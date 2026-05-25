@@ -16,11 +16,13 @@ from pathlib import Path
 from PySide6.QtCore import QSettings, Qt
 from PySide6.QtGui import QAction, QActionGroup
 from PySide6.QtWidgets import (
-    QFileDialog, QLabel, QMainWindow, QMenu, QStatusBar, QTabWidget,
-    QToolBar, QWidget,
+    QFileDialog, QLabel, QMainWindow, QMenu, QMessageBox, QStatusBar,
+    QTabWidget, QToolBar, QWidget,
 )
 
 from . import themes, version_string, last_commit_subject
+from .icons import icon
+from .pdftab import PdfTab
 
 
 class MainWindow(QMainWindow):
@@ -50,44 +52,48 @@ class MainWindow(QMainWindow):
         mb = self.menuBar()
 
         m_file = mb.addMenu("&File")
-        m_file.addAction(QAction("&New", self, shortcut="Ctrl+N",
+        m_file.addAction(QAction(icon("new"), "&New", self, shortcut="Ctrl+N",
                                  triggered=self._new))
-        m_file.addAction(QAction("&Open…", self, shortcut="Ctrl+O",
+        m_file.addAction(QAction(icon("open"), "&Open…", self, shortcut="Ctrl+O",
                                  triggered=self._open))
         m_file.addSeparator()
-        m_file.addAction(QAction("&Save", self, shortcut="Ctrl+S",
+        m_file.addAction(QAction(icon("save"), "&Save", self, shortcut="Ctrl+S",
                                  triggered=self._save))
-        m_file.addAction(QAction("Save &As…", self, shortcut="Ctrl+Shift+S",
+        m_file.addAction(QAction(icon("save_as"), "Save &As…", self,
+                                 shortcut="Ctrl+Shift+S",
                                  triggered=self._save_as))
         m_file.addSeparator()
-        m_file.addAction(QAction("Export as &PNG…", self,
+        m_file.addAction(QAction(icon("export_png"), "Export as &PNG…", self,
                                  triggered=self._noop))
-        m_file.addAction(QAction("Export &Text…", self,
+        m_file.addAction(QAction(icon("export_txt"), "Export &Text…", self,
                                  triggered=self._noop))
-        m_file.addAction(QAction("&Print…", self, shortcut="Ctrl+P",
-                                 triggered=self._noop))
+        m_file.addAction(QAction(icon("print"), "&Print…", self,
+                                 shortcut="Ctrl+P", triggered=self._noop))
         m_file.addSeparator()
-        m_file.addAction(QAction("&Close Tab", self, shortcut="Ctrl+W",
+        m_file.addAction(QAction(icon("close"), "&Close Tab", self,
+                                 shortcut="Ctrl+W",
                                  triggered=lambda: self._close_tab(self._tabs.currentIndex())))
         m_file.addAction(QAction("E&xit", self, shortcut="Ctrl+Q",
                                  triggered=self.close))
 
         m_edit = mb.addMenu("&Edit")
-        m_edit.addAction(QAction("&Undo", self, shortcut="Ctrl+Z",
+        m_edit.addAction(QAction(icon("undo"), "&Undo", self, shortcut="Ctrl+Z",
                                  triggered=self._noop))
-        m_edit.addAction(QAction("&Redo", self, shortcut="Ctrl+Y",
+        m_edit.addAction(QAction(icon("redo"), "&Redo", self, shortcut="Ctrl+Y",
                                  triggered=self._noop))
         m_edit.addSeparator()
-        m_edit.addAction(QAction("&Find…", self, shortcut="Ctrl+F",
+        m_edit.addAction(QAction(icon("find"), "&Find…", self, shortcut="Ctrl+F",
                                  triggered=self._noop))
 
         m_view = mb.addMenu("&View")
-        m_view.addAction(QAction("Zoom &In", self, shortcut="Ctrl++",
+        m_view.addAction(QAction(icon("zoom_in"), "Zoom &In", self,
+                                 shortcut="Ctrl++", triggered=self._zoom_in))
+        m_view.addAction(QAction(icon("zoom_out"), "Zoom &Out", self,
+                                 shortcut="Ctrl+-", triggered=self._zoom_out))
+        m_view.addAction(QAction(icon("fit_width"), "Fit &Width", self,
+                                 triggered=self._fit_width))
+        m_view.addAction(QAction(icon("fit_page"), "Fit &Page", self,
                                  triggered=self._noop))
-        m_view.addAction(QAction("Zoom &Out", self, shortcut="Ctrl+-",
-                                 triggered=self._noop))
-        m_view.addAction(QAction("Fit &Width", self, triggered=self._noop))
-        m_view.addAction(QAction("Fit &Page", self, triggered=self._noop))
         m_view.addSeparator()
         m_view.addAction(QAction("Rotate &Left", self, triggered=self._noop))
         m_view.addAction(QAction("Rotate &Right", self, triggered=self._noop))
@@ -127,16 +133,35 @@ class MainWindow(QMainWindow):
         tb = QToolBar("Main", self)
         tb.setMovable(False)
         self.addToolBar(Qt.TopToolBarArea, tb)
-        # Placeholder buttons — qtawesome icons land in v0.2+.
-        for label in ("Open", "Save", "|",
-                      "Select", "Pen", "Highlight", "Text",
-                      "Line", "Arrow", "Rectangle", "Ellipse",
-                      "Note", "Signature", "Redact", "|",
-                      "Zoom-", "Zoom+", "Fit"):
-            if label == "|":
+        # (icon_name, tooltip, handler). "|" inserts a separator.
+        entries: list = [
+            ("open",      "Open PDF (Ctrl+O)",   self._open),
+            ("save",      "Save (Ctrl+S)",       self._save),
+            "|",
+            ("select",    "Select",              self._noop),
+            ("pen",       "Pen",                 self._noop),
+            ("highlight", "Highlight",           self._noop),
+            ("text",      "Text",                self._noop),
+            ("line",      "Line",                self._noop),
+            ("arrow",     "Arrow",               self._noop),
+            ("rect",      "Rectangle",           self._noop),
+            ("ellipse",   "Ellipse",             self._noop),
+            ("note",      "Sticky Note",         self._noop),
+            ("signature", "Signature",           self._noop),
+            ("redact",    "Redact",              self._noop),
+            "|",
+            ("zoom_out",  "Zoom Out",            self._zoom_out),
+            ("zoom_in",   "Zoom In",             self._zoom_in),
+            ("fit_width", "Fit Width",           self._fit_width),
+        ]
+        for e in entries:
+            if e == "|":
                 tb.addSeparator()
-            else:
-                tb.addAction(QAction(label, self, triggered=self._noop))
+                continue
+            name, tip, handler = e
+            act = QAction(icon(name), tip, self, triggered=handler)
+            act.setToolTip(tip)
+            tb.addAction(act)
 
     def _build_statusbar(self) -> None:
         sb = QStatusBar(self)
@@ -175,13 +200,13 @@ class MainWindow(QMainWindow):
         )
 
     def _refresh_status(self) -> None:
-        # Placeholder until pdftab wires real page/zoom signals.
-        if self._tabs.count() == 0:
+        w = self._tabs.currentWidget()
+        if isinstance(w, PdfTab):
+            self._lbl_page.setText(f"Page 1 of {w.page_count()}")
+            self._lbl_zoom.setText(f"{w.zoom_percent()}%")
+        else:
             self._lbl_page.setText("—")
             self._lbl_zoom.setText("—")
-        else:
-            self._lbl_page.setText("Page 1 of 1")
-            self._lbl_zoom.setText("100%")
         self._update_title()
 
     # ----- tab helpers -----
@@ -195,6 +220,8 @@ class MainWindow(QMainWindow):
             return
         w = self._tabs.widget(idx)
         self._tabs.removeTab(idx)
+        if isinstance(w, PdfTab):
+            w.close_doc()
         if w is not None:
             w.deleteLater()
         self._refresh_status()
@@ -202,11 +229,41 @@ class MainWindow(QMainWindow):
     # ----- file actions (stubs — concrete logic in pdftab v0.3) -----
 
     def open_path(self, path: Path) -> None:
-        placeholder = QWidget(self)
-        placeholder.path = path
-        self._tabs.addTab(placeholder, path.name)
-        self._tabs.setCurrentWidget(placeholder)
+        try:
+            tab = PdfTab(path, self)
+        except Exception as e:
+            QMessageBox.critical(
+                self, "Open failed",
+                f"Could not open <b>{path.name}</b>:<br>{e}",
+            )
+            return
+        self._tabs.addTab(tab, path.name)
+        self._tabs.setCurrentWidget(tab)
         self._refresh_status()
+
+    # ----- view actions -----
+
+    def _current_pdf_tab(self) -> PdfTab | None:
+        w = self._tabs.currentWidget()
+        return w if isinstance(w, PdfTab) else None
+
+    def _zoom_in(self) -> None:
+        t = self._current_pdf_tab()
+        if t:
+            t.zoom_in()
+            self._refresh_status()
+
+    def _zoom_out(self) -> None:
+        t = self._current_pdf_tab()
+        if t:
+            t.zoom_out()
+            self._refresh_status()
+
+    def _fit_width(self) -> None:
+        t = self._current_pdf_tab()
+        if t:
+            t.fit_width()
+            self._refresh_status()
 
     def _new(self) -> None:
         self._noop()

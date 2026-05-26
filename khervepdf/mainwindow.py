@@ -11,6 +11,7 @@ subsequent commits. The shell already wires up:
 """
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 from typing import Optional
 
@@ -23,11 +24,11 @@ from PySide6.QtWidgets import (
     QApplication, QButtonGroup, QCheckBox, QColorDialog, QComboBox,
     QDialog, QDockWidget, QDoubleSpinBox, QFileDialog, QGridLayout,
     QHBoxLayout, QLabel, QMainWindow, QMenu, QMessageBox, QProgressBar,
-    QPushButton, QSlider, QStatusBar, QTabWidget, QToolBar, QToolButton,
-    QVBoxLayout, QWidget, QWidgetAction,
+    QPushButton, QSlider, QStatusBar, QTabBar, QTabWidget, QToolBar,
+    QToolButton, QVBoxLayout, QWidget, QWidgetAction,
 )
 
-from . import git_backend, page_ops, themes, version_string, last_commit_subject
+from . import git_backend, page_ops, themes, version_string
 from .history_dialog import HistoryDialog
 from .icons import app_icon, icon
 from .outline import OutlinePanel
@@ -321,6 +322,92 @@ class _ToolButton(QToolButton):
         super().showMenu()
 
 
+class _DetachableTabBar(QTabBar):
+    """Tab bar whose tabs can be torn off into their own KhervePDF
+    process. Drag a tab outside the tab bar's vertical strip and the
+    PDF the tab is hosting is opened in a new instance, then closed
+    here.
+
+    Implemented as a subclass override of the mouse-release event so
+    we don't fight Qt's internal tab-reordering machinery (which uses
+    press / move). The right-click menu also offers an explicit
+    "Open in new window" entry — handy on touchpads where a precise
+    drag-out is awkward.
+    """
+
+    def __init__(self, parent: QTabWidget) -> None:
+        super().__init__(parent)
+        self.setMovable(True)
+        self.setUsesScrollButtons(True)
+        self._tab_widget = parent
+        self.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._show_context_menu)
+
+    def mouseReleaseEvent(self, ev):  # noqa: N802
+        super().mouseReleaseEvent(ev)
+        if ev.button() != Qt.LeftButton:
+            return
+        # If the mouse left the tab bar's geometry by more than a
+        # small fudge, treat it as a tear-off.
+        if self.rect().adjusted(-6, -6, 6, 6).contains(ev.pos()):
+            return
+        idx = self.tabAt(self._press_pos) if hasattr(self, "_press_pos") \
+            else -1
+        if idx < 0:
+            idx = self.currentIndex()
+        if idx < 0:
+            return
+        self._detach_tab(idx)
+
+    def mousePressEvent(self, ev):  # noqa: N802
+        if ev.button() == Qt.LeftButton:
+            self._press_pos = ev.pos()
+        super().mousePressEvent(ev)
+
+    def _show_context_menu(self, pos) -> None:
+        idx = self.tabAt(pos)
+        if idx < 0:
+            return
+        menu = QMenu(self)
+        act = menu.addAction("Open in new window")
+        act.triggered.connect(lambda: self._detach_tab(idx))
+        menu.exec(self.mapToGlobal(pos))
+
+    def _detach_tab(self, idx: int) -> None:
+        widget = self._tab_widget.widget(idx)
+        path = getattr(widget, "path", None)
+        if path is None:
+            return
+        import subprocess
+        # sys.argv[0] points at the script the user launched
+        # (KhervePDF.py or a frozen .exe). sys.executable is the
+        # Python interpreter. Together they reproduce the way this
+        # process was started — best chance the new process runs
+        # under the same environment.
+        try:
+            entry = Path(sys.argv[0]).resolve()
+        except Exception:
+            entry = None
+        if entry is not None and entry.exists() and entry.suffix == ".py":
+            cmd = [sys.executable, str(entry), str(path)]
+        elif entry is not None and entry.exists():
+            cmd = [str(entry), str(path)]
+        else:
+            cmd = [sys.executable, "-m", "khervepdf", str(path)]
+        try:
+            subprocess.Popen(cmd, close_fds=True)
+        except Exception as e:
+            QMessageBox.warning(
+                self.window(), "Open in new window",
+                f"Could not spawn a new KhervePDF process:\n{e}",
+            )
+            return
+        # Close this tab in the current window.
+        mw = self.window()
+        if hasattr(mw, "_close_tab"):
+            mw._close_tab(idx)
+
+
 class MainWindow(QMainWindow):
     # Drawing tools that take a colour / width / opacity popup. Their
     # toolbar icons re-tint to the active tool colour; other tools
@@ -341,6 +428,7 @@ class MainWindow(QMainWindow):
         self.setAcceptDrops(True)
 
         self._tabs = QTabWidget(self)
+        self._tabs.setTabBar(_DetachableTabBar(self._tabs))
         self._tabs.setTabsClosable(True)
         self._tabs.setMovable(True)
         self._tabs.tabCloseRequested.connect(self._close_tab)
@@ -701,11 +789,10 @@ class MainWindow(QMainWindow):
     def _update_title(self) -> None:
         current = self._current_path()
         name = current.name if current else "Untitled"
-        subj = last_commit_subject()
-        subj_part = f' — "{subj}"' if subj else ""
-        self.setWindowTitle(
-            f"KhervePDF {version_string()}{subj_part} — {name}"
-        )
+        # Keep the title compact — just version + filename. The
+        # build SHA in version_string is enough to identify the
+        # running code; the commit subject was too noisy.
+        self.setWindowTitle(f"KhervePDF {version_string()} — {name}")
 
     def _on_tab_changed(self, _idx: int) -> None:
         self._refresh_status()

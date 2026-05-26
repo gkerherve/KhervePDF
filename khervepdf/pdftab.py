@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Optional
 
 import fitz
-from PySide6.QtCore import QPointF, QRectF, Qt
+from PySide6.QtCore import QPointF, QRectF, QSettings, Qt
 from PySide6.QtGui import (
     QAction, QActionGroup, QBrush, QColor, QFont, QImage, QPainter,
     QPainterPath, QPen, QPixmap, QTextBlockFormat, QTextCharFormat,
@@ -1793,13 +1793,13 @@ class PdfTab(QGraphicsView):
         Two transformations on top of `get_text("dict")`:
 
           * **Visual wraps → one paragraph** — PDF dict "lines" are
-            visual wraps, not paragraph breaks. We stitch them with a
-            single space (or, when the previous line ends in "-"
-            before a lowercase letter, dehyphenate by dropping the
-            hyphen) so the editor shows one continuous paragraph
-            instead of a ladder of pre-wrapped lines. The saved PDF
-            re-wraps to the same rect width, recovering line breaks
-            at sensible places.
+            visual wraps, not paragraph breaks. By default we stitch
+            them with a single space (hyphens at line ends are kept
+            verbatim — "flex- ibility" rather than "flexibility" — so
+            the soft break is still visible). The user can flip the
+            "Preserve PDF Line Breaks" toggle in the View menu to
+            join with `<br>` instead, keeping the source layout
+            exactly as the editor view.
           * **Superscript / subscript spans** — spans whose `size` is
             smaller than the dominant line size and whose baseline
             (`origin[1]`) sits above or below the line baseline are
@@ -1860,26 +1860,16 @@ class PdfTab(QGraphicsView):
                 line_plains.append("".join(plain_parts).rstrip())
             if first_span is None or not line_htmls:
                 continue
-            # Stitch visual lines into one paragraph. Trailing hyphen
-            # before a lowercase letter is treated as a soft
-            # hyphenation break (drop it); everything else joins with
-            # a single space. The plain shadow tracks the same edits
-            # so trailing-char checks aren't fooled by markup tails.
-            paragraph_html = line_htmls[0]
-            paragraph_plain = line_plains[0]
-            for h, p in zip(line_htmls[1:], line_plains[1:]):
-                if not p:
-                    continue
-                if (paragraph_plain.endswith("-") and p[0].islower()):
-                    paragraph_html = paragraph_html.rstrip()
-                    if paragraph_html.endswith("-"):
-                        paragraph_html = paragraph_html[:-1]
-                    paragraph_plain = paragraph_plain[:-1]
-                    paragraph_html += h
-                    paragraph_plain += p
-                else:
-                    paragraph_html += " " + h
-                    paragraph_plain += " " + p
+            # User-controlled separator: spaces by default (one
+            # continuous paragraph) or <br>/\n if "Preserve PDF Line
+            # Breaks" is on. Hyphens at end of line are preserved
+            # either way so the user can decide whether to repair the
+            # word.
+            preserve = self._preserve_line_breaks()
+            sep_html = "<br>" if preserve else " "
+            sep_plain = "\n" if preserve else " "
+            paragraph_html = sep_html.join(line_htmls)
+            paragraph_plain = sep_plain.join(line_plains)
             raw_color = int(first_span.get("color", 0))
             r = ((raw_color >> 16) & 0xff) / 255.0
             g = ((raw_color >> 8) & 0xff) / 255.0
@@ -1896,6 +1886,14 @@ class PdfTab(QGraphicsView):
                 "align": align,
             }
         return None
+
+    @staticmethod
+    def _preserve_line_breaks() -> bool:
+        """Read the global "Preserve PDF Line Breaks" toggle (View
+        menu). When True, Edit-Text / Move-Text stitch visual lines
+        with <br>; otherwise they join with a space."""
+        return bool(QSettings("kherve", "KhervePDF").value(
+            "preserve_line_breaks", False, type=bool))
 
     @staticmethod
     def _detect_alignment(block, fontsize: float) -> str:

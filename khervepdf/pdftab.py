@@ -1790,14 +1790,16 @@ class PdfTab(QGraphicsView):
         """Locate the text block at (x_pt, y_pt) and return its HTML
         text plus the first span's font size and colour for the editor.
 
-        Structure preserved from `get_text("dict")`:
+        Two transformations on top of `get_text("dict")`:
 
-          * **Per-line breaks** — each PDF visual line maps to one
-            `<br>` so the editor (and the rewritten PDF on save) keep
-            the same line count, hyphenated word breaks ("flex-" at
-            line end), and overall block shape as the source. Without
-            this the editor would reflow the paragraph to its own
-            width and lose the layout the user wanted to preserve.
+          * **Visual wraps → one paragraph** — PDF dict "lines" are
+            visual wraps, not paragraph breaks. We stitch them with a
+            single space (or, when the previous line ends in "-"
+            before a lowercase letter, dehyphenate by dropping the
+            hyphen) so the editor shows one continuous paragraph
+            instead of a ladder of pre-wrapped lines. The saved PDF
+            re-wraps to the same rect width, recovering line breaks
+            at sensible places.
           * **Superscript / subscript spans** — spans whose `size` is
             smaller than the dominant line size and whose baseline
             (`origin[1]`) sits above or below the line baseline are
@@ -1858,11 +1860,26 @@ class PdfTab(QGraphicsView):
                 line_plains.append("".join(plain_parts).rstrip())
             if first_span is None or not line_htmls:
                 continue
-            # Keep the original visual line breaks (hyphens included)
-            # so the editor mirrors the PDF layout. <br> for HTML, \n
-            # for the plain-text shadow.
-            paragraph_html = "<br>".join(line_htmls)
-            paragraph_plain = "\n".join(line_plains)
+            # Stitch visual lines into one paragraph. Trailing hyphen
+            # before a lowercase letter is treated as a soft
+            # hyphenation break (drop it); everything else joins with
+            # a single space. The plain shadow tracks the same edits
+            # so trailing-char checks aren't fooled by markup tails.
+            paragraph_html = line_htmls[0]
+            paragraph_plain = line_plains[0]
+            for h, p in zip(line_htmls[1:], line_plains[1:]):
+                if not p:
+                    continue
+                if (paragraph_plain.endswith("-") and p[0].islower()):
+                    paragraph_html = paragraph_html.rstrip()
+                    if paragraph_html.endswith("-"):
+                        paragraph_html = paragraph_html[:-1]
+                    paragraph_plain = paragraph_plain[:-1]
+                    paragraph_html += h
+                    paragraph_plain += p
+                else:
+                    paragraph_html += " " + h
+                    paragraph_plain += " " + p
             raw_color = int(first_span.get("color", 0))
             r = ((raw_color >> 16) & 0xff) / 255.0
             g = ((raw_color >> 8) & 0xff) / 255.0

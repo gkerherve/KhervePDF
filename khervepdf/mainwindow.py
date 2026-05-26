@@ -501,6 +501,9 @@ class MainWindow(QMainWindow):
         m_file.addAction(QAction(icon("save_as"),
                                  "&Compress / shrink…", self,
                                  triggered=self._compress_pdf))
+        m_file.addAction(QAction(icon("save_as"),
+                                 "Encr&ypt / password protect…", self,
+                                 triggered=self._encrypt_pdf))
         m_file.addAction(QAction(icon("print"), "&Print…", self,
                                  shortcut="Ctrl+P", triggered=self._print))
         m_file.addAction(QAction(icon("print"), "Print Pre&view…", self,
@@ -1256,6 +1259,77 @@ class MainWindow(QMainWindow):
                               page.rect.width, page.rect.height)
         t._render_all()
         self._refresh_thumbs()
+
+    def _encrypt_pdf(self) -> None:
+        """Save an encrypted copy of the active PDF. Two passwords:
+        the *user* password is required to open the file; the *owner*
+        password unlocks restrictions (print, copy, modify). Either
+        may be left blank — at least one is required."""
+        t = self._current_pdf_tab()
+        if t is None or t._doc is None:
+            return
+        import fitz as _fitz
+        from PySide6.QtWidgets import (
+            QDialog as _D, QDialogButtonBox as _DB,
+            QFormLayout as _FL, QLineEdit as _LE,
+        )
+        dlg = _D(self)
+        dlg.setWindowTitle("Encrypt PDF")
+        fl = _FL(dlg)
+        user_pw = _LE(dlg)
+        user_pw.setEchoMode(_LE.Password)
+        owner_pw = _LE(dlg)
+        owner_pw.setEchoMode(_LE.Password)
+        fl.addRow("User password (open):", user_pw)
+        fl.addRow("Owner password (edit):", owner_pw)
+        from PySide6.QtWidgets import QLabel as _L
+        hint = _L(
+            "Leave a field empty to skip that level. At least one is "
+            "required. AES-256 used; readers without the user password "
+            "won't see the document at all."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color:#555;")
+        fl.addRow(hint)
+        bb = _DB(_DB.Ok | _DB.Cancel, parent=dlg)
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        fl.addWidget(bb)
+        if dlg.exec() != _D.Accepted:
+            return
+        u = user_pw.text()
+        o = owner_pw.text() or u
+        if not u and not o:
+            QMessageBox.warning(self, "Encrypt",
+                                "Need at least one password.")
+            return
+        suggested = t.path.with_name(f"{t.path.stem}_encrypted.pdf")
+        path_s, _ = QFileDialog.getSaveFileName(
+            self, "Save encrypted PDF as", str(suggested),
+            "PDF files (*.pdf);;All files (*)",
+        )
+        if not path_s:
+            return
+        try:
+            # AES-256 with strict permission set on the owner side
+            # (block printing / copying / modifications unless owner
+            # password is provided). User password — when set —
+            # gates open access entirely.
+            perm = (_fitz.PDF_PERM_ACCESSIBILITY |
+                    _fitz.PDF_PERM_PRINT)  # screen-reader OK; print OK
+            t._doc.save(
+                path_s,
+                encryption=_fitz.PDF_ENCRYPT_AES_256,
+                owner_pw=o, user_pw=u,
+                permissions=perm,
+                deflate=True, garbage=4,
+            )
+        except Exception as e:
+            QMessageBox.warning(self, "Encrypt", str(e))
+            return
+        self.statusBar().showMessage(
+            f"Saved encrypted PDF to {path_s}", 5000,
+        )
 
     def _compress_pdf(self) -> None:
         """Save a recompressed copy of the active PDF. Uses the

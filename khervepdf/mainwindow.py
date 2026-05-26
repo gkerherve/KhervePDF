@@ -15,13 +15,16 @@ from pathlib import Path
 from typing import Optional
 
 from PySide6.QtCore import QSettings, Qt
-from PySide6.QtGui import QAction, QActionGroup, QColor, QKeySequence
+from PySide6.QtGui import (
+    QAction, QActionGroup, QColor, QImage, QKeySequence, QPainter,
+)
+from PySide6.QtPrintSupport import QPrintDialog, QPrinter
 from PySide6.QtWidgets import (
     QApplication, QButtonGroup, QCheckBox, QColorDialog, QComboBox,
-    QDockWidget, QDoubleSpinBox, QFileDialog, QGridLayout, QHBoxLayout,
-    QLabel, QMainWindow, QMenu, QMessageBox, QProgressBar, QPushButton,
-    QSlider, QStatusBar, QTabWidget, QToolBar, QToolButton, QVBoxLayout,
-    QWidget, QWidgetAction,
+    QDialog, QDockWidget, QDoubleSpinBox, QFileDialog, QGridLayout,
+    QHBoxLayout, QLabel, QMainWindow, QMenu, QMessageBox, QProgressBar,
+    QPushButton, QSlider, QStatusBar, QTabWidget, QToolBar, QToolButton,
+    QVBoxLayout, QWidget, QWidgetAction,
 )
 
 from . import git_backend, themes, version_string, last_commit_subject
@@ -404,7 +407,7 @@ class MainWindow(QMainWindow):
         m_file.addAction(QAction(icon("export_txt"), "Export &Text…", self,
                                  triggered=self._noop))
         m_file.addAction(QAction(icon("print"), "&Print…", self,
-                                 shortcut="Ctrl+P", triggered=self._noop))
+                                 shortcut="Ctrl+P", triggered=self._print))
         m_file.addSeparator()
         m_file.addAction(QAction(icon("close"), "&Close Tab", self,
                                  shortcut="Ctrl+W",
@@ -982,6 +985,73 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"Saved {saved}{suffix}", 4000)
         self._refresh_status()
 
+    # ----- Print -----
+
+    def _print(self) -> None:
+        """Open the OS printer dialog and render each PDF page to the
+        selected printer via QPainter. The user gets the standard
+        printer / page-range / copies / orientation controls; we
+        rasterise each page at the printer's logical DPI for fidelity
+        and fit-to-page within the printable rect."""
+        t = self._current_pdf_tab()
+        if t is None or t._doc is None or t._doc.page_count == 0:
+            return
+        import fitz  # local import — only needed for the print path
+        printer = QPrinter(QPrinter.HighResolution)
+        printer.setDocName(t.path.stem)
+        # Tell the dialog the document's page count so the "Pages"
+        # range is bounded properly.
+        printer.setFromTo(1, t._doc.page_count)
+        dlg = QPrintDialog(printer, self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        from_p = printer.fromPage() or 1
+        to_p = printer.toPage() or t._doc.page_count
+        from_idx = max(0, from_p - 1)
+        to_idx = min(t._doc.page_count - 1, to_p - 1)
+        if from_idx > to_idx:
+            return
+        # Render each selected page at the printer's logical DPI so
+        # the output reads as crisp as the device can produce.
+        copies = printer.copyCount()
+        painter = QPainter()
+        if not painter.begin(printer):
+            QMessageBox.warning(self, "Print",
+                                "Could not start the print job.")
+            return
+        try:
+            for copy in range(max(1, copies)):
+                for n, page_idx in enumerate(range(from_idx, to_idx + 1)):
+                    page = t._doc[page_idx]
+                    page_rect_pt = page.rect
+                    # Scale to fit the printer's printable area while
+                    # preserving aspect ratio.
+                    printable = painter.viewport()  # device pixels
+                    sx = printable.width() / page_rect_pt.width
+                    sy = printable.height() / page_rect_pt.height
+                    scale = min(sx, sy)
+                    pix = page.get_pixmap(
+                        matrix=fitz.Matrix(scale, scale),
+                        alpha=False, annots=True,
+                    )
+                    img = QImage(
+                        pix.samples, pix.width, pix.height, pix.stride,
+                        QImage.Format_RGB888,
+                    ).copy()
+                    # Centre on the page.
+                    x = (printable.width() - pix.width) // 2
+                    y = (printable.height() - pix.height) // 2
+                    painter.drawImage(int(x), int(y), img)
+                    if (page_idx < to_idx) or (copy < copies - 1):
+                        printer.newPage()
+        finally:
+            painter.end()
+        self.statusBar().showMessage(
+            f"Sent {to_idx - from_idx + 1} page(s) to "
+            f"{printer.printerName()}",
+            4000,
+        )
+
     # ----- Git menu -----
 
     def _git_commit_now(self) -> None:
@@ -1077,14 +1147,13 @@ class MainWindow(QMainWindow):
         ]
 
         rows = []
-        for name, ver, role, url in libraries:
+        for name, ver, role, _url in libraries:
             rows.append(
                 "<tr>"
                 f"<td valign='top' style='padding:6px 14px 6px 0'>"
                 f"<b>{name}</b><br>"
                 f"<span style='color:#666;font-size:9pt'>{ver}</span></td>"
-                f"<td valign='top' style='padding:6px 0'>{role}<br>"
-                f"<a href='{url}'>{url}</a></td>"
+                f"<td valign='top' style='padding:6px 0'>{role}</td>"
                 "</tr>"
             )
         lib_table = (
@@ -1099,9 +1168,6 @@ class MainWindow(QMainWindow):
             f"{version_string()}</h2>"
             f"<p style='color:#666;margin-top:0'>WYSIWYG PDF viewer &amp; "
             f"annotation editor with Git history.</p>"
-            f"<p><a href='https://github.com/gkerherve/KhervePDF'>"
-            f"github.com/gkerherve/KhervePDF</a> &nbsp;·&nbsp; "
-            f"GPL-3.0</p>"
             f"<hr>"
             f"<h3>About the author</h3>"
             f"<p><b>Gwilherm Kerherv&eacute;</b> &nbsp;—&nbsp; "
@@ -1113,15 +1179,12 @@ class MainWindow(QMainWindow):
             f"storage and catalysis. Maintains a small constellation "
             f"of open-source tools, mostly for the XPS community:</p>"
             f"<ul>"
-            f"<li><a href='https://github.com/gkerherve/KherveFitting'>"
-            f"KherveFitting</a> — peak fitting for XPS spectra.</li>"
-            f"<li><a href='https://github.com/gkerherve/spe_reader'>"
-            f"spe-xps-reader</a> — open reader for PHI Instruments "
-            f"SPE binary files.</li>"
-            f"<li><a href='https://github.com/gkerherve/KherveTeX'>"
-            f"KherveTeX</a> — WYSIWYG LaTeX editor.</li>"
-            f"<li><a href='https://github.com/gkerherve/KherveSheet'>"
-            f"KherveSheet</a> — Origin-style scientific workbook.</li>"
+            f"<li><b>KherveFitting</b> — peak fitting for XPS spectra.</li>"
+            f"<li><b>spe-xps-reader</b> — open reader for PHI "
+            f"Instruments SPE binary files.</li>"
+            f"<li><b>KherveTeX</b> — WYSIWYG LaTeX editor.</li>"
+            f"<li><b>KherveSheet</b> — Origin-style scientific "
+            f"workbook.</li>"
             f"<li><b>KhervePDF</b> — this app: PDF viewing &amp; "
             f"annotation with the same look &amp; feel as the rest "
             f"of the suite.</li>"

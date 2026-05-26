@@ -460,6 +460,7 @@ class MainWindow(QMainWindow):
         self.addDockWidget(Qt.LeftDockWidgetArea, self._thumbs_dock)
         self._thumbs.page_clicked.connect(self._goto_page)
         self._outline.page_clicked.connect(self._goto_page)
+        self._thumbs.page_reorder_requested.connect(self._on_page_reorder)
         # Thumbnail rendering reports progress so the status-bar
         # loading bar can show how much of a long PDF has been
         # rasterised into the side panel.
@@ -808,6 +809,50 @@ class MainWindow(QMainWindow):
         tab = self._current_pdf_tab()
         if tab is not None:
             tab.scroll_to_page(page_idx)
+
+    def _on_page_reorder(self, source: int, target: int) -> None:
+        """Drag-drop in the thumbnails panel: move page `source` so
+        it ends up just before pre-move index `target` (PyMuPDF
+        Document.move_page semantics — see thumbnails.dropEvent).
+        Remap in-memory annotations so they follow their original
+        page to the new index."""
+        t = self._current_pdf_tab()
+        if t is None or t._doc is None:
+            return
+        n = t._doc.page_count
+        if not (0 <= source < n and 0 <= target <= n):
+            return
+        if target == source or target == source + 1:
+            return
+        t._push_undo(include_doc=True)
+        from dataclasses import replace
+        # Compute the moved page's final 0-based index. PyMuPDF gives
+        # us:
+        #   source < target → final index = target - 1
+        #   source > target → final index = target
+        if source < target:
+            moved_to = target - 1
+        else:
+            moved_to = target
+        new_annots = []
+        for a in t._annots:
+            new_idx = a.page_idx
+            if a.page_idx == source:
+                new_idx = moved_to
+            elif source < target and source < a.page_idx < target:
+                new_idx = a.page_idx - 1
+            elif source > target and target <= a.page_idx < source:
+                new_idx = a.page_idx + 1
+            new_annots.append(replace(a, page_idx=new_idx))
+        t._annots = new_annots
+        try:
+            t._doc.move_page(source, target)
+        except Exception as e:
+            QMessageBox.warning(self, "Reorder",
+                                f"Could not move page: {e}")
+            return
+        t._render_all()
+        self._refresh_thumbs()
 
     def _refresh_status(self) -> None:
         w = self._tabs.currentWidget()

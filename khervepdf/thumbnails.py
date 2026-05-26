@@ -17,7 +17,7 @@ from typing import Optional
 import fitz
 from PySide6.QtCore import QSize, Qt, Signal
 from PySide6.QtGui import QIcon, QImage, QPixmap
-from PySide6.QtWidgets import QListWidget, QListWidgetItem
+from PySide6.QtWidgets import QAbstractItemView, QListWidget, QListWidgetItem
 
 
 # Logical-pixel width for each thumbnail image. ~140 keeps the panel
@@ -32,13 +32,23 @@ class ThumbnailPanel(QListWidget):
 
     page_clicked = Signal(int)
     rendering_progress = Signal(int, int)
+    # Emitted when the user drags a thumbnail to reorder pages. The
+    # signal carries (source_row, target_row). MainWindow then calls
+    # doc.move_page + remaps annotation page indices and rebuilds the
+    # panel from the post-move document.
+    page_reorder_requested = Signal(int, int)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setViewMode(QListWidget.ListMode)
         self.setIconSize(QSize(THUMB_WIDTH, int(THUMB_WIDTH * 1.4)))
         self.setSpacing(6)
+        # Drag-drop reordering: tell Qt this is an internal move, but
+        # we override dropEvent so the source of truth stays the
+        # PyMuPDF document (rebuilt afterwards).
         self.setMovement(QListWidget.Static)
+        self.setDragDropMode(QAbstractItemView.InternalMove)
+        self.setDefaultDropAction(Qt.MoveAction)
         self.setUniformItemSizes(False)
         self.setSelectionMode(QListWidget.SingleSelection)
         self.setMinimumWidth(THUMB_WIDTH + 36)
@@ -91,3 +101,29 @@ class ThumbnailPanel(QListWidget):
         idx = item.data(Qt.UserRole)
         if idx is not None:
             self.page_clicked.emit(int(idx))
+
+    def dropEvent(self, event):  # noqa: N802
+        """Intercept the drop, compute (source, target) row indices,
+        emit page_reorder_requested. The `target` we emit follows the
+        PyMuPDF Document.move_page semantics — "insert before this
+        pre-move index". The drop itself is not applied to the widget
+        directly; MainWindow rebuilds the panel from the new document
+        order so items stay in sync with reality."""
+        source = self.currentRow()
+        if source < 0:
+            event.ignore()
+            return
+        target = self.indexAt(event.position().toPoint()).row()
+        if target < 0:
+            target = self.count()  # drop past the last row → append
+        else:
+            r = self.visualItemRect(self.item(target))
+            if event.position().y() > r.y() + r.height() / 2:
+                target += 1
+        # source == target (drop on itself) or target == source+1 (drop
+        # immediately below source) both leave the order unchanged.
+        if target == source or target == source + 1:
+            event.ignore()
+            return
+        self.page_reorder_requested.emit(int(source), int(target))
+        event.accept()

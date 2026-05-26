@@ -39,6 +39,30 @@ Write-Host "==> pyinstaller KhervePDF.spec --noconfirm" -ForegroundColor Yellow
 py -m PyInstaller KhervePDF.spec --noconfirm
 if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed" }
 
+# 1b. Strip unused PySide6 bulk from the dist folder.
+# The .spec excludes most Qt modules, but collect_all still drags
+# in QML, translations, designer plugins, etc.  Remove them here
+# so the zip and installer stay lean.
+$pyside = Join-Path $ProjectRoot 'dist\KhervePDF\_internal\PySide6'
+$stripDirs = @('qml','translations','metatypes','include','typesystems',
+               'glue','scripts','doc','support','lib','QtAsyncio','resources')
+foreach ($d in $stripDirs) {
+    $p = Join-Path $pyside $d
+    if (Test-Path $p) { Remove-Item $p -Recurse -Force }
+}
+$keepPlugins = @('platforms','styles','imageformats','iconengines',
+                 'platforminputcontexts','tls')
+$plugDir = Join-Path $pyside 'plugins'
+if (Test-Path $plugDir) {
+    Get-ChildItem $plugDir -Directory |
+        Where-Object { $_.Name -notin $keepPlugins } |
+        ForEach-Object { Remove-Item $_.FullName -Recurse -Force }
+}
+$distSizeMB = [math]::Round(
+    (Get-ChildItem 'dist\KhervePDF' -Recurse -File |
+     Measure-Object -Property Length -Sum).Sum / 1MB, 1)
+Write-Host "    dist size after PySide6 strip: $distSizeMB MB" -ForegroundColor Green
+
 # 2. Zip
 $zipPath = Join-Path $ProjectRoot ("dist\KhervePDF_" + $Version + ".zip")
 if (Test-Path $zipPath) { Remove-Item $zipPath }

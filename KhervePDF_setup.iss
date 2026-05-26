@@ -17,7 +17,7 @@
 #define MyAppName        "KhervePDF"
 #define MyAppPublisher   "Gwilherm Kerherve"
 #define MyAppExeName     "KhervePDF.exe"
-#define MyAppVersion     "0.64"
+#define MyAppVersion     "0.65"
 
 [Setup]
 ; Globally-unique app ID — keeps the uninstaller info tidy and lets

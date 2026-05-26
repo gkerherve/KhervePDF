@@ -96,6 +96,60 @@ for pkg, sweep_submodules in _packages:
         except Exception:
             pass
 
+# Strip PySide6 directories that a pure QtWidgets app never touches.
+# collect_all("PySide6") sweeps everything; drop the bulk here.
+_strip_prefixes = (
+    "PySide6/qml",
+    "PySide6/resources",
+    "PySide6/translations",
+    "PySide6/metatypes",
+    "PySide6/include",
+    "PySide6/typesystems",
+    "PySide6/glue",
+    "PySide6/scripts",
+    "PySide6\\qml",
+    "PySide6\\resources",
+    "PySide6\\translations",
+    "PySide6\\metatypes",
+    "PySide6\\include",
+    "PySide6\\typesystems",
+    "PySide6\\glue",
+    "PySide6\\scripts",
+)
+# Also strip plugin subdirectories we don't need (keep platforms,
+# styles, imageformats, iconengines, platforminputcontexts, tls).
+_strip_plugins = (
+    "plugins/assetimporters", "plugins/canbus", "plugins/designer",
+    "plugins/generic", "plugins/geometryloaders", "plugins/geoservices",
+    "plugins/multimedia", "plugins/networkinformation", "plugins/position",
+    "plugins/qmllint", "plugins/qmltooling", "plugins/renderers",
+    "plugins/renderplugins", "plugins/sceneparsers",
+    "plugins/scxmldatamodel", "plugins/sensors", "plugins/sqldrivers",
+    "plugins/texttospeech", "plugins/vectorimageformats", "plugins/webview",
+)
+_strip_plugins_all = tuple(
+    p.replace("/", sep)
+    for sep in ("/", "\\")
+    for p in _strip_plugins
+)
+_all_strip = _strip_prefixes + tuple(
+    f"PySide6/{p}" for p in _strip_plugins
+) + tuple(
+    f"PySide6\\{p}" for p in _strip_plugins
+)
+
+
+def _prune(pairs):
+    """Filter (source, dest_dir) tuples by dest_dir prefix."""
+    return [
+        (src, dest) for src, dest in pairs
+        if not any(dest.startswith(pfx) for pfx in _all_strip)
+    ]
+
+
+datas = _prune(datas)
+binaries = _prune(binaries)
+
 
 # ---- Analysis --------------------------------------------------------
 
@@ -142,6 +196,51 @@ a = Analysis(
         "docutils",
         "babel",
         "matplotlib",
+        # PySide6 modules we don't use — KhervePDF only needs
+        # QtCore, QtGui, QtWidgets, QtPrintSupport, QtSvg, QtNetwork.
+        "PySide6.Qt3DAnimation",
+        "PySide6.Qt3DCore",
+        "PySide6.Qt3DExtras",
+        "PySide6.Qt3DInput",
+        "PySide6.Qt3DLogic",
+        "PySide6.Qt3DRender",
+        "PySide6.QtBluetooth",
+        "PySide6.QtCharts",
+        "PySide6.QtConcurrent",
+        "PySide6.QtDataVisualization",
+        "PySide6.QtDesigner",
+        "PySide6.QtGraphs",
+        "PySide6.QtHttpServer",
+        "PySide6.QtLocation",
+        "PySide6.QtMultimedia",
+        "PySide6.QtMultimediaWidgets",
+        "PySide6.QtNetworkAuth",
+        "PySide6.QtNfc",
+        "PySide6.QtPdf",
+        "PySide6.QtPdfWidgets",
+        "PySide6.QtPositioning",
+        "PySide6.QtQuick",
+        "PySide6.QtQuick3D",
+        "PySide6.QtQuickControls2",
+        "PySide6.QtQuickWidgets",
+        "PySide6.QtRemoteObjects",
+        "PySide6.QtScxml",
+        "PySide6.QtSensors",
+        "PySide6.QtSerialBus",
+        "PySide6.QtSerialPort",
+        "PySide6.QtSpatialAudio",
+        "PySide6.QtSql",
+        "PySide6.QtStateMachine",
+        "PySide6.QtTest",
+        "PySide6.QtTextToSpeech",
+        "PySide6.QtUiTools",
+        "PySide6.QtWebChannel",
+        "PySide6.QtWebEngineCore",
+        "PySide6.QtWebEngineQuick",
+        "PySide6.QtWebEngineWidgets",
+        "PySide6.QtWebSockets",
+        "PySide6.QtXml",
+        "PySide6.QtAsyncio",
     ],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,

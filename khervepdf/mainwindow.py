@@ -83,9 +83,9 @@ class MainWindow(QMainWindow):
 
         m_edit = mb.addMenu("&Edit")
         m_edit.addAction(QAction(icon("undo"), "&Undo", self, shortcut="Ctrl+Z",
-                                 triggered=self._noop))
+                                 triggered=self._undo))
         m_edit.addAction(QAction(icon("redo"), "&Redo", self, shortcut="Ctrl+Y",
-                                 triggered=self._noop))
+                                 triggered=self._redo))
         m_edit.addSeparator()
         m_edit.addAction(QAction(icon("find"), "&Find…", self, shortcut="Ctrl+F",
                                  triggered=self._noop))
@@ -575,11 +575,51 @@ class MainWindow(QMainWindow):
         if path_s:
             self.open_path(Path(path_s))
 
+    def _undo(self) -> None:
+        t = self._current_pdf_tab()
+        if t is not None:
+            t.undo()
+            self._refresh_status()
+
+    def _redo(self) -> None:
+        t = self._current_pdf_tab()
+        if t is not None:
+            t.redo()
+            self._refresh_status()
+
     def _save(self) -> None:
-        self._noop()
+        t = self._current_pdf_tab()
+        if t is None:
+            return
+        try:
+            saved = t.save_to_pdf()
+        except Exception as e:
+            QMessageBox.critical(
+                self, "Save failed",
+                f"Could not save:<br>{e}",
+            )
+            return
+        self.statusBar().showMessage(f"Saved {saved}", 3000)
 
     def _save_as(self) -> None:
-        self._noop()
+        t = self._current_pdf_tab()
+        if t is None:
+            return
+        path_s, _ = QFileDialog.getSaveFileName(
+            self, "Save PDF As", str(t.path),
+            "PDF files (*.pdf);;All files (*)",
+        )
+        if not path_s:
+            return
+        try:
+            saved = t.save_to_pdf(Path(path_s))
+        except Exception as e:
+            QMessageBox.critical(
+                self, "Save failed",
+                f"Could not save:<br>{e}",
+            )
+            return
+        self.statusBar().showMessage(f"Saved {saved}", 3000)
 
     def _about(self) -> None:
         from PySide6.QtWidgets import QMessageBox

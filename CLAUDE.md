@@ -159,6 +159,19 @@ All annotations are persisted into the PDF on save through PyMuPDF
 - `document.py` is the **single source of truth**. Tools mutate the
   document model; serializers read it. Never edit PDF bytes directly
   outside `document.py`.
+- **Undo/Redo invariant**: every user-facing tool that changes state —
+  adding/removing annotations, mutating PDF text, page operations,
+  anything that survives the gesture — MUST call `PdfTab._push_undo()`
+  *before* the mutation. If the mutation touches the underlying
+  `fitz.Document` (e.g. Edit-Text, redactions applied on save, page
+  insert/delete/rotate), pass `include_doc=True` so the snapshot
+  captures doc bytes. A new tool that doesn't integrate with this
+  stack is broken-by-default and must not be merged. The stack is
+  per-`PdfTab`, capped at 20 entries, and reachable from the Edit
+  menu as Undo / Redo (Ctrl+Z / Ctrl+Y). If a gesture turns out to
+  be a no-op (degenerate click, empty drag), pop the snapshot back
+  off the stack instead of leaving a noise entry — see how
+  `PdfTab.mouseReleaseEvent` does it.
 - Tests in `tests/` cover model + page_ops + annotation serialization.
   Any change to those modules ships with matching tests in the **same
   commit**.

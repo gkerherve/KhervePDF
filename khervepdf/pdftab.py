@@ -17,6 +17,8 @@ source of truth (CLAUDE.md); for now PdfTab owns them.
 """
 from __future__ import annotations
 
+import copy
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -54,6 +56,10 @@ TOOL_DEFAULTS = {
     "redact":    {"color": "#000000", "width": 1.0,  "opacity": 100},
     "select":    {"color": "#000000", "width": 1.0,  "opacity": 100},
     "edit_text": {"color": "#000000", "width": 11.0, "opacity": 100},
+    # Tools that don't have option panels still need defaults so the
+    # mousePressEvent lookup doesn't KeyError.
+    "note":      {"color": "#fbc02d", "width": 1.0,  "opacity": 100},
+    "signature": {"color": "#0d47a1", "width": 1.0,  "opacity": 100},
 }
 
 
@@ -172,12 +178,22 @@ class PdfTab(QGraphicsView):
         self.path = Path(path)
         self._doc: Optional[fitz.Document] = None
         self._zoom = 1.0
-        self._base_dpi = 110
+        # 144 DPI ≈ 2x the historical 72 DPI baseline — combined with
+        # devicePixelRatio oversampling in _render_all, text reads
+        # crisp on both 1x and HiDPI displays.
+        self._base_dpi = 144
         self._tool = "select"
         # tool -> {"color": "#hex", "width": float} (per-tab state).
         self._tool_settings = {k: dict(v) for k, v in TOOL_DEFAULTS.items()}
         # Live storage of all annotations on this document.
         self._annots: list[Annotation] = []
+        # Undo/redo: each entry is a state snapshot. Annotation-only
+        # actions snapshot just the annot list (cheap); actions that
+        # mutate the underlying PDF (edit_text) also snapshot doc bytes.
+        # Cap stacks to 20 entries to bound memory.
+        self._undo_stack: list[dict] = []
+        self._redo_stack: list[dict] = []
+        self._max_undo = 20
         # page_idx -> dict(y_origin, scale, w_pt, h_pt, pixmap_h_px)
         self._page_layout: dict[int, dict] = {}
         # Preview state while dragging.
@@ -217,8 +233,14 @@ class PdfTab(QGraphicsView):
         self._page_layout.clear()
         if self._doc is None:
             return
-        scale = self._base_dpi / 72.0 * self._zoom  # px per PDF point
-        matrix = fitz.Matrix(scale, scale)
+        # Render at logical_scale * dpr internally and tag the resulting
+        # QImage with the device pixel ratio so QGraphicsPixmapItem
+        # scales it back to logical pixels — page reads sharp on HiDPI
+        # without bloating scene coordinates.
+        dpr = self.devicePixelRatioF() or 1.0
+        logical_scale = self._base_dpi / 72.0 * self._zoom
+        render_scale = logical_scale * dpr
+        matrix = fitz.Matrix(render_scale, render_scale)
         y = 0.0
         max_w = 0.0
         for idx, page in enumerate(self._doc):
@@ -227,20 +249,27 @@ class PdfTab(QGraphicsView):
                 pix.samples, pix.width, pix.height, pix.stride,
                 QImage.Format_RGB888,
             ).copy()
-            item = QGraphicsPixmapItem(QPixmap.fromImage(img))
+            img.setDevicePixelRatio(dpr)
+            pm = QPixmap.fromImage(img)
+            item = QGraphicsPixmapItem(pm)
+            item.setTransformationMode(Qt.SmoothTransformation)
             item.setPos(0, y)
             item.setZValue(-1)
             self._scene.addItem(item)
+            # Logical (scene-space) dimensions are the raw pixmap size
+            # divided by dpr — same units as scene_to_page coordinates.
+            w_logical = pix.width / dpr
+            h_logical = pix.height / dpr
             self._page_layout[idx] = {
                 "y_origin": y,
-                "scale": scale,
+                "scale": logical_scale,
                 "w_pt": page.rect.width,
                 "h_pt": page.rect.height,
-                "h_px": pix.height,
-                "w_px": pix.width,
+                "h_px": h_logical,
+                "w_px": w_logical,
             }
-            y += pix.height + PAGE_GAP
-            max_w = max(max_w, float(pix.width))
+            y += h_logical + PAGE_GAP
+            max_w = max(max_w, w_logical)
         self._scene.setSceneRect(QRectF(0, 0, max_w, max(0.0, y - PAGE_GAP)))
         self._replay_annots()
 
@@ -271,6 +300,187 @@ class PdfTab(QGraphicsView):
         lay = self._page_layout[page_idx]
         return (max(0.0, min(x_pt, lay["w_pt"])),
                 max(0.0, min(y_pt, lay["h_pt"])))
+
+    # ----- undo / redo -----
+    #
+    # Snapshot-based. Every state-changing tool MUST call _push_undo()
+    # before mutating self._annots or the underlying fitz.Document; see
+    # the "Undo/Redo invariant" section in CLAUDE.md.
+
+    def _snapshot(self, include_doc: bool = False) -> dict:
+        return {
+            "annots": copy.deepcopy(self._annots),
+            "doc_bytes": (self._doc.tobytes()
+                          if include_doc and self._doc else None),
+        }
+
+    def _push_undo(self, include_doc: bool = False) -> None:
+        self._undo_stack.append(self._snapshot(include_doc))
+        if len(self._undo_stack) > self._max_undo:
+            self._undo_stack.pop(0)
+        self._redo_stack.clear()
+
+    def can_undo(self) -> bool:
+        return bool(self._undo_stack)
+
+    def can_redo(self) -> bool:
+        return bool(self._redo_stack)
+
+    def undo(self) -> None:
+        if not self._undo_stack:
+            return
+        snap = self._undo_stack.pop()
+        # The forward state pushed to the redo stack must mirror the
+        # snap we're about to apply — if the undo entry carries doc
+        # bytes, the redo entry must too.
+        self._redo_stack.append(
+            self._snapshot(include_doc=snap.get("doc_bytes") is not None)
+        )
+        self._restore(snap)
+
+    def redo(self) -> None:
+        if not self._redo_stack:
+            return
+        snap = self._redo_stack.pop()
+        self._undo_stack.append(
+            self._snapshot(include_doc=snap.get("doc_bytes") is not None)
+        )
+        self._restore(snap)
+
+    def _restore(self, snap: dict) -> None:
+        self._annots = snap["annots"]
+        doc_bytes = snap.get("doc_bytes")
+        if doc_bytes is not None:
+            if self._doc is not None:
+                self._doc.close()
+            self._doc = fitz.open(stream=doc_bytes, filetype="pdf")
+        self._render_all()
+
+    # ----- save -----
+
+    def is_dirty(self) -> bool:
+        """True if there are unsaved annotations to bake into the PDF."""
+        return bool(self._annots) or self.can_undo()
+
+    def save_to_pdf(self, dest: Optional[Path] = None) -> Path:
+        """Bake every Annotation into the underlying PDF and write it.
+
+        Saving in-place to `self.path` goes via a tempfile + os.replace
+        so a failed save can't clobber the original. Save-As keeps the
+        current in-memory annotations untouched by baking into a deep
+        copy of the document.
+        """
+        if self._doc is None:
+            raise RuntimeError("No document open")
+        target = Path(dest) if dest is not None else self.path
+        in_place = target == self.path
+
+        if in_place:
+            doc = self._doc
+            self._bake_into(doc)
+            tmp = target.with_suffix(target.suffix + ".kpdftmp")
+            doc.save(str(tmp), deflate=True, garbage=4)
+            doc.close()
+            self._doc = None
+            os.replace(str(tmp), str(target))
+            # Reopen from disk so subsequent edits see the baked PDF.
+            self._doc = fitz.open(str(target))
+            # The annots have been baked into the PDF — clear them so
+            # the next save doesn't double-write.
+            self._annots.clear()
+            self._undo_stack.clear()
+            self._redo_stack.clear()
+        else:
+            # Save As — work on a copy so the current session keeps its
+            # editable annotations.
+            doc_copy = fitz.open(stream=self._doc.tobytes(), filetype="pdf")
+            try:
+                self._bake_into(doc_copy)
+                doc_copy.save(str(target), deflate=True, garbage=4)
+            finally:
+                doc_copy.close()
+        self._render_all()
+        return target
+
+    @staticmethod
+    def _hex_to_rgb01(hex_str: str) -> tuple[float, float, float]:
+        s = hex_str.lstrip("#")
+        return (int(s[0:2], 16) / 255.0,
+                int(s[2:4], 16) / 255.0,
+                int(s[4:6], 16) / 255.0)
+
+    def _bake_into(self, doc: fitz.Document) -> None:
+        """Translate every Annotation into a real PDF annotation on
+        the given document. Redactions are queued per page and applied
+        at the end so the page content stream is rewritten once."""
+        redacts_by_page: dict[int, list[fitz.Rect]] = {}
+        for a in self._annots:
+            if a.page_idx >= doc.page_count:
+                continue
+            page = doc[a.page_idx]
+            rgb = self._hex_to_rgb01(a.color)
+            op = max(0.0, min(1.0, a.opacity / 100.0))
+            if a.type == "pen":
+                annot = page.add_ink_annot([
+                    [fitz.Point(x, y) for x, y in a.pts]
+                ])
+                annot.set_colors(stroke=rgb)
+                annot.set_border(width=max(0.5, a.width))
+                annot.set_opacity(op)
+                annot.update()
+            elif a.type == "highlight":
+                rect = fitz.Rect(a.pts[0][0], a.pts[0][1],
+                                 a.pts[1][0], a.pts[1][1])
+                annot = page.add_highlight_annot(rect)
+                annot.set_colors(stroke=rgb)
+                annot.set_opacity(op)
+                annot.update()
+            elif a.type == "rect":
+                rect = fitz.Rect(a.pts[0][0], a.pts[0][1],
+                                 a.pts[1][0], a.pts[1][1])
+                annot = page.add_rect_annot(rect)
+                annot.set_colors(stroke=rgb)
+                annot.set_border(width=max(0.5, a.width))
+                annot.set_opacity(op)
+                annot.update()
+            elif a.type == "ellipse":
+                rect = fitz.Rect(a.pts[0][0], a.pts[0][1],
+                                 a.pts[1][0], a.pts[1][1])
+                annot = page.add_circle_annot(rect)
+                annot.set_colors(stroke=rgb)
+                annot.set_border(width=max(0.5, a.width))
+                annot.set_opacity(op)
+                annot.update()
+            elif a.type in ("line", "arrow"):
+                p1 = fitz.Point(*a.pts[0])
+                p2 = fitz.Point(*a.pts[1])
+                annot = page.add_line_annot(p1, p2)
+                annot.set_colors(stroke=rgb)
+                annot.set_border(width=max(0.5, a.width))
+                annot.set_opacity(op)
+                if a.type == "arrow":
+                    # Newer PyMuPDF accepts string ending names; guard
+                    # because the constant set has shifted across versions.
+                    try:
+                        annot.set_line_ends("None", "OpenArrow")
+                    except Exception:
+                        pass
+                annot.update()
+            elif a.type == "text":
+                page.insert_text(
+                    (a.pts[0][0], a.pts[0][1] + max(4.0, a.width)),
+                    a.text, fontsize=max(4.0, a.width), color=rgb,
+                )
+            elif a.type == "redact":
+                redacts_by_page.setdefault(a.page_idx, []).append(
+                    fitz.Rect(a.pts[0][0], a.pts[0][1],
+                              a.pts[1][0], a.pts[1][1])
+                )
+        for page_idx, rects in redacts_by_page.items():
+            page = doc[page_idx]
+            for r in rects:
+                page.add_redact_annot(r, fill=(0, 0, 0))
+            page.apply_redactions()
 
     # ----- zoom -----
 
@@ -542,6 +752,10 @@ class PdfTab(QGraphicsView):
         end_pt = self._clamp_to_page(page, *end_pt)
         start_pt = self._clamp_to_page(page, *start_pt)
         n_before = len(self._annots)
+        # Snapshot before the mutation so undo restores pre-gesture
+        # state. We pop the snapshot if the gesture turned out to be a
+        # no-op (degenerate click, sub-pixel drag).
+        self._push_undo()
 
         if self._tool == "pen":
             if len(self._stroke_pts_page) >= 2:
@@ -570,6 +784,11 @@ class PdfTab(QGraphicsView):
         self._stroke_pts_page = []
         self._drag_start = None
         self._drag_page = None
+        # If nothing was actually added, the undo snapshot pushed above
+        # would just restore the same state — drop it to keep Ctrl+Z
+        # meaningful.
+        if len(self._annots) == n_before and self._undo_stack:
+            self._undo_stack.pop()
         for a in self._annots[n_before:]:
             self._draw_annot(a)
         event.accept()
@@ -630,6 +849,7 @@ class PdfTab(QGraphicsView):
     def _commit_text_item(self, page_idx: int,
                           anchor_pt: tuple[float, float], text: str,
                           color: str, fontsize: float) -> None:
+        self._push_undo()
         self._annots.append(Annotation(
             type="text", page_idx=page_idx, color=color, width=fontsize,
             pts=[anchor_pt], text=text,
@@ -668,6 +888,8 @@ class PdfTab(QGraphicsView):
         new_text, requested_size, fitz_align = dlg.values()
         if new_text == info["text"] and abs(requested_size - info["size"]) < 0.1:
             return
+        # Doc is about to be mutated — undo entry must include doc bytes.
+        self._push_undo(include_doc=True)
         rect = fitz.Rect(*info["rect"])
         # White out the original glyphs by rewriting the page content
         # stream — without apply_redactions the new text would sit on

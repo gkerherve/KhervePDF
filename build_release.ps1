@@ -52,6 +52,7 @@ $iscc = $null
 $candidates = @(
     'C:\Program Files (x86)\Inno Setup 6\ISCC.exe',
     'C:\Program Files\Inno Setup 6\ISCC.exe',
+    "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe",
     'C:\Program Files (x86)\Inno Setup 5\ISCC.exe'
 )
 foreach ($c in $candidates) {
@@ -63,10 +64,35 @@ if (-not $iscc) {
 }
 
 if ($iscc) {
-    Write-Host "==> $iscc KhervePDF_setup.iss" -ForegroundColor Yellow
-    & $iscc KhervePDF_setup.iss
-    if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed" }
-    $setupExe = Join-Path $ProjectRoot ("installer\Setup_KhervePDF_" + $Version + ".exe")
+    # Inno Setup hits Windows' 260-char MAX_PATH when the project
+    # lives under a long OneDrive path — sweeping the dist tree
+    # plus deeply-nested PySide6 plugins blows the limit. Stage
+    # everything ISCC reads into C:\tmp\kpbuild before compiling,
+    # then copy the resulting Setup.exe back into installer\.
+    $stage = 'C:\tmp\kpbuild'
+    if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
+    New-Item -ItemType Directory -Force -Path $stage | Out-Null
+    Write-Host "==> Staging to $stage (avoids MAX_PATH on long OneDrive paths)" -ForegroundColor Yellow
+    Copy-Item 'KhervePDF_setup.iss' "$stage\KhervePDF_setup.iss"
+    Copy-Item 'LICENSE'             "$stage\LICENSE"
+    New-Item -ItemType Directory -Force -Path "$stage\build" | Out-Null
+    Copy-Item 'build\KhervePDF.ico' "$stage\build\KhervePDF.ico"
+    Copy-Item 'dist\KhervePDF'      "$stage\dist\KhervePDF" -Recurse
+    Push-Location $stage
+    try {
+        Write-Host "==> $iscc KhervePDF_setup.iss" -ForegroundColor Yellow
+        & $iscc KhervePDF_setup.iss
+        if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed" }
+    } finally {
+        Pop-Location
+    }
+    $stageInstaller = Join-Path $stage 'installer'
+    $localInstaller = Join-Path $ProjectRoot 'installer'
+    if (-not (Test-Path $localInstaller)) {
+        New-Item -ItemType Directory -Path $localInstaller | Out-Null
+    }
+    Copy-Item "$stageInstaller\*" $localInstaller -Force
+    $setupExe = Join-Path $localInstaller ("Setup_KhervePDF_" + $Version + ".exe")
     if (Test-Path $setupExe) {
         $setupSizeMB = [math]::Round((Get-Item $setupExe).Length / 1MB, 1)
         Write-Host "    Setup.exe: $setupSizeMB MB" -ForegroundColor Green

@@ -1747,15 +1747,13 @@ class PdfTab(QGraphicsView):
                 self._scene.removeItem(marker)
         html = dlg.html()
         new_plain = dlg.plain_text()
-        # If the user didn't actually change anything, skip the edit.
-        if new_plain.strip() == info["text"].strip() \
-                and "<sup>" not in html and "<sub>" not in html:
-            # Original may already have sup/sub; treat unchanged plain
-            # text + identical formatting as no-op only when neither
-            # the source nor the editor introduced sup/sub.
-            if not info.get("html") or "<sup>" not in info["html"] \
-                    and "<sub>" not in info["html"]:
-                return
+        # Normalise both sides — Qt represents <br> as   in
+        # plain text while our reader uses \n — and skip if the body
+        # is identical to what we loaded.
+        def _norm(s: str) -> str:
+            return s.replace(" ", "\n").strip()
+        if _norm(new_plain) == _norm(info["text"]):
+            return
         # Doc is about to be mutated — undo entry must include doc bytes.
         self._push_undo(include_doc=True)
         rect = fitz.Rect(*info["rect"])
@@ -1792,17 +1790,18 @@ class PdfTab(QGraphicsView):
         """Locate the text block at (x_pt, y_pt) and return its HTML
         text plus the first span's font size and colour for the editor.
 
-        Two kinds of structure are recovered from `get_text("dict")`
-        that a naive flatten would lose:
+        Structure preserved from `get_text("dict")`:
 
-          * **Visual wraps within a paragraph** — PDF dict "lines" are
-            visual wraps, not paragraph breaks. We stitch them back
-            into one paragraph: lines ending in "-" before a lowercase
-            letter dehyphenate; other breaks join with a space.
+          * **Per-line breaks** — each PDF visual line maps to one
+            `<br>` so the editor (and the rewritten PDF on save) keep
+            the same line count, hyphenated word breaks ("flex-" at
+            line end), and overall block shape as the source. Without
+            this the editor would reflow the paragraph to its own
+            width and lose the layout the user wanted to preserve.
           * **Superscript / subscript spans** — spans whose `size` is
             smaller than the dominant line size and whose baseline
             (`origin[1]`) sits above or below the line baseline are
-            wrapped in `<sup>` / `<sub>` HTML, so the editor can show
+            wrapped in `<sup>` / `<sub>` HTML, so the editor shows
             them with proper baseline shift and `insert_htmlbox`
             renders them back correctly on save. PyMuPDF flag bit 0
             (TEXT_FONT_SUPERSCRIPT) is also honoured when present.
@@ -1859,26 +1858,11 @@ class PdfTab(QGraphicsView):
                 line_plains.append("".join(plain_parts).rstrip())
             if first_span is None or not line_htmls:
                 continue
-            # Stitch visual lines into a single paragraph. Use the
-            # plain-text trailing char to detect hyphenated breaks so
-            # we don't get fooled by trailing markup tags.
-            paragraph_html = line_htmls[0]
-            paragraph_plain = line_plains[0]
-            for h, p in zip(line_htmls[1:], line_plains[1:]):
-                if not p:
-                    continue
-                if (paragraph_plain.endswith("-")
-                        and p and p[0].islower()):
-                    # Drop the trailing "-" from both representations.
-                    paragraph_html = paragraph_html.rstrip()
-                    if paragraph_html.endswith("-"):
-                        paragraph_html = paragraph_html[:-1]
-                    paragraph_plain = paragraph_plain[:-1]
-                    paragraph_html += h
-                    paragraph_plain += p
-                else:
-                    paragraph_html += " " + h
-                    paragraph_plain += " " + p
+            # Keep the original visual line breaks (hyphens included)
+            # so the editor mirrors the PDF layout. <br> for HTML, \n
+            # for the plain-text shadow.
+            paragraph_html = "<br>".join(line_htmls)
+            paragraph_plain = "\n".join(line_plains)
             raw_color = int(first_span.get("color", 0))
             r = ((raw_color >> 16) & 0xff) / 255.0
             g = ((raw_color >> 8) & 0xff) / 255.0

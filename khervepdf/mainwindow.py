@@ -17,11 +17,11 @@ from typing import Optional
 from PySide6.QtCore import QSettings, Qt
 from PySide6.QtGui import QAction, QActionGroup, QColor, QKeySequence
 from PySide6.QtWidgets import (
-    QApplication, QButtonGroup, QCheckBox, QColorDialog, QDockWidget,
-    QDoubleSpinBox, QFileDialog, QGridLayout, QHBoxLayout, QLabel,
-    QMainWindow, QMenu, QMessageBox, QProgressBar, QPushButton, QSlider,
-    QStatusBar, QTabWidget, QToolBar, QToolButton, QVBoxLayout, QWidget,
-    QWidgetAction,
+    QApplication, QButtonGroup, QCheckBox, QColorDialog, QComboBox,
+    QDockWidget, QDoubleSpinBox, QFileDialog, QGridLayout, QHBoxLayout,
+    QLabel, QMainWindow, QMenu, QMessageBox, QProgressBar, QPushButton,
+    QSlider, QStatusBar, QTabWidget, QToolBar, QToolButton, QVBoxLayout,
+    QWidget, QWidgetAction,
 )
 
 from . import themes, version_string, last_commit_subject
@@ -559,6 +559,35 @@ class MainWindow(QMainWindow):
             act = QAction(icon(name), tip, self, triggered=handler)
             act.setToolTip(tip)
             tb.addAction(act)
+        # Zoom-level selector — typeable combobox next to the zoom
+        # icons. Picks between Fit Width and a set of common
+        # percentages, or accepts a custom "%" entry typed in.
+        self._zoom_combo = QComboBox(self)
+        self._zoom_combo.setEditable(True)
+        self._zoom_combo.setMaximumWidth(110)
+        self._zoom_combo.setToolTip(
+            "Zoom level — pick a preset or type a percentage"
+        )
+        # Show the magnifier icon as the combo's leading visual cue.
+        zoom_label = QToolButton(self)
+        zoom_label.setIcon(icon("zoom_in"))
+        zoom_label.setEnabled(False)
+        zoom_label.setStyleSheet(
+            "QToolButton { background:transparent; border:none; }"
+        )
+        tb.addWidget(zoom_label)
+        for label in ("Fit Width", "50%", "75%", "100%", "125%",
+                      "150%", "200%", "300%", "400%"):
+            self._zoom_combo.addItem(label)
+        self._zoom_combo.setCurrentText("Fit Width")
+        self._zoom_combo.activated.connect(
+            lambda _i: self._apply_zoom_combo()
+        )
+        # Hitting Enter in the line edit applies the typed value.
+        self._zoom_combo.lineEdit().returnPressed.connect(
+            self._apply_zoom_combo
+        )
+        tb.addWidget(self._zoom_combo)
 
     def _activate_tool(self, name: str) -> None:
         self._current_tool = name
@@ -671,6 +700,11 @@ class MainWindow(QMainWindow):
         else:
             self._lbl_page.setText("—")
             self._lbl_zoom.setText("—")
+        # Keep the toolbar's zoom combo in step with the actual zoom
+        # (the user can change it via the combo, the +/- buttons,
+        # Ctrl+wheel, Ctrl±, or a window resize triggering auto-fit).
+        if hasattr(self, "_zoom_combo"):
+            self._sync_zoom_combo()
         self._update_title()
 
     # ----- tab helpers -----
@@ -786,6 +820,42 @@ class MainWindow(QMainWindow):
         if t:
             t.zoom_out()
             self._refresh_status()
+
+    def _apply_zoom_combo(self) -> None:
+        text = self._zoom_combo.currentText().strip()
+        tab = self._current_pdf_tab()
+        if tab is None:
+            return
+        if text.lower().startswith("fit"):
+            tab.fit_width()
+        else:
+            pct = text.rstrip("% ").strip()
+            try:
+                val = float(pct) / 100.0
+            except ValueError:
+                self._sync_zoom_combo()
+                return
+            tab._auto_fit_width = False
+            tab._set_zoom(val)
+        self._refresh_status()
+        self._sync_zoom_combo()
+
+    def _sync_zoom_combo(self) -> None:
+        """Push the active tab's zoom into the combo's text. Called
+        after manual zoom (buttons / Ctrl+wheel / Ctrl±) so the combo
+        always reflects reality."""
+        tab = self._current_pdf_tab()
+        if tab is None:
+            return
+        text = "Fit Width" if tab._auto_fit_width \
+            else f"{tab.zoom_percent()}%"
+        self._zoom_combo.blockSignals(True)
+        idx = self._zoom_combo.findText(text)
+        if idx >= 0:
+            self._zoom_combo.setCurrentIndex(idx)
+        else:
+            self._zoom_combo.setCurrentText(text)
+        self._zoom_combo.blockSignals(False)
 
     def _fit_width(self) -> None:
         t = self._current_pdf_tab()

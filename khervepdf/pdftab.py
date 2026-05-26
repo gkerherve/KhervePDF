@@ -434,24 +434,22 @@ class _EditableTextItem(QGraphicsTextItem):
     def _maybe_commit(self) -> None:
         if self._committed:
             return
+        # If this item is no longer the active inline editor (e.g.
+        # the tool switched, or a new Add-Text was started), the
+        # tab has already dismissed it — don't do anything.
+        if self._tab._inline_text_item is not self:
+            self._committed = True
+            return
         from PySide6.QtWidgets import QApplication as _QApp
-        bar = getattr(self._tab, "_inline_format_bar", None)
+        bar = self._tab._inline_format_bar
         new_focus = _QApp.focusWidget()
         if bar is not None and new_focus is not None:
             # Focus moved into the toolbar — keep editing.
             if bar is new_focus or bar.isAncestorOf(new_focus):
                 return
-        self._committed = True
-        plain = self.toPlainText().strip()
-        rich = self.toHtml()
-        tab = self._tab
-        page_idx = self._page_idx
-        anchor = self._anchor_pt
-        color = self._color
-        fontsize = self._fontsize
-        rotation = self._rotation
-        tab._commit_inline_text(page_idx, anchor, plain, rich,
-                                color, fontsize, rotation)
+        # Defer to the tab's central dismiss path so the toolbar
+        # teardown and annotation push are kept together.
+        self._tab._dismiss_inline_text()
 
 
 class _TextFormatBar(QFrame):
@@ -1344,6 +1342,11 @@ class PdfTab(QGraphicsView):
     # ----- tools -----
 
     def set_tool(self, name: str) -> None:
+        # Switching away from Text mid-edit should commit + tear down
+        # the floating toolbar; otherwise it'd hang around over the
+        # page after the user picks Select / Hand / etc.
+        if name != "text" and self._inline_text_item is not None:
+            self._dismiss_inline_text()
         self._tool = name
         self._apply_drag_mode()
 
@@ -2102,26 +2105,20 @@ class PdfTab(QGraphicsView):
     def _add_text_at(self, page_idx: int,
                      anchor_pt: tuple[float, float],
                      color: str, fontsize: float, opacity: int) -> None:
-        """Add Text tool: drop an editable text item on the page at
-        the click point and pop up a floating toolbar with font /
-        size / B / I / U / sub-sup / alignment / rotation controls.
-        The user types straight onto the PDF — no modal dialog. The
-        commit (focusOut → _annots) is deferred via QTimer so the
-        re-render doesn't tear down the item under Qt's focus
-        machinery."""
-        # If another inline edit is in progress, commit (focus out)
-        # before starting a new one.
-        if self._inline_text_item is not None:
-            self._inline_text_item.clearFocus()
+        """Add Text tool: drop an editable text item on the page and
+        pop up the floating format toolbar. The user types straight
+        onto the PDF — no modal dialog."""
+        # Always synchronously dismiss any in-progress edit *before*
+        # starting a new one. Without this the deferred commit of the
+        # previous item would later tear down whichever toolbar is
+        # current — including this new one.
+        self._dismiss_inline_text()
         scene_pt = self._page_to_scene(page_idx, *anchor_pt)
         item = _EditableTextItem(self, page_idx, anchor_pt, color, fontsize)
         item.setPos(scene_pt)
         self._scene.addItem(item)
         item.setFocus()
         self._inline_text_item = item
-        # Position the floating toolbar just above the click point in
-        # the viewport. Use mapToGlobal because the bar is a Qt.Tool
-        # top-level — its coordinates are screen-global.
         bar = _TextFormatBar(item, self)
         view_pt = self.mapFromScene(scene_pt)
         global_pt = self.viewport().mapToGlobal(view_pt)
@@ -2129,37 +2126,42 @@ class PdfTab(QGraphicsView):
         bar.show()
         self._inline_format_bar = bar
 
-    def _commit_inline_text(self, page_idx: int,
-                            anchor_pt: tuple[float, float],
-                            plain: str, html: str,
-                            color: str, fontsize: float,
-                            rotation: int) -> None:
-        """Slot called via QTimer.singleShot from
-        _EditableTextItem.focusOutEvent. Safe to mutate the scene
-        here — Qt has finished its focus processing by now."""
-        # Tear down the floating toolbar regardless of whether we
-        # actually commit (might be a cancel — empty text).
-        if getattr(self, "_inline_format_bar", None) is not None:
-            self._inline_format_bar.hide()
-            self._inline_format_bar.deleteLater()
-            self._inline_format_bar = None
+    def _dismiss_inline_text(self) -> None:
+        """Synchronously commit the current inline text edit (if any)
+        and tear down the floating format toolbar. Safe to call from
+        the focus-out path, on tool switch, and before starting a new
+        edit — runs at most once per outstanding item because the
+        item's _committed flag short-circuits any later commit."""
+        item = self._inline_text_item
+        bar = self._inline_format_bar
+        # Drop the references first so any re-entrant call is a no-op.
         self._inline_text_item = None
-        if not plain:
-            # Empty — just refresh so the temporary item disappears.
+        self._inline_format_bar = None
+        if bar is not None:
+            bar.hide()
+            bar.deleteLater()
+        if item is None:
+            return
+        if item._committed:
+            # Already committed via the deferred path — just refresh
+            # to remove the temporary scene item.
             self._render_all()
             return
-        # Use the rich HTML when it carries any sup/sub/bold/italic
-        # spans; otherwise store the plain string so the saved PDF
-        # gets a real editable annotation (add_freetext_annot).
+        item._committed = True
+        plain = item.toPlainText().strip()
+        rich = item.toHtml() if plain else ""
+        if not plain:
+            self._render_all()
+            return
         rich_markers = ("<sub", "<sup", "<b>", "<b ", "<i>", "<i ",
                         "<span", "<u>", "<u ")
-        store = html if any(m in html for m in rich_markers) else plain
+        store = rich if any(m in rich for m in rich_markers) else plain
         self._push_undo()
         self._annots.append(Annotation(
-            type="text", page_idx=page_idx, color=color,
-            width=fontsize, opacity=100,
-            pts=[anchor_pt], text=store,
-            rotation=int(rotation),
+            type="text", page_idx=item._page_idx,
+            color=item._color, width=item._fontsize, opacity=100,
+            pts=[item._anchor_pt], text=store,
+            rotation=int(item._rotation),
         ))
         self._render_all()
 

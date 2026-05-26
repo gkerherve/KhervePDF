@@ -1383,6 +1383,43 @@ class PdfTab(QGraphicsView):
         self._auto_fit_width = False
         self._set_zoom(self._zoom / 1.25)
 
+    def current_page_index(self) -> int:
+        """Page whose vertical range contains the viewport's top —
+        used by the Pages menu so operations act on the page the
+        user is looking at."""
+        if not self._page_layout:
+            return 0
+        vp_top = self.mapToScene(self.viewport().rect().topLeft()).y()
+        for idx, lay in self._page_layout.items():
+            if lay["y_origin"] <= vp_top <= lay["y_origin"] + lay["h_px"]:
+                return idx
+        # Fallback: nearest page centre.
+        best, best_d = 0, float("inf")
+        for idx, lay in self._page_layout.items():
+            centre = lay["y_origin"] + lay["h_px"] / 2
+            d = abs(centre - vp_top)
+            if d < best_d:
+                best, best_d = idx, d
+        return best
+
+    def shift_annot_pages(self, from_idx: int, delta: int) -> None:
+        """Shift the page_idx of every annotation whose page_idx is
+        >= from_idx by `delta`. Used after page insert/delete so the
+        in-memory annotations stay attached to the right page."""
+        from dataclasses import replace
+        new_annots: list[Annotation] = []
+        for a in self._annots:
+            if a.page_idx < from_idx:
+                new_annots.append(a)
+            else:
+                new_annots.append(replace(a, page_idx=a.page_idx + delta))
+        self._annots = new_annots
+
+    def drop_annots_on_page(self, page_idx: int) -> None:
+        """Remove annotations attached to the given page (used right
+        before deleting that page)."""
+        self._annots = [a for a in self._annots if a.page_idx != page_idx]
+
     def scroll_to_page(self, page_idx: int) -> None:
         """Center the main view on the given page (used by the side
         thumbnails panel)."""

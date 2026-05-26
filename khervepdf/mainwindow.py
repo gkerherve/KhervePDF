@@ -27,7 +27,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QWidget, QWidgetAction,
 )
 
-from . import git_backend, themes, version_string, last_commit_subject
+from . import git_backend, page_ops, themes, version_string, last_commit_subject
 from .history_dialog import HistoryDialog
 from .icons import app_icon, icon
 from .outline import OutlinePanel
@@ -472,10 +472,26 @@ class MainWindow(QMainWindow):
             m_tools.addAction(QAction(label, self, triggered=self._noop))
 
         m_pages = mb.addMenu("&Pages")
-        for label in ("Insert &Blank Page", "&Delete Page",
-                      "Rotate Page Left", "Rotate Page Right",
-                      "&Reorder Pages…", "&Merge PDF…", "&Split…"):
-            m_pages.addAction(QAction(label, self, triggered=self._noop))
+        m_pages.addAction(QAction(icon("page_insert"),
+                                  "Insert &Blank Page", self,
+                                  triggered=self._insert_blank))
+        m_pages.addAction(QAction(icon("page_delete"),
+                                  "&Delete Current Page", self,
+                                  triggered=self._delete_page))
+        m_pages.addSeparator()
+        m_pages.addAction(QAction(icon("rotate_l"),
+                                  "Rotate Page &Left", self,
+                                  triggered=self._rotate_left))
+        m_pages.addAction(QAction(icon("rotate_r"),
+                                  "Rotate Page &Right", self,
+                                  triggered=self._rotate_right))
+        m_pages.addSeparator()
+        m_pages.addAction(QAction(icon("page_merge"),
+                                  "&Merge PDF(s)…", self,
+                                  triggered=self._merge_pdf))
+        m_pages.addAction(QAction(icon("page_split"),
+                                  "&Split into one PDF per page…", self,
+                                  triggered=self._split_pdf))
 
         m_git = mb.addMenu("&Git")
         m_git.addAction(QAction(icon("commit"), "Commit &Now", self,
@@ -987,6 +1003,115 @@ class MainWindow(QMainWindow):
         suffix = " · committed to git" if committed else ""
         self.statusBar().showMessage(f"Saved {saved}{suffix}", 4000)
         self._refresh_status()
+
+    # ----- Pages menu -----
+
+    def _merge_pdf(self) -> None:
+        t = self._current_pdf_tab()
+        if t is None or t._doc is None:
+            return
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Choose PDF(s) to insert after the current page",
+            str(t.path.parent), "PDF files (*.pdf);;All files (*)",
+        )
+        if not paths:
+            return
+        t._push_undo(include_doc=True)
+        target_after = t.current_page_index()
+        for p in paths:
+            try:
+                added = page_ops.merge_pdf_into(
+                    t._doc, Path(p), after_page_idx=target_after,
+                )
+                # Shift annotations that sit on pages after the
+                # insertion point so they stay attached to the same
+                # visual page.
+                t.shift_annot_pages(target_after + 1, added)
+                target_after += added
+            except Exception as e:
+                QMessageBox.warning(self, "Merge",
+                                    f"Failed to merge {p}:\n{e}")
+        t._render_all()
+        self._refresh_thumbs()
+        self.statusBar().showMessage(
+            f"Merged {len(paths)} PDF(s)", 4000,
+        )
+
+    def _delete_page(self) -> None:
+        t = self._current_pdf_tab()
+        if t is None or t._doc is None:
+            return
+        if t._doc.page_count <= 1:
+            QMessageBox.information(self, "Delete page",
+                                    "Cannot delete the last page.")
+            return
+        idx = t.current_page_index()
+        ok = QMessageBox.question(
+            self, "Delete page",
+            f"Delete page {idx + 1} of {t._doc.page_count}?",
+        )
+        if ok != QMessageBox.Yes:
+            return
+        t._push_undo(include_doc=True)
+        t.drop_annots_on_page(idx)
+        # Shift down everything after by -1.
+        t.shift_annot_pages(idx + 1, -1)
+        page_ops.delete_page(t._doc, idx)
+        t._render_all()
+        self._refresh_thumbs()
+
+    def _rotate_left(self) -> None:
+        self._rotate_current(-90)
+
+    def _rotate_right(self) -> None:
+        self._rotate_current(90)
+
+    def _rotate_current(self, delta: int) -> None:
+        t = self._current_pdf_tab()
+        if t is None or t._doc is None:
+            return
+        t._push_undo(include_doc=True)
+        page_ops.rotate_page(t._doc, t.current_page_index(), delta)
+        t._render_all()
+        self._refresh_thumbs()
+
+    def _insert_blank(self) -> None:
+        t = self._current_pdf_tab()
+        if t is None or t._doc is None:
+            return
+        idx = t.current_page_index()
+        # Use the current page's size as the default for the new
+        # blank — keeps the document looking uniform.
+        page = t._doc[idx]
+        t._push_undo(include_doc=True)
+        # New page goes AFTER idx, so any annotation on a page
+        # after idx shifts by +1.
+        t.shift_annot_pages(idx + 1, +1)
+        page_ops.insert_blank(t._doc, idx,
+                              page.rect.width, page.rect.height)
+        t._render_all()
+        self._refresh_thumbs()
+
+    def _split_pdf(self) -> None:
+        t = self._current_pdf_tab()
+        if t is None or t._doc is None:
+            return
+        out_dir = QFileDialog.getExistingDirectory(
+            self, "Choose a folder to write the split PDFs into",
+            str(t.path.parent),
+        )
+        if not out_dir:
+            return
+        try:
+            paths = page_ops.split_into_files(
+                t._doc, Path(out_dir), t.path.stem,
+            )
+        except Exception as e:
+            QMessageBox.warning(self, "Split", str(e))
+            return
+        self.statusBar().showMessage(
+            f"Wrote {len(paths)} file(s) to {out_dir}", 5000,
+        )
 
     # ----- Print -----
 

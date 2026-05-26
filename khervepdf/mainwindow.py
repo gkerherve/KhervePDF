@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (
 )
 
 from . import themes, version_string, last_commit_subject
-from .icons import icon
+from .icons import app_icon, icon
 from .pdftab import PdfTab, TOOL_DEFAULTS
 
 
@@ -219,6 +219,7 @@ class MainWindow(QMainWindow):
         self._theme_name = theme_name
         self._theme = themes.THEMES.get(theme_name, themes.THEMES["Light"])
 
+        self.setWindowIcon(app_icon())
         self.resize(1280, 860)
 
         self._tabs = QTabWidget(self)

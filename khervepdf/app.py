@@ -10,6 +10,7 @@ from PySide6.QtCore import QSettings
 from PySide6.QtWidgets import QApplication
 
 from . import themes
+from .icons import app_icon
 from .mainwindow import MainWindow
 
 
@@ -30,6 +31,7 @@ def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("KhervePDF")
     app.setOrganizationName("kherve")
+    app.setWindowIcon(app_icon())
 
     settings = QSettings("kherve", "KhervePDF")
     theme_name = settings.value("theme_name", "Light") or "Light"

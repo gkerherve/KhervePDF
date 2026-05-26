@@ -10,5 +10,7 @@ dist/
 *.egg-info/
 .pytest_cache/
 *.spec
+# …except the project's own PyInstaller spec.
+!KhervePDF.spec
 .DS_Store
 Thumbs.db

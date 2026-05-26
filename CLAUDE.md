@@ -114,7 +114,7 @@ into a new module and import.
   - `remote_dialog.py`  — GitHub remote setup dialog.
   - `examples.py`   — bundled sample PDFs.
 - `tests/` — model + page_ops + annotation round-trip tests.
-- `requirements.txt`, `README.md`, `LICENSE` (GPL-3.0).
+- `requirements.txt`, `README.md`, `LICENSE` (BSD 3-Clause).
 
 ## UI conventions (mirror KherveTeX/KherveSheet)
 
@@ -184,4 +184,5 @@ All annotations are persisted into the PDF on save through PyMuPDF
 
 ## Licensing
 
-GPL-3.0. New source files must carry the short GPL notice at the top.
+BSD 3-Clause. New source files don't need a copyright header — the
+project-level LICENSE file at the repo root covers every module.

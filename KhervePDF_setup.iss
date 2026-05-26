@@ -38,6 +38,7 @@ PrivilegesRequiredOverridesAllowed=dialog
 OutputDir=installer
 OutputBaseFilename=Setup_KhervePDF_{#MyAppVersion}
 UninstallDisplayIcon={app}\{#MyAppExeName}
+LicenseFile=LICENSE
 Compression=lzma2/ultra64
 SolidCompression=yes
 WizardStyle=modern

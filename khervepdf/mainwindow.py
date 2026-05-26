@@ -2085,6 +2085,10 @@ class MainWindow(QMainWindow):
             f"free-text), so files stay editable across save cycles "
             f"and in other PDF readers."
             f"</p>"
+            f"<p style='color:#888;font-size:9pt;margin-top:6pt'>"
+            f"© 2026 Gwilherm Kerherv&eacute;. Released under the "
+            f"BSD 3-Clause license — see the LICENSE file."
+            f"</p>"
         )
 
         dlg = QDialog(self)

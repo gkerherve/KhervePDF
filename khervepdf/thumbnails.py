@@ -52,6 +52,10 @@ class ThumbnailPanel(QListWidget):
         self.setUniformItemSizes(False)
         self.setSelectionMode(QListWidget.SingleSelection)
         self.setMinimumWidth(THUMB_WIDTH + 36)
+        self.setToolTip(
+            "Click to jump to a page.\n"
+            "Drag a thumbnail up or down to reorder pages."
+        )
         self.itemClicked.connect(self._on_clicked)
 
     def set_document(self, doc: Optional[fitz.Document]) -> None:

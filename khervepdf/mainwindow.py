@@ -450,8 +450,13 @@ class MainWindow(QMainWindow):
         self._thumbs = ThumbnailPanel(self)
         self._outline = OutlinePanel(self)
         self._side_tabs = QTabWidget(self)
-        self._side_tabs.addTab(self._thumbs, "Pages")
+        self._side_tabs.addTab(self._thumbs, "Pages (drag to reorder)")
         self._side_tabs.addTab(self._outline, "Contents")
+        # Tooltip on the Pages tab so the affordance is also
+        # discoverable on hover.
+        self._side_tabs.setTabToolTip(
+            0, "Drag a thumbnail up or down to reorder pages.",
+        )
         self._thumbs_dock = QDockWidget("Document", self)
         self._thumbs_dock.setObjectName("PagesDock")
         self._thumbs_dock.setWidget(self._side_tabs)
@@ -2045,6 +2050,10 @@ class MainWindow(QMainWindow):
             f"<li><b>KherveTeX</b> — WYSIWYG LaTeX editor.</li>"
             f"<li><b>KherveSheet</b> — Origin-style scientific "
             f"workbook.</li>"
+            f"<li><b>KhervePlot</b> — scientific plotting &amp; "
+            f"figure preparation.</li>"
+            f"<li><b>KherveNotebook</b> — interactive notebook tying "
+            f"the Kherve* tools together.</li>"
             f"<li><b>KherveDB</b> — reference database for the "
             f"Kherve* suite.</li>"
             f"<li><b>KhervePDF</b> — this app: PDF viewing &amp; "

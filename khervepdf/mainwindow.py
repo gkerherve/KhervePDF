@@ -174,18 +174,23 @@ class _OptionsPopup(QWidget):
     def refresh(self) -> None:
         """Sync slider/spin values from the active tool's stored state.
 
-        Width and opacity rows are shown for every tool the popup
-        applies to; the font-size row only for text tools. Hiding rows
-        per-tool inside a QMenu's QWidgetAction proved unreliable
-        (the menu caches size on first show), so we keep them all
-        visible apart from the size row's text-only branch."""
+        Every row stays *visible* on every tool — toggling visibility
+        inside a QMenu/QWidgetAction proved unreliable (the menu
+        caches size on first show, so rows that become visible later
+        get clipped). Instead, each row's controls are enabled only
+        when they apply to the active tool, so the menu height stays
+        constant and the user can see at a glance what's available."""
         tool = self._mw._current_tool
         is_text = tool in ("text", "edit_text")
         is_shape = tool in ("rect", "ellipse")
-        self._width_row.setVisible(not is_text)
-        self._opacity_row.setVisible(not is_text)
-        self._size_row.setVisible(is_text)
-        self._fill_row.setVisible(is_shape)
+        self._width_row.setVisible(True)
+        self._opacity_row.setVisible(True)
+        self._size_row.setVisible(True)
+        self._fill_row.setVisible(True)
+        self._width_row.setEnabled(not is_text)
+        self._opacity_row.setEnabled(not is_text)
+        self._size_row.setEnabled(is_text)
+        self._fill_row.setEnabled(is_shape)
 
         tab = self._mw._current_pdf_tab()
         if tab is not None:

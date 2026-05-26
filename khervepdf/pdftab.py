@@ -1936,10 +1936,40 @@ class PdfTab(QGraphicsView):
             x0, y0, x1, y1 = block["bbox"]
             if not (x0 <= x_pt <= x1 and y0 <= y_pt <= y1):
                 continue
+            # PyMuPDF often groups several visually-distinct paragraphs
+            # into one "block" (e.g. running prose, indented children).
+            # Split the block's lines into paragraphs using indentation
+            # and vertical gaps, then act only on the paragraph the
+            # user actually clicked into.
+            all_lines = [ln for ln in block.get("lines", [])
+                         if ln.get("spans")]
+            paragraphs = self._split_lines_into_paragraphs(all_lines)
+            if not paragraphs:
+                continue
+            target_para = None
+            for para in paragraphs:
+                p_y_top = min(ln["bbox"][1] for ln in para)
+                p_y_bot = max(ln["bbox"][3] for ln in para)
+                if p_y_top <= y_pt <= p_y_bot:
+                    target_para = para
+                    break
+            if target_para is None:
+                # Click sat between paragraph bounds — fall back to the
+                # nearest by vertical distance.
+                target_para = min(
+                    paragraphs,
+                    key=lambda p: abs(
+                        ((p[0]["bbox"][1] + p[-1]["bbox"][3]) / 2) - y_pt
+                    ),
+                )
+            # Recompute the block-relative rect: width = block column,
+            # height = the chosen paragraph only.
+            p_y0 = min(ln["bbox"][1] for ln in target_para)
+            p_y1 = max(ln["bbox"][3] for ln in target_para)
             line_htmls: list[str] = []
             line_plains: list[str] = []
             first_span = None
-            for line in block.get("lines", []):
+            for line in target_para:
                 spans = line.get("spans", [])
                 if not spans:
                     continue
@@ -1994,17 +2024,22 @@ class PdfTab(QGraphicsView):
             r = ((raw_color >> 16) & 0xff) / 255.0
             g = ((raw_color >> 8) & 0xff) / 255.0
             b = (raw_color & 0xff) / 255.0
-            # Pick the *dominant* font + size across the whole block,
-            # weighted by character count — first_span alone can be a
-            # superscript marker (smaller, different font) and would
-            # mislead the editor.
-            dom_font_raw, dom_size = self._dominant_font_and_size(
-                block, fallback_size=float(first_span.get("size", 11.0)),
+            # Dominant font + size measured across the paragraph the
+            # user actually clicked (not the whole block — adjacent
+            # paragraphs may use a different font or weight).
+            dom_font_raw, dom_size = self._dominant_font_and_size_lines(
+                target_para,
+                fallback_size=float(first_span.get("size", 11.0)),
             )
-            align = self._detect_alignment(block, dom_size)
+            # Alignment detected on a synthetic block-like dict so the
+            # heuristic only sees the chosen paragraph's lines.
+            align = self._detect_alignment(
+                {"bbox": (x0, p_y0, x1, p_y1), "lines": target_para},
+                dom_size,
+            )
             font = self._clean_font_name(dom_font_raw)
             return {
-                "rect": (x0, y0, x1, y1),
+                "rect": (x0, p_y0, x1, p_y1),
                 "html": paragraph_html.rstrip(),
                 "text": paragraph_plain.rstrip(),
                 "size": dom_size,
@@ -2013,6 +2048,76 @@ class PdfTab(QGraphicsView):
                 "font": font,
             }
         return None
+
+    @staticmethod
+    def _split_lines_into_paragraphs(lines: list) -> list[list]:
+        """Group a block's visual lines into paragraphs.
+
+        Heuristics (one is enough to start a new paragraph):
+          * The line's left edge is noticeably further right than the
+            block's main left margin — a first-line indent.
+          * The vertical gap to the previous line is larger than the
+            typical line spacing — blank-line separation.
+
+        Tolerance scales with the block's median line height so 8pt
+        body text and 14pt headings are judged on the same relative
+        scale.
+        """
+        if not lines:
+            return []
+        from collections import Counter
+        # Body left margin = most common rounded line.x0. Round to
+        # integer to absorb sub-point jitter.
+        rounded_starts = [round(line["bbox"][0]) for line in lines]
+        body_x0 = Counter(rounded_starts).most_common(1)[0][0]
+        # Typical line height — used to scale indent and gap thresholds.
+        heights = sorted(line["bbox"][3] - line["bbox"][1] for line in lines)
+        median_h = heights[len(heights) // 2] if heights else 12.0
+        indent_threshold = body_x0 + max(4.0, median_h * 0.6)
+        gap_threshold = median_h * 0.6
+        paragraphs: list[list] = []
+        current: list = []
+        prev_y1 = None
+        for line in lines:
+            lx0, ly0, _lx1, ly1 = line["bbox"]
+            starts_new = False
+            if current:
+                if lx0 > indent_threshold:
+                    starts_new = True
+                elif prev_y1 is not None and (ly0 - prev_y1) > gap_threshold:
+                    starts_new = True
+            if starts_new:
+                paragraphs.append(current)
+                current = []
+            current.append(line)
+            prev_y1 = ly1
+        if current:
+            paragraphs.append(current)
+        return paragraphs
+
+    @staticmethod
+    def _dominant_font_and_size_lines(lines: list, fallback_size: float
+                                      ) -> tuple[str, float]:
+        """Same as _dominant_font_and_size but takes a list of lines
+        (a paragraph) instead of a whole block."""
+        font_chars: dict[str, int] = {}
+        size_chars: dict[float, int] = {}
+        for line in lines:
+            for span in line.get("spans", []):
+                text = span.get("text", "")
+                if not text:
+                    continue
+                n = len(text)
+                f = span.get("font") or ""
+                font_chars[f] = font_chars.get(f, 0) + n
+                s = round(float(span.get("size", fallback_size)), 1)
+                size_chars[s] = size_chars.get(s, 0) + n
+        if not font_chars:
+            return ("", fallback_size)
+        dom_font = max(font_chars, key=font_chars.get)
+        dom_size = max(size_chars, key=size_chars.get) if size_chars \
+            else fallback_size
+        return dom_font, float(dom_size)
 
     @staticmethod
     def _dominant_font_and_size(block, fallback_size: float

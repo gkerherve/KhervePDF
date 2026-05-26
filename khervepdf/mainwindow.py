@@ -583,6 +583,9 @@ class MainWindow(QMainWindow):
         m_pages.addAction(QAction(icon("page_split"),
                                   "&Split into one PDF per page…", self,
                                   triggered=self._split_pdf))
+        m_pages.addAction(QAction(icon("page_split"),
+                                  "E&xtract pages…", self,
+                                  triggered=self._extract_pages))
 
         m_git = mb.addMenu("&Git")
         m_git.addAction(QAction(icon("commit"), "Commit &Now", self,
@@ -1248,6 +1251,77 @@ class MainWindow(QMainWindow):
                               page.rect.width, page.rect.height)
         t._render_all()
         self._refresh_thumbs()
+
+    def _extract_pages(self) -> None:
+        t = self._current_pdf_tab()
+        if t is None or t._doc is None:
+            return
+        from PySide6.QtWidgets import QInputDialog
+        text, ok = QInputDialog.getText(
+            self, "Extract pages",
+            f"Pages to extract (1–{t._doc.page_count}). "
+            "Comma-separated, ranges allowed — e.g. <code>1, 3-5, 9</code>:",
+            text="1-{}".format(t._doc.page_count),
+        )
+        if not ok or not text.strip():
+            return
+        indices = self._parse_page_range(text, t._doc.page_count)
+        if not indices:
+            QMessageBox.warning(self, "Extract",
+                                "Couldn't parse that page range.")
+            return
+        suggested = t.path.with_name(
+            f"{t.path.stem}_pages.pdf"
+        )
+        out_s, _ = QFileDialog.getSaveFileName(
+            self, "Save extracted PDF as", str(suggested),
+            "PDF files (*.pdf);;All files (*)",
+        )
+        if not out_s:
+            return
+        try:
+            ok = page_ops.extract_pages(t._doc, indices, Path(out_s))
+        except Exception as e:
+            QMessageBox.warning(self, "Extract", str(e))
+            return
+        if not ok:
+            QMessageBox.warning(self, "Extract",
+                                "No pages were extracted.")
+            return
+        self.statusBar().showMessage(
+            f"Extracted {len(indices)} page(s) to {out_s}", 4000,
+        )
+
+    @staticmethod
+    def _parse_page_range(text: str, page_count: int) -> list[int]:
+        """Parse a user-facing 1-based range string ("1, 3-5, 9")
+        into a sorted unique list of 0-based indices, clamped to the
+        document's page count. Bad chunks are skipped."""
+        out: set[int] = set()
+        for chunk in text.split(","):
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+            if "-" in chunk:
+                lo_s, hi_s = chunk.split("-", 1)
+                try:
+                    lo = int(lo_s.strip())
+                    hi = int(hi_s.strip())
+                except ValueError:
+                    continue
+                if lo > hi:
+                    lo, hi = hi, lo
+                for n in range(lo, hi + 1):
+                    if 1 <= n <= page_count:
+                        out.add(n - 1)
+            else:
+                try:
+                    n = int(chunk)
+                except ValueError:
+                    continue
+                if 1 <= n <= page_count:
+                    out.add(n - 1)
+        return sorted(out)
 
     def _split_pdf(self) -> None:
         t = self._current_pdf_tab()

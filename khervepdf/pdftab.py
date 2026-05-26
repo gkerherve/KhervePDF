@@ -32,11 +32,11 @@ from PySide6.QtGui import (
     QTextCursor, QTextDocumentFragment,
 )
 from PySide6.QtWidgets import (
-    QComboBox, QDialog, QDialogButtonBox, QGraphicsEllipseItem,
-    QGraphicsItem, QGraphicsLineItem, QGraphicsPathItem,
-    QGraphicsPixmapItem, QGraphicsRectItem, QGraphicsScene,
-    QGraphicsTextItem, QGraphicsView, QInputDialog, QLabel,
-    QMessageBox, QTextEdit, QToolBar, QVBoxLayout,
+    QComboBox, QDialog, QDialogButtonBox, QFontComboBox,
+    QGraphicsEllipseItem, QGraphicsItem, QGraphicsLineItem,
+    QGraphicsPathItem, QGraphicsPixmapItem, QGraphicsRectItem,
+    QGraphicsScene, QGraphicsTextItem, QGraphicsView, QInputDialog,
+    QLabel, QMessageBox, QTextEdit, QToolBar, QVBoxLayout,
 )
 
 from .icons import icon
@@ -108,7 +108,8 @@ class _EditTextDialog(QDialog):
 
     def __init__(self, parent, html_or_text: str, fontsize: float,
                  is_html: bool = False, align: str = "left",
-                 preserve_line_breaks: bool = False) -> None:
+                 preserve_line_breaks: bool = False,
+                 font_family: str = "") -> None:
         super().__init__(parent)
         self.setWindowTitle("Edit text")
         self.resize(720, 520)
@@ -120,6 +121,15 @@ class _EditTextDialog(QDialog):
         tb = QToolBar(self)
         tb.setIconSize(tb.iconSize())
         layout.addWidget(tb)
+
+        tb.addWidget(QLabel(" Font: "))
+        self._font_combo = QFontComboBox(self)
+        self._font_combo.setMaximumWidth(180)
+        if font_family:
+            self._font_combo.setCurrentFont(QFont(font_family))
+        self._font_combo.currentFontChanged.connect(self._on_font)
+        tb.addWidget(self._font_combo)
+        tb.addSeparator()
 
         tb.addWidget(QLabel(" Size: "))
         self._size_combo = QComboBox(self)
@@ -196,8 +206,8 @@ class _EditTextDialog(QDialog):
         self._editor.setAcceptRichText(True)
         if is_html:
             # Wrap the block HTML in a span carrying the original font
-            # size so the editor renders it at the right scale and
-            # toHtml() round-trips the size on save.
+            # family + size so the editor renders it at the right
+            # scale and toHtml() round-trips both on save.
             sz = max(4.0, fontsize)
             display_html = html_or_text
             if not preserve_line_breaks:
@@ -208,9 +218,11 @@ class _EditTextDialog(QDialog):
                 display_html = _re.sub(
                     r"<br\s*/?>", " ", display_html, flags=_re.IGNORECASE,
                 )
+            style = f"font-size:{sz:.1f}pt;"
+            if font_family:
+                style += f" font-family:'{font_family}';"
             self._editor.setHtml(
-                f'<span style="font-size:{sz:.1f}pt;">'
-                f'{display_html}</span>'
+                f'<span style="{style}">{display_html}</span>'
             )
         else:
             self._editor.setPlainText(html_or_text)
@@ -253,6 +265,15 @@ class _EditTextDialog(QDialog):
         act.triggered.connect(handler)
         tb.addAction(act)
         return act
+
+    def _on_font(self, font: QFont) -> None:
+        family = font.family()
+        cur = self._editor.textCursor()
+        if cur.hasSelection():
+            fmt = QTextCharFormat()
+            fmt.setFontFamily(family)
+            cur.mergeCharFormat(fmt)
+        self._editor.setFontFamily(family)
 
     def _on_size(self, text: str) -> None:
         try:
@@ -1557,11 +1578,15 @@ class PdfTab(QGraphicsView):
                                 flags=_re.IGNORECASE)
             sz = max(4.0, info["size"])
             align = info.get("align", "left")
+            font = info.get("font", "")
             # text-align is on the wrapping <div> so justify / center
             # / right preserved from the original block apply to the
-            # rewrapped lines at the new location.
+            # rewrapped lines at the new location. font-family carries
+            # the detected source font so insert_htmlbox uses it (or
+            # the closest MuPDF fallback).
+            font_css = f"font-family:'{font}';" if font else ""
             wrapped = (f'<div style="text-align:{align};'
-                       f'font-size:{sz:.1f}pt;">'
+                       f'font-size:{sz:.1f}pt;{font_css}">'
                        f'{html_body}</div>')
             try:
                 page.insert_htmlbox(new_rect, wrapped)
@@ -1810,6 +1835,7 @@ class PdfTab(QGraphicsView):
                 is_html=("html" in info),
                 align=info.get("align", "left"),
                 preserve_line_breaks=self._preserve_line_breaks(),
+                font_family=info.get("font", ""),
             )
             if dlg.exec() != QDialog.Accepted:
                 return
@@ -1954,6 +1980,7 @@ class PdfTab(QGraphicsView):
             align = self._detect_alignment(
                 block, float(first_span.get("size", 11.0))
             )
+            font = self._clean_font_name(first_span.get("font", ""))
             return {
                 "rect": (x0, y0, x1, y1),
                 "html": paragraph_html.rstrip(),
@@ -1961,8 +1988,36 @@ class PdfTab(QGraphicsView):
                 "size": float(first_span.get("size", 11.0)),
                 "color": (r, g, b),
                 "align": align,
+                "font": font,
             }
         return None
+
+    @staticmethod
+    def _clean_font_name(font: str) -> str:
+        """PDF font names often carry a 6-char subset prefix like
+        "ABCDEF+Helvetica" or trailing style markers like
+        "Helvetica,Bold" or "Arial-BoldItalicMT". Return the base
+        family the user would recognise so it can be looked up in
+        Qt's font registry and passed straight to insert_htmlbox's
+        CSS font-family."""
+        if not font:
+            return ""
+        # Strip subset prefix (six uppercase letters + "+")
+        if "+" in font:
+            font = font.split("+", 1)[1]
+        # Strip Adobe-style style suffix after comma or dash
+        for sep in (",", "-"):
+            if sep in font:
+                base, _ = font.split(sep, 1)
+                if base:
+                    font = base
+                    break
+        # Strip trailing "MT" / "PS" / "Std" markers that show up on
+        # Adobe-licensed TrueType variants.
+        for suffix in ("MT", "PS", "Std"):
+            if font.endswith(suffix):
+                font = font[: -len(suffix)]
+        return font.strip()
 
     @staticmethod
     def _preserve_line_breaks() -> bool:

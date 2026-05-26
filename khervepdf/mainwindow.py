@@ -28,7 +28,7 @@ from PySide6.QtWidgets import (
     QToolButton, QVBoxLayout, QWidget, QWidgetAction,
 )
 
-from . import git_backend, page_ops, themes, version_string
+from . import digital_sign, git_backend, page_ops, themes, version_string
 from .find_bar import FindBar
 from .history_dialog import HistoryDialog
 from .icons import app_icon, icon
@@ -504,6 +504,9 @@ class MainWindow(QMainWindow):
         m_file.addAction(QAction(icon("save_as"),
                                  "Encr&ypt / password protect…", self,
                                  triggered=self._encrypt_pdf))
+        m_file.addAction(QAction(icon("signature"),
+                                 "Di&gitally sign (PKCS#12)…", self,
+                                 triggered=self._digitally_sign))
         m_file.addAction(QAction(icon("print"), "&Print…", self,
                                  shortcut="Ctrl+P", triggered=self._print))
         m_file.addAction(QAction(icon("print"), "Print Pre&view…", self,
@@ -1354,6 +1357,110 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             f"Numbered {total} page(s)", 4000,
         )
+
+    def _digitally_sign(self) -> None:
+        """Add a real PKCS#7 cryptographic signature to the active
+        PDF (pyHanko, see digital_sign.py). The user supplies a
+        PKCS#12 (.p12 / .pfx) file containing their certificate +
+        private key; we ask for the password and the optional
+        reason / location / contact metadata, then write a signed
+        copy."""
+        t = self._current_pdf_tab()
+        if t is None or t._doc is None:
+            return
+        if not digital_sign.is_available():
+            QMessageBox.information(
+                self, "Digital signature",
+                "pyHanko isn't installed.\n\n"
+                "Install with:\n"
+                "    pip install pyHanko\n\n"
+                f"({digital_sign.import_error()})",
+            )
+            return
+        from PySide6.QtWidgets import (
+            QDialog as _D, QDialogButtonBox as _DB,
+            QFormLayout as _FL, QLineEdit as _LE, QPushButton as _PB,
+        )
+        dlg = _D(self)
+        dlg.setWindowTitle("Digitally sign PDF")
+        dlg.resize(560, 0)
+        fl = _FL(dlg)
+        p12_le = _LE(dlg)
+        p12_le.setPlaceholderText("Path to .p12 / .pfx file")
+        p12_btn = _PB("Browse…", dlg)
+
+        def _pick():
+            f, _ = QFileDialog.getOpenFileName(
+                dlg, "Pick certificate", "",
+                "PKCS#12 (*.p12 *.pfx);;All files (*)",
+            )
+            if f:
+                p12_le.setText(f)
+
+        p12_btn.clicked.connect(_pick)
+        from PySide6.QtWidgets import QHBoxLayout as _HL, QWidget as _W
+        row = _W(dlg)
+        h = _HL(row)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.addWidget(p12_le)
+        h.addWidget(p12_btn)
+        fl.addRow("Certificate:", row)
+        pw_le = _LE(dlg)
+        pw_le.setEchoMode(_LE.Password)
+        fl.addRow("Password:", pw_le)
+        reason_le = _LE(dlg)
+        reason_le.setPlaceholderText("e.g. Approval, Reviewed")
+        fl.addRow("Reason:", reason_le)
+        loc_le = _LE(dlg)
+        loc_le.setPlaceholderText("e.g. Imperial College London")
+        fl.addRow("Location:", loc_le)
+        contact_le = _LE(dlg)
+        contact_le.setPlaceholderText("e.g. e-mail")
+        fl.addRow("Contact:", contact_le)
+        bb = _DB(_DB.Ok | _DB.Cancel, parent=dlg)
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        fl.addWidget(bb)
+        if dlg.exec() != _D.Accepted:
+            return
+        if not p12_le.text():
+            QMessageBox.warning(self, "Sign", "Need a certificate.")
+            return
+        # The doc may have unsaved annotations — they need to be on
+        # disk before pyHanko can read them.
+        if t.is_dirty():
+            ok = QMessageBox.question(
+                self, "Save first?",
+                "There are unsaved annotations. Save them into the "
+                "PDF first so they're part of what gets signed?",
+            )
+            if ok == QMessageBox.Yes:
+                try:
+                    t.save_to_pdf()
+                except Exception as e:
+                    QMessageBox.warning(self, "Sign",
+                                        f"Save failed: {e}")
+                    return
+        suggested = t.path.with_name(f"{t.path.stem}_signed.pdf")
+        out_s, _ = QFileDialog.getSaveFileName(
+            self, "Save signed PDF as", str(suggested),
+            "PDF files (*.pdf);;All files (*)",
+        )
+        if not out_s:
+            return
+        ok, msg = digital_sign.sign_pdf(
+            t.path, Path(out_s),
+            Path(p12_le.text()), pw_le.text(),
+            reason=reason_le.text(),
+            location=loc_le.text(),
+            contact_info=contact_le.text(),
+        )
+        if ok:
+            self.statusBar().showMessage(
+                f"Signed → {out_s}", 6000,
+            )
+        else:
+            QMessageBox.warning(self, "Sign failed", msg)
 
     def _encrypt_pdf(self) -> None:
         """Save an encrypted copy of the active PDF. Two passwords:

@@ -416,24 +416,6 @@ class MainWindow(QMainWindow):
         toggle_thumbs.setText("Show Page &Thumbnails")
         toggle_thumbs.setIcon(icon("thumbs"))
         m_view.addAction(toggle_thumbs)
-        # Toggle controlling how Edit-Text / Move-Text stitch the PDF
-        # block's visual lines back together: by default they join
-        # with a space (one continuous paragraph in the editor); when
-        # ticked, they join with <br> so the original hyphenated
-        # layout (e.g. "flex- / ibility") is preserved in both the
-        # editor and the rewritten PDF.
-        self._preserve_breaks_act = QAction(
-            "Preserve PDF Line &Breaks (keep flex- / ibility)", self,
-            checkable=True,
-        )
-        self._preserve_breaks_act.setChecked(
-            self._settings().value("preserve_line_breaks",
-                                   False, type=bool)
-        )
-        self._preserve_breaks_act.toggled.connect(
-            self._on_toggle_preserve_breaks
-        )
-        m_view.addAction(self._preserve_breaks_act)
         m_view.addSeparator()
 
         m_theme = m_view.addMenu("&Theme")
@@ -614,9 +596,6 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(
             f"KhervePDF {version_string()}{subj_part} — {name}"
         )
-
-    def _on_toggle_preserve_breaks(self, checked: bool) -> None:
-        self._settings().setValue("preserve_line_breaks", bool(checked))
 
     def _on_tab_changed(self, _idx: int) -> None:
         self._refresh_status()

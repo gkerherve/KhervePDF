@@ -107,7 +107,8 @@ class _EditTextDialog(QDialog):
     """
 
     def __init__(self, parent, html_or_text: str, fontsize: float,
-                 is_html: bool = False, align: str = "left") -> None:
+                 is_html: bool = False, align: str = "left",
+                 preserve_line_breaks: bool = False) -> None:
         super().__init__(parent)
         self.setWindowTitle("Edit text")
         self.resize(720, 520)
@@ -169,6 +170,27 @@ class _EditTextDialog(QDialog):
         )
         self._align_acts[initial_act_name].setChecked(True)
 
+        # "Preserve PDF line breaks" — controls how the original
+        # paragraph is displayed in the editor. State persists in
+        # QSettings("kherve","KhervePDF")/preserve_line_breaks. The
+        # save path always strips <br> before insert_htmlbox so the
+        # rewritten text reflows naturally regardless of this state.
+        tb.addSeparator()
+        from PySide6.QtCore import QSettings as _QS
+        from PySide6.QtWidgets import QCheckBox as _QC
+        self._preserve_chk = _QC("Preserve PDF line breaks", self)
+        self._preserve_chk.setToolTip(
+            "Show the paragraph with the original PDF line breaks "
+            "(e.g. \"flex- ibility\" on separate lines). Takes effect "
+            "next time you open Edit Text."
+        )
+        self._preserve_chk.setChecked(bool(preserve_line_breaks))
+        self._preserve_chk.toggled.connect(
+            lambda v: _QS("kherve", "KhervePDF")
+                .setValue("preserve_line_breaks", bool(v))
+        )
+        tb.addWidget(self._preserve_chk)
+
         # ----- Editor -----
         self._editor = QTextEdit(self)
         self._editor.setAcceptRichText(True)
@@ -177,9 +199,18 @@ class _EditTextDialog(QDialog):
             # size so the editor renders it at the right scale and
             # toHtml() round-trips the size on save.
             sz = max(4.0, fontsize)
+            display_html = html_or_text
+            if not preserve_line_breaks:
+                # Flatten the source <br>s to spaces so the user sees
+                # one continuous paragraph (easier to edit). The
+                # checkbox below lets them switch back.
+                import re as _re
+                display_html = _re.sub(
+                    r"<br\s*/?>", " ", display_html, flags=_re.IGNORECASE,
+                )
             self._editor.setHtml(
                 f'<span style="font-size:{sz:.1f}pt;">'
-                f'{html_or_text}</span>'
+                f'{display_html}</span>'
             )
         else:
             self._editor.setPlainText(html_or_text)
@@ -1517,6 +1548,13 @@ class PdfTab(QGraphicsView):
             page.add_redact_annot(fitz.Rect(x0, y0, x1, y1), fill=(1, 1, 1))
             page.apply_redactions()
             html_body = info.get("html") or html_mod.escape(info["text"])
+            # Strip <br> from the recovered html so insert_htmlbox
+            # reflows naturally at the destination rather than baking
+            # in the original visual breaks (which inflate line spacing
+            # and overflow the rect).
+            import re as _re
+            html_body = _re.sub(r"<br\s*/?>", " ", html_body,
+                                flags=_re.IGNORECASE)
             sz = max(4.0, info["size"])
             align = info.get("align", "left")
             # text-align is on the wrapping <div> so justify / center
@@ -1771,6 +1809,7 @@ class PdfTab(QGraphicsView):
                 self, initial, info["size"],
                 is_html=("html" in info),
                 align=info.get("align", "left"),
+                preserve_line_breaks=self._preserve_line_breaks(),
             )
             if dlg.exec() != QDialog.Accepted:
                 return
@@ -1800,13 +1839,20 @@ class PdfTab(QGraphicsView):
         # scale); when scale < 1 the engine had to shrink to fit and
         # we extend the rect downward and retry so the user's chosen
         # font size is honoured instead of silently shrunk.
+        # Strip <br> before passing to insert_htmlbox: the engine's
+        # per-line spacing for explicit breaks is taller than the
+        # original PDF leading, which made the rewritten text overflow
+        # into the next paragraph. Letting insert_htmlbox reflow
+        # naturally produces tight lines that fit the original rect.
+        import re as _re
+        html = _re.sub(r"<br\s*/?>", " ", html, flags=_re.IGNORECASE)
+        html = html.replace(" ", " ")
         try:
             spare, scale = page.insert_htmlbox(rect, html)
             if scale < 0.999:
                 page_h = page.rect.height
                 grown = fitz.Rect(rect.x0, rect.y0,
                                   rect.x1, min(page_h, rect.y1 + rect.height * 4))
-                # Rewrite — first clear the previous shrunk attempt.
                 page.add_redact_annot(rect, fill=(1, 1, 1))
                 page.apply_redactions()
                 page.insert_htmlbox(grown, html)
@@ -1892,16 +1938,15 @@ class PdfTab(QGraphicsView):
                 line_plains.append("".join(plain_parts).rstrip())
             if first_span is None or not line_htmls:
                 continue
-            # User-controlled separator: spaces by default (one
-            # continuous paragraph) or <br>/\n if "Preserve PDF Line
-            # Breaks" is on. Hyphens at end of line are preserved
-            # either way so the user can decide whether to repair the
-            # word.
-            preserve = self._preserve_line_breaks()
-            sep_html = "<br>" if preserve else " "
-            sep_plain = "\n" if preserve else " "
-            paragraph_html = sep_html.join(line_htmls)
-            paragraph_plain = sep_plain.join(line_plains)
+            # Always carry the original line breaks as <br> /\n in
+            # the returned info. _EditTextDialog flattens them to
+            # spaces when its "Preserve line breaks" checkbox is
+            # unticked. Saving always strips <br> before
+            # insert_htmlbox so the engine can reflow the paragraph
+            # cleanly (otherwise <br> forces tall line-spacing that
+            # overflows into the next block).
+            paragraph_html = "<br>".join(line_htmls)
+            paragraph_plain = "\n".join(line_plains)
             raw_color = int(first_span.get("color", 0))
             r = ((raw_color >> 16) & 0xff) / 255.0
             g = ((raw_color >> 8) & 0xff) / 255.0

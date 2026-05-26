@@ -18,7 +18,7 @@ from PySide6.QtCore import QSettings, Qt
 from PySide6.QtGui import (
     QAction, QActionGroup, QColor, QImage, QKeySequence, QPainter,
 )
-from PySide6.QtPrintSupport import QPrintDialog, QPrinter
+from PySide6.QtPrintSupport import QPrinter, QPrintPreviewDialog
 from PySide6.QtWidgets import (
     QApplication, QButtonGroup, QCheckBox, QColorDialog, QComboBox,
     QDialog, QDockWidget, QDoubleSpinBox, QFileDialog, QGridLayout,
@@ -988,69 +988,69 @@ class MainWindow(QMainWindow):
     # ----- Print -----
 
     def _print(self) -> None:
-        """Open the OS printer dialog and render each PDF page to the
-        selected printer via QPainter. The user gets the standard
-        printer / page-range / copies / orientation controls; we
-        rasterise each page at the printer's logical DPI for fidelity
-        and fit-to-page within the printable rect."""
+        """Open Qt's print-preview dialog. Gives the user a full-doc
+        preview (with page navigation + zoom + a Print button) and
+        avoids the Windows print dialog complaining that we don't
+        support preview — the preview is rendered by us, by Qt."""
         t = self._current_pdf_tab()
         if t is None or t._doc is None or t._doc.page_count == 0:
             return
-        import fitz  # local import — only needed for the print path
         printer = QPrinter(QPrinter.HighResolution)
         printer.setDocName(t.path.stem)
-        # Tell the dialog the document's page count so the "Pages"
-        # range is bounded properly.
         printer.setFromTo(1, t._doc.page_count)
-        dlg = QPrintDialog(printer, self)
-        if dlg.exec() != QDialog.Accepted:
+        preview = QPrintPreviewDialog(printer, self)
+        preview.setWindowTitle(f"Print preview — {t.path.name}")
+        # paintRequested fires once for the preview, again on actual
+        # print after the user clicks Print in the toolbar. Same
+        # handler in both cases.
+        preview.paintRequested.connect(
+            lambda pr, tab=t: self._render_pdf_to_printer(pr, tab)
+        )
+        preview.exec()
+
+    def _render_pdf_to_printer(self, printer: QPrinter,
+                               tab: "PdfTab") -> None:
+        """Rasterise the (selected pages of the) active PDF onto
+        `printer`. PyMuPDF renders each page at a scale chosen to
+        fit the printable area while preserving aspect ratio; we
+        centre the image on the page. Honours fromPage / toPage."""
+        if tab._doc is None:
             return
+        import fitz  # local — only the print path needs it
         from_p = printer.fromPage() or 1
-        to_p = printer.toPage() or t._doc.page_count
+        to_p = printer.toPage() or tab._doc.page_count
         from_idx = max(0, from_p - 1)
-        to_idx = min(t._doc.page_count - 1, to_p - 1)
+        to_idx = min(tab._doc.page_count - 1, to_p - 1)
         if from_idx > to_idx:
             return
-        # Render each selected page at the printer's logical DPI so
-        # the output reads as crisp as the device can produce.
-        copies = printer.copyCount()
         painter = QPainter()
         if not painter.begin(printer):
-            QMessageBox.warning(self, "Print",
-                                "Could not start the print job.")
             return
         try:
-            for copy in range(max(1, copies)):
-                for n, page_idx in enumerate(range(from_idx, to_idx + 1)):
-                    page = t._doc[page_idx]
-                    page_rect_pt = page.rect
-                    # Scale to fit the printer's printable area while
-                    # preserving aspect ratio.
-                    printable = painter.viewport()  # device pixels
-                    sx = printable.width() / page_rect_pt.width
-                    sy = printable.height() / page_rect_pt.height
-                    scale = min(sx, sy)
-                    pix = page.get_pixmap(
-                        matrix=fitz.Matrix(scale, scale),
-                        alpha=False, annots=True,
-                    )
-                    img = QImage(
-                        pix.samples, pix.width, pix.height, pix.stride,
-                        QImage.Format_RGB888,
-                    ).copy()
-                    # Centre on the page.
-                    x = (printable.width() - pix.width) // 2
-                    y = (printable.height() - pix.height) // 2
-                    painter.drawImage(int(x), int(y), img)
-                    if (page_idx < to_idx) or (copy < copies - 1):
-                        printer.newPage()
+            first = True
+            for page_idx in range(from_idx, to_idx + 1):
+                if not first:
+                    printer.newPage()
+                first = False
+                page = tab._doc[page_idx]
+                page_rect_pt = page.rect
+                printable = painter.viewport()
+                sx = printable.width() / page_rect_pt.width
+                sy = printable.height() / page_rect_pt.height
+                scale = min(sx, sy)
+                pix = page.get_pixmap(
+                    matrix=fitz.Matrix(scale, scale),
+                    alpha=False, annots=True,
+                )
+                img = QImage(
+                    pix.samples, pix.width, pix.height, pix.stride,
+                    QImage.Format_RGB888,
+                ).copy()
+                x = (printable.width() - pix.width) // 2
+                y = (printable.height() - pix.height) // 2
+                painter.drawImage(int(x), int(y), img)
         finally:
             painter.end()
-        self.statusBar().showMessage(
-            f"Sent {to_idx - from_idx + 1} page(s) to "
-            f"{printer.printerName()}",
-            4000,
-        )
 
     # ----- Git menu -----
 
@@ -1185,6 +1185,8 @@ class MainWindow(QMainWindow):
             f"<li><b>KherveTeX</b> — WYSIWYG LaTeX editor.</li>"
             f"<li><b>KherveSheet</b> — Origin-style scientific "
             f"workbook.</li>"
+            f"<li><b>KherveDB</b> — reference database for the "
+            f"Kherve* suite.</li>"
             f"<li><b>KhervePDF</b> — this app: PDF viewing &amp; "
             f"annotation with the same look &amp; feel as the rest "
             f"of the suite.</li>"

@@ -492,9 +492,11 @@ class MainWindow(QMainWindow):
                                  shortcut="Ctrl+Shift+S",
                                  triggered=self._save_as))
         m_file.addSeparator()
-        m_file.addAction(QAction(icon("export_png"), "Export as &PNG…", self,
-                                 triggered=self._noop))
-        m_file.addAction(QAction(icon("export_txt"), "Export &Text…", self,
+        m_file.addAction(QAction(icon("export_png"),
+                                 "Export pages as &PNG / JPEG…", self,
+                                 triggered=self._export_images))
+        m_file.addAction(QAction(icon("export_txt"),
+                                 "Export &Text…", self,
                                  triggered=self._noop))
         m_file.addAction(QAction(icon("print"), "&Print…", self,
                                  shortcut="Ctrl+P", triggered=self._print))
@@ -1251,6 +1253,81 @@ class MainWindow(QMainWindow):
                               page.rect.width, page.rect.height)
         t._render_all()
         self._refresh_thumbs()
+
+    def _export_images(self) -> None:
+        t = self._current_pdf_tab()
+        if t is None or t._doc is None:
+            return
+        # Compact one-shot dialog: format radio + DPI spinbox + page
+        # range. Reuse _parse_page_range so the input format matches
+        # Extract pages.
+        from PySide6.QtWidgets import (
+            QButtonGroup as _BG, QDialog as _D, QDialogButtonBox as _DB,
+            QFormLayout as _FL, QRadioButton as _RB, QSpinBox as _SB,
+        )
+        from PySide6.QtWidgets import QLineEdit as _LE
+        dlg = _D(self)
+        dlg.setWindowTitle("Export pages as images")
+        fl = _FL(dlg)
+        png_rb = _RB("PNG (lossless)", dlg)
+        jpg_rb = _RB("JPEG (smaller)", dlg)
+        png_rb.setChecked(True)
+        rbg = _BG(dlg)
+        rbg.addButton(png_rb)
+        rbg.addButton(jpg_rb)
+        fl.addRow("Format:", png_rb)
+        fl.addRow("", jpg_rb)
+        dpi = _SB(dlg)
+        dpi.setRange(36, 600)
+        dpi.setSingleStep(36)
+        dpi.setValue(150)
+        dpi.setSuffix(" dpi")
+        fl.addRow("Resolution:", dpi)
+        pages = _LE(dlg)
+        pages.setText(f"1-{t._doc.page_count}")
+        fl.addRow("Pages:", pages)
+        bb = _DB(_DB.Ok | _DB.Cancel, parent=dlg)
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        fl.addWidget(bb)
+        if dlg.exec() != _D.Accepted:
+            return
+        indices = self._parse_page_range(pages.text(), t._doc.page_count)
+        if not indices:
+            QMessageBox.warning(self, "Export images",
+                                "Couldn't parse that page range.")
+            return
+        out_dir = QFileDialog.getExistingDirectory(
+            self, "Choose output directory", str(t.path.parent),
+        )
+        if not out_dir:
+            return
+        ext = "png" if png_rb.isChecked() else "jpg"
+        fmt = "png" if png_rb.isChecked() else "jpeg"
+        scale = dpi.value() / 72.0
+        import fitz as _fitz
+        matrix = _fitz.Matrix(scale, scale)
+        out_root = Path(out_dir)
+        width = len(str(t._doc.page_count))
+        written = 0
+        for n in indices:
+            try:
+                pix = t._doc[n].get_pixmap(
+                    matrix=matrix, alpha=False, annots=True,
+                )
+                out_path = (out_root /
+                            f"{t.path.stem}_p{n + 1:0{width}d}.{ext}")
+                pix.save(str(out_path), output=fmt)
+                written += 1
+            except Exception as e:
+                QMessageBox.warning(
+                    self, "Export images",
+                    f"Page {n + 1} failed: {e}",
+                )
+                break
+        self.statusBar().showMessage(
+            f"Wrote {written} image(s) to {out_dir}", 5000,
+        )
 
     def _extract_pages(self) -> None:
         t = self._current_pdf_tab()

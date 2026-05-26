@@ -17,14 +17,16 @@ from typing import Optional
 from PySide6.QtCore import QSettings, Qt
 from PySide6.QtGui import QAction, QActionGroup, QColor
 from PySide6.QtWidgets import (
-    QButtonGroup, QCheckBox, QColorDialog, QDockWidget, QDoubleSpinBox,
-    QFileDialog, QGridLayout, QHBoxLayout, QLabel, QMainWindow, QMenu,
-    QMessageBox, QPushButton, QSlider, QStatusBar, QTabWidget, QToolBar,
-    QToolButton, QVBoxLayout, QWidget, QWidgetAction,
+    QApplication, QButtonGroup, QCheckBox, QColorDialog, QDockWidget,
+    QDoubleSpinBox, QFileDialog, QGridLayout, QHBoxLayout, QLabel,
+    QMainWindow, QMenu, QMessageBox, QProgressBar, QPushButton, QSlider,
+    QStatusBar, QTabWidget, QToolBar, QToolButton, QVBoxLayout, QWidget,
+    QWidgetAction,
 )
 
 from . import themes, version_string, last_commit_subject
 from .icons import app_icon, icon
+from .outline import OutlinePanel
 from .pdftab import PdfTab, TOOL_DEFAULTS
 from .thumbnails import ThumbnailPanel
 
@@ -330,6 +332,8 @@ class MainWindow(QMainWindow):
 
         self.setWindowIcon(app_icon())
         self.resize(1280, 860)
+        # Accept PDFs dragged from the file manager onto the window.
+        self.setAcceptDrops(True)
 
         self._tabs = QTabWidget(self)
         self._tabs.setTabsClosable(True)
@@ -345,17 +349,28 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(self._tabs)
 
         self._current_tool = "hand"
-        # Side thumbnails panel (dock-widget). Built before the menus
-        # so View → Show Page Thumbnails can hook its toggleViewAction.
+        # Side panel — a QTabWidget holding the page thumbnails and the
+        # document outline (TOC) — lives in a dock so the user can
+        # hide/move it. Built before the menus so View → Show Side
+        # Panel can hook its toggleViewAction.
         self._thumbs = ThumbnailPanel(self)
-        self._thumbs_dock = QDockWidget("Pages", self)
+        self._outline = OutlinePanel(self)
+        self._side_tabs = QTabWidget(self)
+        self._side_tabs.addTab(self._thumbs, "Pages")
+        self._side_tabs.addTab(self._outline, "Contents")
+        self._thumbs_dock = QDockWidget("Document", self)
         self._thumbs_dock.setObjectName("PagesDock")
-        self._thumbs_dock.setWidget(self._thumbs)
+        self._thumbs_dock.setWidget(self._side_tabs)
         self._thumbs_dock.setAllowedAreas(
             Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea
         )
         self.addDockWidget(Qt.LeftDockWidgetArea, self._thumbs_dock)
         self._thumbs.page_clicked.connect(self._goto_page)
+        self._outline.page_clicked.connect(self._goto_page)
+        # Thumbnail rendering reports progress so the status-bar
+        # loading bar can show how much of a long PDF has been
+        # rasterised into the side panel.
+        self._thumbs.rendering_progress.connect(self._on_render_progress)
         self._build_menus()
         self._build_toolbar()
         self._build_statusbar()
@@ -573,10 +588,32 @@ class MainWindow(QMainWindow):
         self._lbl_zoom = QLabel("100%")
         self._lbl_tool = QLabel("Select")
         self._lbl_branch = QLabel("")
+        # Progress bar — hidden when idle, shown while opening a PDF
+        # or rendering thumbnails. Determinate when total > 0,
+        # indeterminate (busy) when range == (0, 0).
+        self._progress = QProgressBar(self)
+        self._progress.setMaximumWidth(180)
+        self._progress.setMaximumHeight(14)
+        self._progress.setTextVisible(False)
+        self._progress.setVisible(False)
         sb.addWidget(self._lbl_page)
+        sb.addPermanentWidget(self._progress)
         sb.addPermanentWidget(self._lbl_tool)
         sb.addPermanentWidget(self._lbl_zoom)
         sb.addPermanentWidget(self._lbl_branch)
+
+    def _on_render_progress(self, current: int, total: int) -> None:
+        """Slot for ThumbnailPanel.rendering_progress — drives the
+        status-bar progress bar while the side panel rasterises a
+        document's pages."""
+        if total <= 0 or current >= total:
+            self._progress.setVisible(False)
+            self._progress.setRange(0, 100)
+            self._progress.setValue(0)
+            return
+        self._progress.setRange(0, total)
+        self._progress.setValue(current)
+        self._progress.setVisible(True)
 
     # ----- theming -----
 
@@ -610,6 +647,7 @@ class MainWindow(QMainWindow):
         tab = self._current_pdf_tab()
         doc = getattr(tab, "_doc", None) if tab is not None else None
         self._thumbs.set_document(doc)
+        self._outline.set_document(doc)
 
     def _goto_page(self, page_idx: int) -> None:
         tab = self._current_pdf_tab()
@@ -632,6 +670,50 @@ class MainWindow(QMainWindow):
         w = self._tabs.currentWidget()
         return getattr(w, "path", None) if w else None
 
+    # ----- drag & drop -----
+
+    @staticmethod
+    def _pdf_urls(mime) -> list[Path]:
+        """Return the list of .pdf file paths in a QMimeData drop, in
+        the order they appeared. Non-PDF URLs are filtered out — we
+        don't want a stray .docx silently ignored to surprise the
+        user, but rejecting at the dragEnter stage is the friendlier
+        UX, so this helper is shared by both events."""
+        paths: list[Path] = []
+        if not mime.hasUrls():
+            return paths
+        for url in mime.urls():
+            if not url.isLocalFile():
+                continue
+            p = Path(url.toLocalFile())
+            if p.suffix.lower() == ".pdf" and p.is_file():
+                paths.append(p)
+        return paths
+
+    def dragEnterEvent(self, event):  # noqa: N802 — Qt override
+        if self._pdf_urls(event.mimeData()):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):  # noqa: N802 — Qt override
+        # Needed so the drop cursor stays "copy" the whole way across
+        # the window; without it some Qt platforms revert to "no-drop"
+        # mid-drag.
+        if self._pdf_urls(event.mimeData()):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event):  # noqa: N802 — Qt override
+        paths = self._pdf_urls(event.mimeData())
+        if not paths:
+            event.ignore()
+            return
+        for p in paths:
+            self.open_path(p)
+        event.acceptProposedAction()
+
     def _close_tab(self, idx: int) -> None:
         if idx < 0:
             return
@@ -647,14 +729,26 @@ class MainWindow(QMainWindow):
     # ----- file actions (stubs — concrete logic in pdftab v0.3) -----
 
     def open_path(self, path: Path) -> None:
+        # Indeterminate progress while fitz.open + the first render
+        # run — these are fast for small PDFs but can take a moment
+        # for hundreds of pages.
+        self._progress.setRange(0, 0)
+        self._progress.setVisible(True)
+        QApplication.processEvents()
         try:
             tab = PdfTab(path, self)
         except Exception as e:
+            self._progress.setVisible(False)
+            self._progress.setRange(0, 100)
             QMessageBox.critical(
                 self, "Open failed",
                 f"Could not open <b>{path.name}</b>:<br>{e}",
             )
             return
+        # Reset to determinate; the thumbnail rendering signal will
+        # take over from here.
+        self._progress.setRange(0, 100)
+        self._progress.setVisible(False)
         self._tabs.addTab(tab, path.name)
         self._tabs.setCurrentWidget(tab)
         tab.set_tool(self._current_tool)

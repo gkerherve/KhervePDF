@@ -26,9 +26,12 @@ THUMB_WIDTH = 140
 
 
 class ThumbnailPanel(QListWidget):
-    """Page list that emits page_clicked(idx) when a row is clicked."""
+    """Page list that emits page_clicked(idx) when a row is clicked
+    and rendering_progress(current, total) while building thumbs so
+    the status bar can show a loading bar."""
 
     page_clicked = Signal(int)
+    rendering_progress = Signal(int, int)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -43,10 +46,14 @@ class ThumbnailPanel(QListWidget):
 
     def set_document(self, doc: Optional[fitz.Document]) -> None:
         """Replace the panel contents with thumbnails of every page in
-        `doc`. Passing None clears the panel."""
+        `doc`. Passing None clears the panel. Emits
+        rendering_progress(i+1, total) after each page so a status-bar
+        loading indicator can advance."""
         self.clear()
         if doc is None:
+            self.rendering_progress.emit(0, 0)
             return
+        total = doc.page_count
         for i, page in enumerate(doc):
             page_w = page.rect.width or 1.0
             # Oversample a touch (×1.4) and let scaledToWidth down-
@@ -71,6 +78,10 @@ class ThumbnailPanel(QListWidget):
             item.setData(Qt.UserRole, i)
             item.setSizeHint(QSize(pm.width() + 24, pm.height() + 10))
             self.addItem(item)
+            self.rendering_progress.emit(i + 1, total)
+        # Signal completion so the status bar can clear its progress
+        # indicator even if total == 0.
+        self.rendering_progress.emit(total, total)
 
     def set_current_page(self, idx: int) -> None:
         if 0 <= idx < self.count():

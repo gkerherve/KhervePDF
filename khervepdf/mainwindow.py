@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
 )
 
 from . import git_backend, page_ops, themes, version_string
+from .find_bar import FindBar
 from .history_dialog import HistoryDialog
 from .icons import app_icon, icon
 from .outline import OutlinePanel
@@ -513,8 +514,9 @@ class MainWindow(QMainWindow):
         m_edit.addAction(QAction(icon("redo"), "&Redo", self, shortcut="Ctrl+Y",
                                  triggered=self._redo))
         m_edit.addSeparator()
-        m_edit.addAction(QAction(icon("find"), "&Find…", self, shortcut="Ctrl+F",
-                                 triggered=self._noop))
+        m_edit.addAction(QAction(icon("find"), "&Find…", self,
+                                 shortcut="Ctrl+F",
+                                 triggered=self._show_find_bar))
 
         m_view = mb.addMenu("&View")
         # Zoom shortcuts mirror the browser convention: Ctrl++ /
@@ -1081,6 +1083,27 @@ class MainWindow(QMainWindow):
             self, "Open PDF", "", "PDF files (*.pdf);;All files (*)")
         if path_s:
             self.open_path(Path(path_s))
+
+    def _show_find_bar(self) -> None:
+        """Open the floating Find bar at the top of the canvas
+        (lazy-instantiated). The bar searches across every page of
+        the active PDF and jumps to each match with a yellow
+        overlay rect."""
+        t = self._current_pdf_tab()
+        if t is None or t._doc is None:
+            return
+        if getattr(self, "_find_bar", None) is None:
+            self._find_bar = FindBar(self)
+            self._find_bar.setParent(self)
+        self._find_bar.set_tab(t)
+        # Centre at the top of the viewport.
+        x = (self.width() - max(self._find_bar.sizeHint().width(), 420)) // 2
+        self._find_bar.setGeometry(x, 60,
+                                   max(self._find_bar.sizeHint().width(),
+                                       420),
+                                   self._find_bar.sizeHint().height())
+        self._find_bar.show_and_focus()
+        self._find_bar.raise_()
 
     def _undo(self) -> None:
         t = self._current_pdf_tab()

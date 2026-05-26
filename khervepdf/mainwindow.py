@@ -133,32 +133,50 @@ class MainWindow(QMainWindow):
         tb = QToolBar("Main", self)
         tb.setMovable(False)
         self.addToolBar(Qt.TopToolBarArea, tb)
-        # (icon_name, tooltip, handler). "|" inserts a separator.
-        entries: list = [
-            ("open",      "Open PDF (Ctrl+O)",   self._open),
-            ("save",      "Save (Ctrl+S)",       self._save),
-            "|",
-            ("select",    "Select",              self._noop),
-            ("pen",       "Pen",                 self._noop),
-            ("highlight", "Highlight",           self._noop),
-            ("text",      "Text",                self._noop),
-            ("line",      "Line",                self._noop),
-            ("arrow",     "Arrow",               self._noop),
-            ("rect",      "Rectangle",           self._noop),
-            ("ellipse",   "Ellipse",             self._noop),
-            ("note",      "Sticky Note",         self._noop),
-            ("signature", "Signature",           self._noop),
-            ("redact",    "Redact",              self._noop),
-            "|",
-            ("zoom_out",  "Zoom Out",            self._zoom_out),
-            ("zoom_in",   "Zoom In",             self._zoom_in),
-            ("fit_width", "Fit Width",           self._fit_width),
+
+        # Plain file/zoom actions.
+        for name, tip, handler in (
+            ("open",     "Open PDF (Ctrl+O)", self._open),
+            ("save",     "Save (Ctrl+S)",     self._save),
+        ):
+            act = QAction(icon(name), tip, self, triggered=handler)
+            act.setToolTip(tip)
+            tb.addAction(act)
+        tb.addSeparator()
+
+        # Tool buttons — checkable, mutually exclusive. Triggering one
+        # sets the active PdfTab's current tool.
+        self._tool_group = QActionGroup(self)
+        self._tool_group.setExclusive(True)
+        self._tool_actions: dict[str, QAction] = {}
+        tools = [
+            ("select",    "Select / Pan"),
+            ("pen",       "Pen"),
+            ("highlight", "Highlight"),
+            ("text",      "Text"),
+            ("line",      "Line"),
+            ("arrow",     "Arrow"),
+            ("rect",      "Rectangle"),
+            ("ellipse",   "Ellipse"),
+            ("note",      "Sticky Note"),
+            ("signature", "Signature"),
+            ("redact",    "Redact"),
         ]
-        for e in entries:
-            if e == "|":
-                tb.addSeparator()
-                continue
-            name, tip, handler = e
+        for name, tip in tools:
+            act = QAction(icon(name), tip, self, checkable=True)
+            act.setToolTip(tip)
+            act.triggered.connect(lambda _c=False, n=name: self._set_tool(n))
+            self._tool_group.addAction(act)
+            self._tool_actions[name] = act
+            tb.addAction(act)
+        self._tool_actions["select"].setChecked(True)
+
+        tb.addSeparator()
+        for name, tip, handler in (
+            ("zoom_out",  "Zoom Out",  self._zoom_out),
+            ("zoom_in",   "Zoom In",   self._zoom_in),
+            ("fit_width", "Fit Width", self._fit_width),
+        ):
             act = QAction(icon(name), tip, self, triggered=handler)
             act.setToolTip(tip)
             tb.addAction(act)
@@ -239,6 +257,12 @@ class MainWindow(QMainWindow):
             return
         self._tabs.addTab(tab, path.name)
         self._tabs.setCurrentWidget(tab)
+        checked = self._tool_group.checkedAction()
+        if checked is not None:
+            for n, a in self._tool_actions.items():
+                if a is checked:
+                    tab.set_tool(n)
+                    break
         self._refresh_status()
 
     # ----- view actions -----
@@ -264,6 +288,12 @@ class MainWindow(QMainWindow):
         if t:
             t.fit_width()
             self._refresh_status()
+
+    def _set_tool(self, name: str) -> None:
+        t = self._current_pdf_tab()
+        if t:
+            t.set_tool(name)
+        self._lbl_tool.setText(name.capitalize())
 
     def _new(self) -> None:
         self._noop()

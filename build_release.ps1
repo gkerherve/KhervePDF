@@ -1,6 +1,6 @@
 # Build script for a KhervePDF release.
 #
-#   1. Runs PyInstaller against KhervePDF.spec — produces dist\KhervePDF\
+#   1. Runs PyInstaller against KhervePDF.spec - produces dist\KhervePDF\
 #   2. Zips that folder into dist\KhervePDF_<version>.zip
 #   3. Runs Inno Setup (ISCC.exe) against KhervePDF_setup.iss to make
 #      installer\Setup_KhervePDF_<version>.exe
@@ -27,7 +27,7 @@ if ($initPy -match '__version__\s*=\s*"([^"]+)"') {
 }
 Write-Host "Building KhervePDF v$Version" -ForegroundColor Cyan
 
-# 0. Icon — render from icons.app_icon() into a multi-res .ico so
+# 0. Icon - render from icons.app_icon() into a multi-res .ico so
 # both the PyInstaller EXE block and the Inno Setup wizard pick up
 # the red KP monogram.
 Write-Host "==> Generating build\KhervePDF.ico from icons.app_icon()" -ForegroundColor Yellow
@@ -65,7 +65,7 @@ if (-not $iscc) {
 
 if ($iscc) {
     # Inno Setup hits Windows' 260-char MAX_PATH when the project
-    # lives under a long OneDrive path — sweeping the dist tree
+    # lives under a long OneDrive path - sweeping the dist tree
     # plus deeply-nested PySide6 plugins blows the limit. Stage
     # everything ISCC reads into C:\tmp\kpbuild before compiling,
     # then copy the resulting Setup.exe back into installer\.
@@ -99,8 +99,8 @@ if ($iscc) {
     }
 } else {
     Write-Host ""
-    Write-Host "Inno Setup not found — skipping Setup.exe generation." -ForegroundColor Yellow
-    Write-Host "Install from https://jrsoftware.org/isinfo.php (free, ~3 MB)" -ForegroundColor Yellow
+    Write-Host "Inno Setup not found - skipping Setup.exe generation." -ForegroundColor Yellow
+    Write-Host "Install from https://jrsoftware.org/isinfo.php (free, 3 MB)" -ForegroundColor Yellow
     Write-Host "then re-run this script to produce the installer." -ForegroundColor Yellow
 }
 

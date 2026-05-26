@@ -652,13 +652,141 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"Saved {saved}", 3000)
 
     def _about(self) -> None:
-        from PySide6.QtWidgets import QMessageBox
-        QMessageBox.about(
-            self, "About KhervePDF",
-            f"<b>KhervePDF</b> {version_string()}<br>"
-            "WYSIWYG PDF viewer & annotation editor with Git history.<br>"
-            "<a href='https://github.com/gkerherve/KhervePDF'>github.com/gkerherve/KhervePDF</a>",
+        """Rich About dialog: app + author bio + every library the
+        running app actually loads, each with a one-line description
+        of why it's here. Same shape as KherveTeX's About so the suite
+        feels consistent."""
+        from PySide6.QtWidgets import QDialog, QDialogButtonBox, QTextBrowser
+
+        def _ver(modname: str) -> str:
+            try:
+                mod = __import__(modname)
+                return getattr(mod, "__version__", "") or "(unknown)"
+            except Exception:
+                return "not installed"
+
+        import sys
+        py_ver = sys.version.split()[0]
+
+        libraries = [
+            ("PySide6", _ver("PySide6"),
+             "Official Qt for Python bindings — drives the entire GUI: "
+             "tabs, toolbar, options popup, the QGraphicsView canvas, "
+             "the rich-text Edit-Text dialog.",
+             "https://doc.qt.io/qtforpython-6/"),
+            ("PyMuPDF (fitz)", _ver("pymupdf"),
+             "Page-level access to PDFs — rasterising pages for the "
+             "view, loading / baking annotations (ink, rect, ellipse, "
+             "line, highlight, sticky-note, free-text), redaction and "
+             "HTML-box insertion for the Edit-Text feature.",
+             "https://pymupdf.readthedocs.io/"),
+            ("pikepdf", _ver("pikepdf"),
+             "Higher-level PDF library used for page-level operations "
+             "(merge, split, reorder) that fall outside PyMuPDF's "
+             "comfort zone.",
+             "https://pikepdf.readthedocs.io/"),
+            ("pygit2", _ver("pygit2"),
+             "libgit2 bindings — surfaces the per-document Git "
+             "metadata in the title bar (commit count + short SHA + "
+             "subject of HEAD).",
+             "https://www.pygit2.org/"),
+            ("qtawesome", _ver("qtawesome"),
+             "Font Awesome / Material Design Icons glyphs rendered as "
+             "QIcons at runtime — every toolbar and menu icon. No "
+             "PNG/SVG files ship with the app.",
+             "https://github.com/spyder-ide/qtawesome"),
+        ]
+
+        rows = []
+        for name, ver, role, url in libraries:
+            rows.append(
+                "<tr>"
+                f"<td valign='top' style='padding:6px 14px 6px 0'>"
+                f"<b>{name}</b><br>"
+                f"<span style='color:#666;font-size:9pt'>{ver}</span></td>"
+                f"<td valign='top' style='padding:6px 0'>{role}<br>"
+                f"<a href='{url}'>{url}</a></td>"
+                "</tr>"
+            )
+        lib_table = (
+            "<table cellpadding='0' cellspacing='0' "
+            "style='border-collapse:collapse'>"
+            + "".join(rows) +
+            "</table>"
         )
+
+        html = (
+            f"<h2 style='margin-bottom:2pt'>KhervePDF "
+            f"{version_string()}</h2>"
+            f"<p style='color:#666;margin-top:0'>WYSIWYG PDF viewer &amp; "
+            f"annotation editor with Git history.</p>"
+            f"<p><a href='https://github.com/gkerherve/KhervePDF'>"
+            f"github.com/gkerherve/KhervePDF</a> &nbsp;·&nbsp; "
+            f"GPL-3.0</p>"
+            f"<hr>"
+            f"<h3>About the author</h3>"
+            f"<p><b>Gwilherm Kerherv&eacute;</b> &nbsp;—&nbsp; "
+            f"Research Associate, Department of Materials, "
+            f"<a href='https://www.imperial.ac.uk/materials/'>"
+            f"Imperial College London</a>.</p>"
+            f"<p>Works on surface analysis and X-ray Photoelectron "
+            f"Spectroscopy (XPS), with a focus on materials for energy "
+            f"storage and catalysis. Maintains a small constellation "
+            f"of open-source tools, mostly for the XPS community:</p>"
+            f"<ul>"
+            f"<li><a href='https://github.com/gkerherve/KherveFitting'>"
+            f"KherveFitting</a> — peak fitting for XPS spectra.</li>"
+            f"<li><a href='https://github.com/gkerherve/spe_reader'>"
+            f"spe-xps-reader</a> — open reader for PHI Instruments "
+            f"SPE binary files.</li>"
+            f"<li><a href='https://github.com/gkerherve/KherveTeX'>"
+            f"KherveTeX</a> — WYSIWYG LaTeX editor.</li>"
+            f"<li><a href='https://github.com/gkerherve/KherveSheet'>"
+            f"KherveSheet</a> — Origin-style scientific workbook.</li>"
+            f"<li><b>KhervePDF</b> — this app: PDF viewing &amp; "
+            f"annotation with the same look &amp; feel as the rest "
+            f"of the suite.</li>"
+            f"</ul>"
+            f"<p>KhervePDF was built to round out the trio: write "
+            f"papers in KherveTeX, crunch and plot data in "
+            f"KherveSheet, and mark up PDFs (referee reports, "
+            f"reading lists, manuscripts) in KhervePDF — all "
+            f"sharing the same themes, the same icon style, and the "
+            f"same per-document Git history.</p>"
+            f"<p>"
+            f"<a href='mailto:g.kerherve@imperial.ac.uk'>"
+            f"g.kerherve@imperial.ac.uk</a> &nbsp;·&nbsp; "
+            f"<a href='mailto:gwilherm.kerherve@gmail.com'>"
+            f"gwilherm.kerherve@gmail.com</a>"
+            f"</p>"
+            f"<hr>"
+            f"<h3>Libraries</h3>"
+            f"<p style='color:#666;margin-bottom:6pt'>Python "
+            f"{py_ver}</p>"
+            f"{lib_table}"
+            f"<p style='color:#888;margin-top:14pt;font-size:9pt'>"
+            f"Every toolbar icon is drawn at runtime via qtawesome — "
+            f"no .ico / .png / .svg ships with the app. Annotations "
+            f"round-trip through real PDF annotation objects "
+            f"(ink, square, circle, line, highlight, text, "
+            f"free-text), so files stay editable across save cycles "
+            f"and in other PDF readers."
+            f"</p>"
+        )
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("About KhervePDF")
+        dlg.resize(720, 760)
+        browser = QTextBrowser(dlg)
+        browser.setOpenExternalLinks(True)
+        browser.setHtml(html)
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        buttons.rejected.connect(dlg.reject)
+        buttons.accepted.connect(dlg.accept)
+        layout = QVBoxLayout(dlg)
+        layout.addWidget(browser, 1)
+        layout.addWidget(buttons)
+        dlg.exec()
 
     def _noop(self) -> None:
         # Stub for actions not yet implemented in this version.

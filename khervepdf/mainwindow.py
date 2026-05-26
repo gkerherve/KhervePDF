@@ -18,7 +18,7 @@ from PySide6.QtCore import QSettings, Qt
 from PySide6.QtGui import (
     QAction, QActionGroup, QColor, QImage, QKeySequence, QPainter,
 )
-from PySide6.QtPrintSupport import QPrinter, QPrintPreviewDialog
+from PySide6.QtPrintSupport import QPrintDialog, QPrinter, QPrintPreviewDialog
 from PySide6.QtWidgets import (
     QApplication, QButtonGroup, QCheckBox, QColorDialog, QComboBox,
     QDialog, QDockWidget, QDoubleSpinBox, QFileDialog, QGridLayout,
@@ -408,6 +408,9 @@ class MainWindow(QMainWindow):
                                  triggered=self._noop))
         m_file.addAction(QAction(icon("print"), "&Print…", self,
                                  shortcut="Ctrl+P", triggered=self._print))
+        m_file.addAction(QAction(icon("print"), "Print Pre&view…", self,
+                                 shortcut="Ctrl+Shift+P",
+                                 triggered=self._print_preview))
         m_file.addSeparator()
         m_file.addAction(QAction(icon("close"), "&Close Tab", self,
                                  shortcut="Ctrl+W",
@@ -988,10 +991,29 @@ class MainWindow(QMainWindow):
     # ----- Print -----
 
     def _print(self) -> None:
-        """Open Qt's print-preview dialog. Gives the user a full-doc
-        preview (with page navigation + zoom + a Print button) and
-        avoids the Windows print dialog complaining that we don't
-        support preview — the preview is rendered by us, by Qt."""
+        """File → Print: jump straight to the OS native printer
+        dialog. From there the user picks printer, range, copies,
+        and orientation, then hits Print. (Print Preview is a
+        separate menu item for the Qt-preview workflow.)"""
+        t = self._current_pdf_tab()
+        if t is None or t._doc is None or t._doc.page_count == 0:
+            return
+        printer = QPrinter(QPrinter.HighResolution)
+        printer.setDocName(t.path.stem)
+        printer.setFromTo(1, t._doc.page_count)
+        dlg = QPrintDialog(printer, self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        self._render_pdf_to_printer(printer, t)
+        self.statusBar().showMessage(
+            f"Sent to {printer.printerName()}", 4000,
+        )
+
+    def _print_preview(self) -> None:
+        """File → Print Preview: open Qt's preview window (page
+        navigation, zoom, fit-page / two-page modes). Its toolbar's
+        Print button hands off to the OS native dialog for printer
+        selection. Both dialogs are visible together in this flow."""
         t = self._current_pdf_tab()
         if t is None or t._doc is None or t._doc.page_count == 0:
             return
@@ -1000,9 +1022,6 @@ class MainWindow(QMainWindow):
         printer.setFromTo(1, t._doc.page_count)
         preview = QPrintPreviewDialog(printer, self)
         preview.setWindowTitle(f"Print preview — {t.path.name}")
-        # paintRequested fires once for the preview, again on actual
-        # print after the user clicks Print in the toolbar. Same
-        # handler in both cases.
         preview.paintRequested.connect(
             lambda pr, tab=t: self._render_pdf_to_printer(pr, tab)
         )

@@ -113,8 +113,12 @@ class _EditTextDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Edit text")
         self.resize(720, 520)
+        # Snapshot the inputs so toggling "Preserve line breaks" can
+        # re-render the editor without re-querying the document.
         self._initial_is_html = is_html
         self._initial_content = html_or_text
+        self._initial_fontsize = float(max(4.0, fontsize))
+        self._initial_font_family = font_family
         layout = QVBoxLayout(self)
 
         # ----- Toolbar -----
@@ -195,56 +199,13 @@ class _EditTextDialog(QDialog):
             "next time you open Edit Text."
         )
         self._preserve_chk.setChecked(bool(preserve_line_breaks))
-        self._preserve_chk.toggled.connect(
-            lambda v: _QS("kherve", "KhervePDF")
-                .setValue("preserve_line_breaks", bool(v))
-        )
+        self._preserve_chk.toggled.connect(self._on_preserve_toggled)
         tb.addWidget(self._preserve_chk)
 
         # ----- Editor -----
         self._editor = QTextEdit(self)
         self._editor.setAcceptRichText(True)
-        if is_html:
-            # Wrap the block HTML in a span carrying the original font
-            # family + size so the editor renders it at the right
-            # scale and toHtml() round-trips both on save.
-            sz = max(4.0, fontsize)
-            display_html = html_or_text
-            if not preserve_line_breaks:
-                # Flatten the source <br>s to spaces so the user sees
-                # one continuous paragraph (easier to edit). The
-                # checkbox below lets them switch back.
-                import re as _re
-                display_html = _re.sub(
-                    r"<br\s*/?>", " ", display_html, flags=_re.IGNORECASE,
-                )
-            style = f"font-size:{sz:.1f}pt;"
-            if font_family:
-                style += f" font-family:'{font_family}';"
-            self._editor.setHtml(
-                f'<span style="{style}">{display_html}</span>'
-            )
-        else:
-            self._editor.setPlainText(html_or_text)
-            cur = self._editor.textCursor()
-            cur.select(QTextCursor.Document)
-            fmt = QTextCharFormat()
-            fmt.setFontPointSize(float(max(4.0, fontsize)))
-            cur.mergeCharFormat(fmt)
-            cur.clearSelection()
-            self._editor.setTextCursor(cur)
-        self._editor.setFontPointSize(float(max(4.0, fontsize)))
-        # Apply the detected/initial alignment to every block in the
-        # document so an originally-justified paragraph reopens as
-        # justified in the editor and round-trips through toHtml.
-        cur_align = self._editor.textCursor()
-        cur_align.select(QTextCursor.Document)
-        blk_fmt = QTextBlockFormat()
-        blk_fmt.setAlignment(self._initial_qt_align)
-        cur_align.mergeBlockFormat(blk_fmt)
-        cur_align.clearSelection()
-        self._editor.setTextCursor(cur_align)
-        self._editor.setAlignment(self._initial_qt_align)
+        self._reload_initial_content(preserve_line_breaks)
         self._editor.currentCharFormatChanged.connect(self._sync_toolbar)
         self._editor.cursorPositionChanged.connect(self._sync_toolbar)
         layout.addWidget(self._editor, 1)
@@ -266,7 +227,62 @@ class _EditTextDialog(QDialog):
         tb.addAction(act)
         return act
 
+    def _reload_initial_content(self, preserve_line_breaks: bool) -> None:
+        """(Re)load the original block into the editor with line breaks
+        either preserved or flattened to spaces. Called once from
+        __init__ and again from the "Preserve line breaks" toggle so
+        ticking / unticking refreshes the editor view immediately.
+        Any in-progress edits to the editor are replaced — the toggle
+        is intended for the user to choose how they want to see the
+        source paragraph before they start editing it."""
+        sz = self._initial_fontsize
+        if self._initial_is_html:
+            display_html = self._initial_content
+            if not preserve_line_breaks:
+                import re as _re
+                display_html = _re.sub(
+                    r"<br\s*/?>", " ", display_html, flags=_re.IGNORECASE,
+                )
+            style = f"font-size:{sz:.1f}pt;"
+            if self._initial_font_family:
+                style += f" font-family:'{self._initial_font_family}';"
+            self._editor.setHtml(
+                f'<span style="{style}">{display_html}</span>'
+            )
+        else:
+            self._editor.setPlainText(self._initial_content)
+            cur = self._editor.textCursor()
+            cur.select(QTextCursor.Document)
+            fmt = QTextCharFormat()
+            fmt.setFontPointSize(sz)
+            cur.mergeCharFormat(fmt)
+            cur.clearSelection()
+            self._editor.setTextCursor(cur)
+        self._editor.setFontPointSize(sz)
+        # Re-apply alignment to the freshly loaded content.
+        cur_align = self._editor.textCursor()
+        cur_align.select(QTextCursor.Document)
+        blk_fmt = QTextBlockFormat()
+        blk_fmt.setAlignment(self._initial_qt_align)
+        cur_align.mergeBlockFormat(blk_fmt)
+        cur_align.clearSelection()
+        self._editor.setTextCursor(cur_align)
+        self._editor.setAlignment(self._initial_qt_align)
+
+    def _on_preserve_toggled(self, checked: bool) -> None:
+        # Persist the choice for the next dialog open …
+        from PySide6.QtCore import QSettings as _QS
+        _QS("kherve", "KhervePDF").setValue("preserve_line_breaks",
+                                            bool(checked))
+        # … and refresh the editor right now so the user sees the
+        # paragraph in the new form.
+        self._reload_initial_content(checked)
+
     def _on_font(self, font: QFont) -> None:
+        # setCurrentFont() during toolbar build fires this slot before
+        # _editor exists — bail out cleanly in that case.
+        if not hasattr(self, "_editor"):
+            return
         family = font.family()
         cur = self._editor.textCursor()
         if cur.hasSelection():

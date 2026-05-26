@@ -26,15 +26,19 @@ from typing import Optional
 import fitz
 from PySide6.QtCore import QPointF, QRectF, Qt
 from PySide6.QtGui import (
-    QBrush, QColor, QFont, QImage, QPainter, QPainterPath, QPen, QPixmap,
+    QAction, QActionGroup, QBrush, QColor, QFont, QImage, QPainter,
+    QPainterPath, QPen, QPixmap, QTextCharFormat, QTextCursor,
+    QTextDocumentFragment,
 )
 from PySide6.QtWidgets import (
-    QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout,
-    QGraphicsEllipseItem, QGraphicsItem, QGraphicsLineItem,
-    QGraphicsPathItem, QGraphicsPixmapItem, QGraphicsRectItem,
-    QGraphicsScene, QGraphicsTextItem, QGraphicsView, QInputDialog,
-    QMessageBox, QPlainTextEdit, QVBoxLayout,
+    QComboBox, QDialog, QDialogButtonBox, QGraphicsEllipseItem,
+    QGraphicsItem, QGraphicsLineItem, QGraphicsPathItem,
+    QGraphicsPixmapItem, QGraphicsRectItem, QGraphicsScene,
+    QGraphicsTextItem, QGraphicsView, QInputDialog, QLabel,
+    QMessageBox, QTextEdit, QToolBar, QVBoxLayout,
 )
+
+from .icons import icon
 
 
 PAGE_GAP = 12  # px between stacked pages in the scene
@@ -82,60 +86,178 @@ class Annotation:
     opacity: int = 100  # percent, 0-100
 
 
-_ALIGN_LABELS = ["Left", "Center", "Right", "Justify"]
-_ALIGN_TO_FITZ = {
-    "Left":    0,  # fitz.TEXT_ALIGN_LEFT
-    "Center":  1,  # fitz.TEXT_ALIGN_CENTER
-    "Right":   2,  # fitz.TEXT_ALIGN_RIGHT
-    "Justify": 3,  # fitz.TEXT_ALIGN_JUSTIFY
-}
+_FONT_SIZES = [6, 7, 8, 9, 10, 11, 12, 14, 16, 18, 20, 24, 28, 36, 48]
 
 
 class _EditTextDialog(QDialog):
-    """Replacement editor for an existing PDF text block. Offers font
-    size and alignment in addition to the raw text — without these the
-    only choice was the original size, which often pushed the new text
-    out of the box and produced empty output."""
+    """Rich-text editor for replacing an existing PDF block.
 
-    def __init__(self, parent, text: str, fontsize: float,
-                 align: str = "Left") -> None:
+    A QToolBar holds the format actions (font size, bold / italic /
+    underline, super / sub, alignment); the body is a QTextEdit. On
+    accept we hand the HTML to PyMuPDF's `insert_htmlbox`, which
+    natively honours alignment, font sizes, and super/subscript — so
+    earlier shrink-to-fit hackery is gone.
+    """
+
+    def __init__(self, parent, text: str, fontsize: float) -> None:
         super().__init__(parent)
         self.setWindowTitle("Edit text")
-        self.resize(560, 380)
+        self.resize(720, 520)
         layout = QVBoxLayout(self)
 
-        self._text_edit = QPlainTextEdit(text, self)
-        layout.addWidget(self._text_edit, 1)
+        # ----- Toolbar -----
+        tb = QToolBar(self)
+        tb.setIconSize(tb.iconSize())
+        layout.addWidget(tb)
 
-        form = QFormLayout()
-        self._size = QDoubleSpinBox(self)
-        self._size.setRange(4.0, 96.0)
-        self._size.setSingleStep(0.5)
-        self._size.setSuffix(" pt")
-        self._size.setValue(max(4.0, fontsize))
-        form.addRow("Font size:", self._size)
+        tb.addWidget(QLabel(" Size: "))
+        self._size_combo = QComboBox(self)
+        self._size_combo.setEditable(True)
+        self._size_combo.setMaximumWidth(80)
+        for sz in _FONT_SIZES:
+            self._size_combo.addItem(str(sz))
+        self._size_combo.setCurrentText(str(int(round(max(4.0, fontsize)))))
+        self._size_combo.editTextChanged.connect(self._on_size)
+        tb.addWidget(self._size_combo)
+        tb.addSeparator()
 
-        self._align = QComboBox(self)
-        self._align.addItems(_ALIGN_LABELS)
-        if align in _ALIGN_LABELS:
-            self._align.setCurrentText(align)
-        form.addRow("Alignment:", self._align)
-        layout.addLayout(form)
+        self._bold = self._toggle(tb, "bold",      "Bold (Ctrl+B)",      self._on_bold)
+        self._italic = self._toggle(tb, "italic",  "Italic (Ctrl+I)",    self._on_italic)
+        self._underline = self._toggle(tb, "underline", "Underline (Ctrl+U)", self._on_underline)
+        tb.addSeparator()
+        self._super = self._toggle(tb, "superscript", "Superscript", self._on_super)
+        self._sub   = self._toggle(tb, "subscript",   "Subscript",   self._on_sub)
+        tb.addSeparator()
 
+        self._align_group = QActionGroup(self)
+        self._align_group.setExclusive(True)
+        self._align_acts: dict[str, QAction] = {}
+        for name, label, flag in (
+            ("align_left",    "Align left",   Qt.AlignLeft),
+            ("align_center",  "Align center", Qt.AlignHCenter),
+            ("align_right",   "Align right",  Qt.AlignRight),
+            ("align_justify", "Justify",      Qt.AlignJustify),
+        ):
+            act = QAction(icon(name), label, self, checkable=True)
+            act.triggered.connect(
+                lambda _c=False, f=flag: self._editor.setAlignment(f)
+            )
+            self._align_group.addAction(act)
+            self._align_acts[name] = act
+            tb.addAction(act)
+        self._align_acts["align_left"].setChecked(True)
+
+        # ----- Editor -----
+        self._editor = QTextEdit(self)
+        self._editor.setAcceptRichText(True)
+        self._editor.setPlainText(text)
+        # Apply the starting font size to all of the inserted content
+        # so future export reflects it.
+        cur = self._editor.textCursor()
+        cur.select(QTextCursor.Document)
+        fmt = QTextCharFormat()
+        fmt.setFontPointSize(float(max(4.0, fontsize)))
+        cur.mergeCharFormat(fmt)
+        cur.clearSelection()
+        self._editor.setTextCursor(cur)
+        self._editor.setFontPointSize(float(max(4.0, fontsize)))
+        self._editor.currentCharFormatChanged.connect(self._sync_toolbar)
+        self._editor.cursorPositionChanged.connect(self._sync_toolbar)
+        layout.addWidget(self._editor, 1)
+
+        # ----- OK / Cancel -----
         bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel,
                               parent=self)
         bb.accepted.connect(self.accept)
         bb.rejected.connect(self.reject)
         layout.addWidget(bb)
-        self._text_edit.setFocus()
+        self._editor.setFocus()
 
-    def values(self) -> tuple[str, float, int]:
-        """Return (text, fontsize, fitz_align_int)."""
-        return (
-            self._text_edit.toPlainText(),
-            float(self._size.value()),
-            _ALIGN_TO_FITZ.get(self._align.currentText(), 0),
-        )
+    # ----- toolbar helpers -----
+
+    def _toggle(self, tb: QToolBar, icon_name: str, tip: str,
+                handler) -> QAction:
+        act = QAction(icon(icon_name), tip, self, checkable=True)
+        act.triggered.connect(handler)
+        tb.addAction(act)
+        return act
+
+    def _on_size(self, text: str) -> None:
+        try:
+            sz = float(text)
+        except ValueError:
+            return
+        if sz < 4.0 or sz > 200.0:
+            return
+        cur = self._editor.textCursor()
+        if cur.hasSelection():
+            fmt = QTextCharFormat()
+            fmt.setFontPointSize(sz)
+            cur.mergeCharFormat(fmt)
+        self._editor.setFontPointSize(sz)
+
+    def _on_bold(self, checked: bool) -> None:
+        self._editor.setFontWeight(QFont.Bold if checked else QFont.Normal)
+
+    def _on_italic(self, checked: bool) -> None:
+        self._editor.setFontItalic(checked)
+
+    def _on_underline(self, checked: bool) -> None:
+        self._editor.setFontUnderline(checked)
+
+    def _set_vertical_align(self, va) -> None:
+        fmt = QTextCharFormat()
+        fmt.setVerticalAlignment(va)
+        cur = self._editor.textCursor()
+        cur.mergeCharFormat(fmt)
+        self._editor.mergeCurrentCharFormat(fmt)
+
+    def _on_super(self, checked: bool) -> None:
+        if checked:
+            self._sub.setChecked(False)
+            self._set_vertical_align(QTextCharFormat.AlignSuperScript)
+        else:
+            self._set_vertical_align(QTextCharFormat.AlignNormal)
+
+    def _on_sub(self, checked: bool) -> None:
+        if checked:
+            self._super.setChecked(False)
+            self._set_vertical_align(QTextCharFormat.AlignSubScript)
+        else:
+            self._set_vertical_align(QTextCharFormat.AlignNormal)
+
+    def _sync_toolbar(self, *_args) -> None:
+        fmt = self._editor.currentCharFormat()
+        self._bold.setChecked(fmt.fontWeight() >= QFont.Bold)
+        self._italic.setChecked(fmt.fontItalic())
+        self._underline.setChecked(fmt.fontUnderline())
+        va = fmt.verticalAlignment()
+        self._super.setChecked(va == QTextCharFormat.AlignSuperScript)
+        self._sub.setChecked(va == QTextCharFormat.AlignSubScript)
+        sz = fmt.fontPointSize()
+        if sz > 0:
+            self._size_combo.blockSignals(True)
+            self._size_combo.setCurrentText(str(int(round(sz))))
+            self._size_combo.blockSignals(False)
+        align = self._editor.alignment()
+        mapping = {
+            Qt.AlignLeft:    "align_left",
+            Qt.AlignHCenter: "align_center",
+            Qt.AlignRight:   "align_right",
+            Qt.AlignJustify: "align_justify",
+        }
+        for flag, name in mapping.items():
+            if align & flag:
+                self._align_acts[name].setChecked(True)
+                break
+
+    def html(self) -> str:
+        """Body HTML as produced by QTextEdit — fed directly to
+        page.insert_htmlbox."""
+        return self._editor.toHtml()
+
+    def plain_text(self) -> str:
+        return self._editor.toPlainText()
 
 
 class _EditableTextItem(QGraphicsTextItem):
@@ -1028,39 +1150,43 @@ class PdfTab(QGraphicsView):
                 "No editable text block at that point.",
             )
             return
-        dlg = _EditTextDialog(self, info["text"], info["size"], align="Left")
+        dlg = _EditTextDialog(self, info["text"], info["size"])
         if dlg.exec() != QDialog.Accepted:
             return
-        new_text, requested_size, fitz_align = dlg.values()
-        if new_text == info["text"] and abs(requested_size - info["size"]) < 0.1:
+        html = dlg.html()
+        new_plain = dlg.plain_text()
+        # Strip Qt's wrapping <p style=...></p> if the body is identical
+        # to the original *and* the dialog applied no extra formatting.
+        if new_plain == info["text"] and html.count("<span") == 0:
             return
         # Doc is about to be mutated — undo entry must include doc bytes.
         self._push_undo(include_doc=True)
         rect = fitz.Rect(*info["rect"])
         # White out the original glyphs by rewriting the page content
-        # stream — without apply_redactions the new text would sit on
-        # top of the old.
+        # stream so the new text doesn't sit on top of the old.
         page.add_redact_annot(rect, fill=(1, 1, 1))
         page.apply_redactions()
-        # Start from the size the user picked. insert_textbox returns
-        # >=0 when all text fits; on overflow, shrink in 0.5pt steps
-        # before falling back to a baseline insert_text.
-        fontsize = max(4.0, requested_size)
-        color = info["color"]
-        inserted = False
-        while fontsize >= 4.0:
-            rc = page.insert_textbox(
-                rect, new_text, fontsize=fontsize, color=color,
-                align=fitz_align,
-            )
-            if rc >= 0:
-                inserted = True
-                break
-            fontsize -= 0.5
-        if not inserted:
-            page.insert_text(
-                (rect.x0, rect.y0 + max(4.0, requested_size)),
-                new_text, fontsize=max(4.0, requested_size), color=color,
+        # insert_htmlbox understands font sizes, super/sub
+        # (vertical-align:super), bold/italic, and CSS text-align — the
+        # dialog's QTextEdit emits all of these so we don't have to
+        # carry them as separate parameters. Returns (spare_height,
+        # scale); when scale < 1 the engine had to shrink to fit and
+        # we extend the rect downward and retry so the user's chosen
+        # font size is honoured instead of silently shrunk.
+        try:
+            spare, scale = page.insert_htmlbox(rect, html)
+            if scale < 0.999:
+                page_h = page.rect.height
+                grown = fitz.Rect(rect.x0, rect.y0,
+                                  rect.x1, min(page_h, rect.y1 + rect.height * 4))
+                # Rewrite — first clear the previous shrunk attempt.
+                page.add_redact_annot(rect, fill=(1, 1, 1))
+                page.apply_redactions()
+                page.insert_htmlbox(grown, html)
+        except AttributeError:
+            # PyMuPDF too old for insert_htmlbox — fall back to plain text.
+            page.insert_textbox(
+                rect, new_plain, fontsize=info["size"], color=info["color"],
             )
         self._render_all()
 

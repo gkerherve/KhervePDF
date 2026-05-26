@@ -76,6 +76,17 @@ _GLYPHS: dict[str, str] = {
     "remote":  "fa5s.cloud",
     "branch":  "fa5s.code-branch",
 
+    # Rich-text dialog
+    "bold":          "fa5s.bold",
+    "italic":        "fa5s.italic",
+    "underline":     "fa5s.underline",
+    "superscript":   "fa5s.superscript",
+    "subscript":     "fa5s.subscript",
+    "align_left":    "fa5s.align-left",
+    "align_center":  "fa5s.align-center",
+    "align_right":   "fa5s.align-right",
+    "align_justify": "fa5s.align-justify",
+
     # Help
     "about": "fa5s.info-circle",
 }
@@ -140,6 +151,17 @@ _COLORS_LIGHT: dict[str, str] = {
     "branch":  "#ef6c00",
 
     "about": "#1565c0",
+
+    # Rich-text dialog — neutral charcoal
+    "bold":          "#212121",
+    "italic":        "#212121",
+    "underline":     "#212121",
+    "superscript":   "#37474f",
+    "subscript":     "#37474f",
+    "align_left":    "#455a64",
+    "align_center":  "#455a64",
+    "align_right":   "#455a64",
+    "align_justify": "#455a64",
 }
 
 # Lighter variants for dark themes — same hues, raised value/saturation
@@ -183,6 +205,16 @@ _COLORS_DARK: dict[str, str] = {
     "remote":  "#64b5f6", "branch":  "#ffb74d",
 
     "about": "#64b5f6",
+
+    "bold":          "#eeeeee",
+    "italic":        "#eeeeee",
+    "underline":     "#eeeeee",
+    "superscript":   "#cfd8dc",
+    "subscript":     "#cfd8dc",
+    "align_left":    "#b0bec5",
+    "align_center":  "#b0bec5",
+    "align_right":   "#b0bec5",
+    "align_justify": "#b0bec5",
 }
 
 _dark = False

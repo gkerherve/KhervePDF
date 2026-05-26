@@ -64,20 +64,17 @@ class _OptionsPopup(QWidget):
         grid = QGridLayout()
         grid.setSpacing(2)
         grid.setContentsMargins(0, 0, 0, 0)
+        self._color_buttons: dict[str, QToolButton] = {}
         for r, row in enumerate(_PALETTE_GRID):
             for c, color in enumerate(row):
                 btn = QToolButton(self)
-                btn.setFixedSize(20, 20)
-                btn.setStyleSheet(
-                    f"QToolButton {{ background:{color};"
-                    "border:1px solid #555; }"
-                    "QToolButton:hover { border:2px solid #000; }"
-                )
+                self._style_swatch(btn, color, selected=False)
                 btn.setToolTip(color)
                 btn.clicked.connect(
                     lambda _c=False, col=color: self._apply_color(col)
                 )
                 grid.addWidget(btn, r, c)
+                self._color_buttons[color.lower()] = btn
         layout.addLayout(grid)
 
         custom_btn = QPushButton("Custom colour…", self)
@@ -139,6 +136,30 @@ class _OptionsPopup(QWidget):
         szr.addStretch(1)
         layout.addWidget(self._size_row)
 
+    @staticmethod
+    def _style_swatch(btn: QToolButton, color: str, *, selected: bool) -> None:
+        """Apply the small coloured-square stylesheet to a swatch
+        button. When `selected`, the border is thicker and stays so on
+        hover — to mark which colour the active tool currently uses."""
+        btn.setFixedSize(20, 20)
+        if selected:
+            btn.setStyleSheet(
+                f"QToolButton {{ background:{color};"
+                "border:3px solid #000; }"
+                "QToolButton:hover { border:3px solid #000; }"
+            )
+        else:
+            btn.setStyleSheet(
+                f"QToolButton {{ background:{color};"
+                "border:1px solid #555; }"
+                "QToolButton:hover { border:2px solid #000; }"
+            )
+
+    def _mark_active_color(self, current: str) -> None:
+        cur = current.lower() if current else ""
+        for color, btn in self._color_buttons.items():
+            self._style_swatch(btn, color, selected=(color == cur))
+
     def refresh(self) -> None:
         """Sync slider/spin values from the active tool's stored state.
 
@@ -159,10 +180,13 @@ class _OptionsPopup(QWidget):
         if tab is not None:
             width = tab.tool_width(tool)
             opacity = tab.tool_opacity(tool)
+            current_color = tab.tool_color(tool)
         else:
             d = TOOL_DEFAULTS.get(tool, {})
             width = d.get("width", 2.0)
             opacity = d.get("opacity", 100)
+            current_color = d.get("color", "")
+        self._mark_active_color(current_color)
         self._width_slider.blockSignals(True)
         self._width_slider.setValue(max(1, min(30, int(round(width)))))
         self._width_slider.blockSignals(False)
@@ -186,20 +210,28 @@ class _OptionsPopup(QWidget):
             menu.adjustSize()
 
     def _apply_color(self, color: str) -> None:
+        tool = self._mw._current_tool
         tab = self._mw._current_pdf_tab()
         if tab is not None:
-            tab.set_tool_color(color, self._mw._current_tool)
+            tab.set_tool_color(color, tool)
+        # Update the toolbar tool button icon's tint so the user can
+        # see at a glance what colour their pen / line / rect will
+        # draw with.
+        self._mw._refresh_tool_icon(tool)
+        self._mark_active_color(color)
         self._mw._close_options_menu()
 
     def _on_custom(self) -> None:
+        tool = self._mw._current_tool
         tab = self._mw._current_pdf_tab()
-        current = (tab.tool_color(self._mw._current_tool)
-                   if tab is not None else "#000000")
+        current = (tab.tool_color(tool) if tab is not None else "#000000")
         chosen = QColorDialog.getColor(QColor(current), self,
                                        "Choose custom colour")
         if chosen.isValid():
             if tab is not None:
-                tab.set_tool_color(chosen.name(), self._mw._current_tool)
+                tab.set_tool_color(chosen.name(), tool)
+            self._mw._refresh_tool_icon(tool)
+            self._mark_active_color(chosen.name())
             self._mw._close_options_menu()
 
     def _on_width(self, v: int) -> None:
@@ -242,6 +274,14 @@ class _ToolButton(QToolButton):
 
 
 class MainWindow(QMainWindow):
+    # Drawing tools that take a colour / width / opacity popup. Their
+    # toolbar icons re-tint to the active tool colour; other tools
+    # (hand, select, note, signature, erase) keep their palette tint.
+    OPTIONS_TOOLS = frozenset({
+        "pen", "highlight", "line", "arrow", "rect", "ellipse",
+        "text", "edit_text",
+    })
+
     def __init__(self, theme_name: str = "Light") -> None:
         super().__init__()
         self._theme_name = theme_name
@@ -389,8 +429,6 @@ class MainWindow(QMainWindow):
         self._tool_group = QButtonGroup(self)
         self._tool_group.setExclusive(True)
         self._tool_buttons: dict[str, QToolButton] = {}
-        OPTIONS_TOOLS = {"pen", "highlight", "line", "arrow", "rect",
-                         "ellipse", "text", "edit_text"}
         tools = [
             ("hand",      "Hand — pan the document"),
             ("select",    "Select — click an annotation; Delete removes it"),
@@ -407,13 +445,18 @@ class MainWindow(QMainWindow):
             ("erase",     "Eraser — click an annotation to delete it"),
         ]
         for name, tip in tools:
-            if name in OPTIONS_TOOLS:
+            if name in self.OPTIONS_TOOLS:
                 btn = _ToolButton(self, name, self)
                 btn.setMenu(self._options_menu)
                 btn.setPopupMode(QToolButton.MenuButtonPopup)
+                # Tint the icon to the tool's stored default colour so
+                # the toolbar reads as the user's palette at a glance.
+                default_color = TOOL_DEFAULTS.get(name, {}).get("color")
+                btn.setIcon(icon(name, color=default_color)
+                            if default_color else icon(name))
             else:
                 btn = QToolButton(self)
-            btn.setIcon(icon(name))
+                btn.setIcon(icon(name))
             btn.setToolTip(tip)
             btn.setCheckable(True)
             btn.setAutoExclusive(False)  # QButtonGroup owns exclusivity
@@ -448,6 +491,22 @@ class MainWindow(QMainWindow):
     def _close_options_menu(self) -> None:
         if getattr(self, "_options_menu", None) is not None:
             self._options_menu.close()
+
+    def _refresh_tool_icon(self, tool: str) -> None:
+        """Re-tint a tool button's icon to the colour currently picked
+        for that tool on the active tab. Only applies to drawing tools
+        that take a colour (OPTIONS_TOOLS) — hand / select / note /
+        signature / erase keep their semantic palette colour."""
+        if tool not in self.OPTIONS_TOOLS:
+            return
+        btn = self._tool_buttons.get(tool)
+        if btn is None:
+            return
+        tab = self._current_pdf_tab()
+        color = (tab.tool_color(tool) if tab is not None
+                 else TOOL_DEFAULTS.get(tool, {}).get("color"))
+        if color:
+            btn.setIcon(icon(tool, color=color))
 
     def _build_statusbar(self) -> None:
         sb = QStatusBar(self)
@@ -527,6 +586,10 @@ class MainWindow(QMainWindow):
         self._tabs.setCurrentWidget(tab)
         tab.set_tool(self._current_tool)
         self._push_recent(path)
+        # Refresh all tinted tool icons to match this tab's tool
+        # settings (each PdfTab keeps its own colour state).
+        for t in self.OPTIONS_TOOLS:
+            self._refresh_tool_icon(t)
         self._refresh_status()
 
     # ----- view actions -----

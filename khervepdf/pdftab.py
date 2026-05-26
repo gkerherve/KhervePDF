@@ -393,6 +393,70 @@ class _EditTextDialog(QDialog):
         return int(self._rotation_combo.currentData() or 0)
 
 
+class _StickyNotePopup(QFrame):
+    """Floating yellow note editor.
+
+    Looks like a Post-it: yellow background, dark-amber border, no
+    title bar. Sits anchored to the note's marker. Committing happens
+    when the inner text edit loses focus to a widget outside the
+    popup — same pattern as the inline text format bar.
+    """
+
+    def __init__(self, tab, annot_idx: int) -> None:
+        super().__init__(tab, Qt.Tool | Qt.FramelessWindowHint
+                         | Qt.WindowStaysOnTopHint)
+        self.setAttribute(Qt.WA_ShowWithoutActivating, False)
+        self._tab = tab
+        self._idx = annot_idx
+        self._committed = False
+        a = tab._annots[annot_idx]
+        # Pickup a wider yellow than the marker so the popup reads as
+        # a Post-it; the border picks the marker's amber.
+        self.setStyleSheet("""
+            QFrame { background:#fff59d; border:1px solid #b58900;
+                     border-radius:4px; }
+            QLabel { background:transparent; color:#5d4037; }
+            QTextEdit { background:#fff59d; border:none;
+                        font-family: 'Segoe UI', 'Arial'; }
+        """)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 6, 8, 8)
+        layout.setSpacing(4)
+        layout.addWidget(QLabel("<b>Sticky note</b>", self))
+        self._editor = _NoteTextEdit(self)
+        self._editor.setPlainText(a.text)
+        layout.addWidget(self._editor, 1)
+        self.resize(240, 160)
+        QTimer.singleShot(0, self._editor.setFocus)
+
+    def _maybe_commit(self) -> None:
+        if self._committed:
+            return
+        from PySide6.QtWidgets import QApplication as _QApp
+        new_focus = _QApp.focusWidget()
+        if new_focus is not None and (
+                self is new_focus or self.isAncestorOf(new_focus)):
+            return
+        self._committed = True
+        self._tab._commit_sticky_popup(self)
+
+    def text(self) -> str:
+        return self._editor.toPlainText()
+
+
+class _NoteTextEdit(QTextEdit):
+    """QTextEdit that asks its parent _StickyNotePopup to commit when
+    focus moves outside the popup."""
+
+    def __init__(self, popup: _StickyNotePopup) -> None:
+        super().__init__(popup)
+        self._popup = popup
+
+    def focusOutEvent(self, ev):  # noqa: N802
+        super().focusOutEvent(ev)
+        QTimer.singleShot(0, self._popup._maybe_commit)
+
+
 class _EditableTextItem(QGraphicsTextItem):
     """In-place text editor that lives on the page canvas. The user
     types directly on the PDF; commit is *deferred* via QTimer so
@@ -666,6 +730,8 @@ class PdfTab(QGraphicsView):
         # Add-Text inline editing state.
         self._inline_text_item: Optional[_EditableTextItem] = None
         self._inline_format_bar: Optional[_TextFormatBar] = None
+        # Sticky-note popup (yellow Post-it style — see _StickyNotePopup).
+        self._sticky_popup: Optional[_StickyNotePopup] = None
         # Undo/redo: each entry is a state snapshot. Annotation-only
         # actions snapshot just the annot list (cheap); actions that
         # mutate the underlying PDF (edit_text) also snapshot doc bytes.
@@ -875,20 +941,47 @@ class PdfTab(QGraphicsView):
         return None
 
     def _edit_note(self, idx: int) -> None:
+        """Open the floating yellow sticky-note editor anchored next
+        to this note's marker. The popup commits its text when focus
+        leaves it."""
+        # If another popup is open, dismiss it first.
+        if self._sticky_popup is not None:
+            self._sticky_popup.hide()
+            self._sticky_popup.deleteLater()
+            self._sticky_popup = None
         a = self._annots[idx]
-        new_text, ok = QInputDialog.getMultiLineText(
-            self, "Sticky note", "Note text:", a.text,
-        )
-        if not ok or new_text == a.text:
-            return
-        self._push_undo()
-        # dataclass field — replace via deepcopy-friendly assignment
-        self._annots[idx] = Annotation(
-            type=a.type, page_idx=a.page_idx, color=a.color,
-            width=a.width, opacity=a.opacity, pts=list(a.pts),
-            text=new_text,
-        )
-        self._render_all()
+        anchor_scene = self._page_to_scene(a.page_idx, *a.pts[0])
+        view_pt = self.mapFromScene(anchor_scene)
+        global_pt = self.viewport().mapToGlobal(view_pt)
+        popup = _StickyNotePopup(self, idx)
+        # Place just to the right of the marker; keep it on-screen.
+        popup.move(global_pt.x() + 28, max(0, global_pt.y() - 4))
+        popup.show()
+        self._sticky_popup = popup
+
+    def _commit_sticky_popup(self, popup: "_StickyNotePopup") -> None:
+        """Slot called by _StickyNotePopup when its editor loses
+        focus. Writes the edited text into the annotation (with one
+        undo step) and tears down the popup."""
+        try:
+            idx = popup._idx
+            if 0 <= idx < len(self._annots):
+                a = self._annots[idx]
+                new_text = popup.text()
+                if new_text != a.text:
+                    self._push_undo()
+                    self._annots[idx] = Annotation(
+                        type=a.type, page_idx=a.page_idx,
+                        color=a.color, width=a.width,
+                        opacity=a.opacity, pts=list(a.pts),
+                        text=new_text,
+                    )
+                    self._render_all()
+        finally:
+            if self._sticky_popup is popup:
+                self._sticky_popup = None
+            popup.hide()
+            popup.deleteLater()
 
     # ----- undo / redo -----
     #
@@ -1603,7 +1696,8 @@ class PdfTab(QGraphicsView):
             mapped0 = self._scene_to_page(scene_pt0)
             if mapped0 is not None:
                 note_idx = self._note_at_scene(scene_pt0)
-                if note_idx is not None and self._tool in ("select", "note"):
+                if note_idx is not None and self._tool in (
+                        "hand", "select", "note"):
                     self._edit_note(note_idx)
                     event.accept()
                     return

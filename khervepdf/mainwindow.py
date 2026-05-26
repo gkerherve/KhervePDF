@@ -16,10 +16,10 @@ from pathlib import Path
 from PySide6.QtCore import QSettings, Qt
 from PySide6.QtGui import QAction, QActionGroup, QColor
 from PySide6.QtWidgets import (
-    QButtonGroup, QColorDialog, QDoubleSpinBox, QFileDialog, QGridLayout,
-    QHBoxLayout, QLabel, QMainWindow, QMenu, QMessageBox, QPushButton,
-    QSlider, QStatusBar, QTabWidget, QToolBar, QToolButton, QVBoxLayout,
-    QWidget, QWidgetAction,
+    QButtonGroup, QCheckBox, QColorDialog, QDoubleSpinBox, QFileDialog,
+    QGridLayout, QHBoxLayout, QLabel, QMainWindow, QMenu, QMessageBox,
+    QPushButton, QSlider, QStatusBar, QTabWidget, QToolBar, QToolButton,
+    QVBoxLayout, QWidget, QWidgetAction,
 )
 
 from . import themes, version_string, last_commit_subject
@@ -114,6 +114,16 @@ class _OptionsPopup(QWidget):
         opr.addWidget(self._opacity_lbl)
         layout.addWidget(self._opacity_row)
 
+        # Fill toggle row — rect / ellipse only.
+        self._fill_row = QWidget(self)
+        fr = QHBoxLayout(self._fill_row)
+        fr.setContentsMargins(0, 0, 0, 0)
+        self._fill_check = QCheckBox("Fill shape", self)
+        self._fill_check.toggled.connect(self._on_fill)
+        fr.addWidget(self._fill_check)
+        fr.addStretch(1)
+        layout.addWidget(self._fill_row)
+
         # Font-size row (text tools).
         self._size_row = QWidget(self)
         szr = QHBoxLayout(self._size_row)
@@ -139,9 +149,11 @@ class _OptionsPopup(QWidget):
         visible apart from the size row's text-only branch."""
         tool = self._mw._current_tool
         is_text = tool in ("text", "edit_text")
+        is_shape = tool in ("rect", "ellipse")
         self._width_row.setVisible(not is_text)
         self._opacity_row.setVisible(not is_text)
         self._size_row.setVisible(is_text)
+        self._fill_row.setVisible(is_shape)
 
         tab = self._mw._current_pdf_tab()
         if tab is not None:
@@ -162,6 +174,11 @@ class _OptionsPopup(QWidget):
         self._opacity_slider.setValue(int(opacity))
         self._opacity_slider.blockSignals(False)
         self._opacity_lbl.setText(f"{int(opacity)}%")
+        if is_shape:
+            filled = tab.tool_filled(tool) if tab is not None else False
+            self._fill_check.blockSignals(True)
+            self._fill_check.setChecked(bool(filled))
+            self._fill_check.blockSignals(False)
         # Nudge the QMenu to re-measure when rows toggle.
         self.adjustSize()
         menu = getattr(self._mw, "_options_menu", None)
@@ -201,6 +218,11 @@ class _OptionsPopup(QWidget):
         tab = self._mw._current_pdf_tab()
         if tab is not None:
             tab.set_tool_width(float(v), self._mw._current_tool)
+
+    def _on_fill(self, checked: bool) -> None:
+        tab = self._mw._current_pdf_tab()
+        if tab is not None:
+            tab.set_tool_filled(checked, self._mw._current_tool)
 
 
 class _ToolButton(QToolButton):

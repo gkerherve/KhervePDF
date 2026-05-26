@@ -54,8 +54,8 @@ TOOL_DEFAULTS = {
     "hand":      {"color": "#000000", "width": 1.0,  "opacity": 100},
     "pen":       {"color": "#1976d2", "width": 2.0,  "opacity": 100},
     "highlight": {"color": "#fbc02d", "width": 14.0, "opacity": 35},
-    "rect":      {"color": "#388e3c", "width": 2.0,  "opacity": 100},
-    "ellipse":   {"color": "#7b1fa2", "width": 2.0,  "opacity": 100},
+    "rect":      {"color": "#388e3c", "width": 2.0,  "opacity": 100, "filled": False},
+    "ellipse":   {"color": "#7b1fa2", "width": 2.0,  "opacity": 100, "filled": False},
     "line":      {"color": "#212121", "width": 2.0,  "opacity": 100},
     "arrow":     {"color": "#212121", "width": 2.0,  "opacity": 100},
     "text":      {"color": "#000000", "width": 11.0, "opacity": 100},
@@ -86,6 +86,7 @@ class Annotation:
     pts: list[tuple[float, float]] = field(default_factory=list)
     text: str = ""
     opacity: int = 100  # percent, 0-100
+    filled: bool = False  # rect / ellipse interior fill
 
 
 _FONT_SIZES = [6, 7, 8, 9, 10, 11, 12, 14, 16, 18, 20, 24, 28, 36, 48]
@@ -328,6 +329,11 @@ class PdfTab(QGraphicsView):
         # Erase-drag flag: True between mouse-press and -release on the
         # eraser so mouseMoveEvent keeps deleting under the cursor.
         self._erasing = False
+        # Select-tool marquee: dragging on blank page draws a dashed
+        # rect; on release, every annotation whose bounding rect
+        # intersects the marquee becomes selected.
+        self._marquee_start: Optional[QPointF] = None
+        self._marquee_item: Optional[QGraphicsRectItem] = None
         # Undo/redo: each entry is a state snapshot. Annotation-only
         # actions snapshot just the annot list (cheap); actions that
         # mutate the underlying PDF (edit_text) also snapshot doc bytes.
@@ -680,7 +686,10 @@ class PdfTab(QGraphicsView):
                 rect = fitz.Rect(a.pts[0][0], a.pts[0][1],
                                  a.pts[1][0], a.pts[1][1])
                 annot = page.add_rect_annot(rect)
-                annot.set_colors(stroke=rgb)
+                if a.filled:
+                    annot.set_colors(stroke=rgb, fill=rgb)
+                else:
+                    annot.set_colors(stroke=rgb)
                 annot.set_border(width=max(0.5, a.width))
                 annot.set_opacity(op)
                 annot.update()
@@ -688,7 +697,10 @@ class PdfTab(QGraphicsView):
                 rect = fitz.Rect(a.pts[0][0], a.pts[0][1],
                                  a.pts[1][0], a.pts[1][1])
                 annot = page.add_circle_annot(rect)
-                annot.set_colors(stroke=rgb)
+                if a.filled:
+                    annot.set_colors(stroke=rgb, fill=rgb)
+                else:
+                    annot.set_colors(stroke=rgb)
                 annot.set_border(width=max(0.5, a.width))
                 annot.set_opacity(op)
                 annot.update()
@@ -779,6 +791,12 @@ class PdfTab(QGraphicsView):
         self._tool_settings[name or self._tool]["opacity"] = \
             max(0, min(100, int(op)))
 
+    def tool_filled(self, name: Optional[str] = None) -> bool:
+        return bool(self._tool_settings[name or self._tool].get("filled", False))
+
+    def set_tool_filled(self, val: bool, name: Optional[str] = None) -> None:
+        self._tool_settings[name or self._tool]["filled"] = bool(val)
+
     def _apply_drag_mode(self) -> None:
         # Hand = pan; Select = click annotations; everything else = draw.
         if self._tool == "hand":
@@ -833,10 +851,19 @@ class PdfTab(QGraphicsView):
             r = self._rect_from_pts(a)
             item = QGraphicsRectItem(r)
             item.setPen(QPen(color, pw_px))
+            if a.filled:
+                # Fill uses the same hex with the annotation's alpha.
+                fill = QColor(a.color)
+                fill.setAlpha(alpha)
+                item.setBrush(QBrush(fill))
             self._scene.addItem(item)
         elif a.type == "ellipse":
             item = QGraphicsEllipseItem(self._rect_from_pts(a))
             item.setPen(QPen(color, pw_px))
+            if a.filled:
+                fill = QColor(a.color)
+                fill.setAlpha(alpha)
+                item.setBrush(QBrush(fill))
             self._scene.addItem(item)
         elif a.type == "highlight":
             r = self._rect_from_pts(a)
@@ -972,15 +999,35 @@ class PdfTab(QGraphicsView):
             return super().mousePressEvent(event)
         page_idx, px, py = mapped
         if self._tool == "select":
-            # Select the topmost annotation at the click, or clear if
-            # the click landed on bare page. Delete key removes the
-            # current selection. (Multi-select / marquee can come later.)
+            ctrl = bool(event.modifiers() & Qt.ControlModifier)
             idx = self._find_annot_at(page_idx, px, py)
             if idx is not None:
-                self._selected = {idx}
+                # Click on annotation: single-select, or Ctrl-click to
+                # toggle into the existing selection.
+                if ctrl:
+                    if idx in self._selected:
+                        self._selected.discard(idx)
+                    else:
+                        self._selected.add(idx)
+                else:
+                    self._selected = {idx}
+                self._render_all()
             else:
-                self._selected.clear()
-            self._render_all()
+                # Empty space: begin a marquee. mouseReleaseEvent
+                # decides whether the gesture was a click (clear
+                # selection) or a real drag (select intersecting
+                # annotations).
+                self._marquee_start = scene_pt
+                rect = QRectF(scene_pt, scene_pt)
+                self._marquee_item = QGraphicsRectItem(rect)
+                pen = QPen(QColor("#1976d2"), 1.0, Qt.DashLine)
+                pen.setCosmetic(True)
+                self._marquee_item.setPen(pen)
+                fill = QColor("#1976d2")
+                fill.setAlpha(40)
+                self._marquee_item.setBrush(QBrush(fill))
+                self._marquee_item.setZValue(200)
+                self._scene.addItem(self._marquee_item)
             event.accept()
             return
         self._drag_start = scene_pt
@@ -1012,6 +1059,10 @@ class PdfTab(QGraphicsView):
                 else QGraphicsEllipseItem
             item = cls(QRectF(scene_pt, scene_pt))
             item.setPen(QPen(qcolor, width * scale))
+            if self.tool_filled():
+                fill = QColor(color_hex)
+                fill.setAlpha(int(opacity * 255 / 100))
+                item.setBrush(QBrush(fill))
             self._scene.addItem(item)
             self._preview_item = item
         elif self._tool == "highlight":
@@ -1068,6 +1119,13 @@ class PdfTab(QGraphicsView):
         event.accept()
 
     def mouseMoveEvent(self, event):  # noqa: N802
+        if self._tool == "select" and self._marquee_item is not None:
+            scene_pt = self.mapToScene(event.position().toPoint())
+            self._marquee_item.setRect(
+                QRectF(self._marquee_start, scene_pt).normalized()
+            )
+            event.accept()
+            return
         if self._tool == "erase" and self._erasing:
             scene_pt = self.mapToScene(event.position().toPoint())
             mapped = self._scene_to_page(scene_pt)
@@ -1100,6 +1158,30 @@ class PdfTab(QGraphicsView):
         event.accept()
 
     def mouseReleaseEvent(self, event):  # noqa: N802
+        if self._tool == "select" and self._marquee_item is not None:
+            marquee = self._marquee_item.rect()
+            ctrl = bool(event.modifiers() & Qt.ControlModifier)
+            self._scene.removeItem(self._marquee_item)
+            self._marquee_item = None
+            self._marquee_start = None
+            if marquee.width() < 3 and marquee.height() < 3:
+                # No real drag — treat as a click on blank page and
+                # clear selection (unless Ctrl-held — then no-op).
+                if not ctrl:
+                    self._selected.clear()
+            else:
+                hits = set()
+                for i, a in enumerate(self._annots):
+                    bbox = self._annot_scene_bbox(a)
+                    if bbox is not None and marquee.intersects(bbox):
+                        hits.add(i)
+                if ctrl:
+                    self._selected ^= hits  # toggle into existing selection
+                else:
+                    self._selected = hits
+            self._render_all()
+            event.accept()
+            return
         if self._tool == "erase" and self._erasing:
             self._erasing = False
             event.accept()
@@ -1148,9 +1230,11 @@ class PdfTab(QGraphicsView):
                     and abs(end_pt[1] - start_pt[1]) < 0.5):
                 pass
             else:
+                filled = (self._tool in ("rect", "ellipse")
+                          and self.tool_filled())
                 self._annots.append(Annotation(
                     type=self._tool, page_idx=page, color=color, width=width,
-                    pts=[start_pt, end_pt], opacity=opacity,
+                    pts=[start_pt, end_pt], opacity=opacity, filled=filled,
                 ))
 
         # Drop the preview; the replay path will redraw from storage so

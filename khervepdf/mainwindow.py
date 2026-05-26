@@ -233,6 +233,12 @@ class MainWindow(QMainWindow):
         self._tabs.setMovable(True)
         self._tabs.tabCloseRequested.connect(self._close_tab)
         self._tabs.currentChanged.connect(lambda _i: self._refresh_status())
+        # Empty pane shouldn't be a white slab — match the grey of the
+        # PdfTab viewport so "no document open" reads the same as
+        # "document open but with margin around the page".
+        self._tabs.setStyleSheet(
+            "QTabWidget::pane { background-color: #808080; border: none; }"
+        )
         self.setCentralWidget(self._tabs)
 
         self._current_tool = "hand"

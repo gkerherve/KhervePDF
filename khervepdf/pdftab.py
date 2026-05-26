@@ -18,6 +18,7 @@ source of truth (CLAUDE.md); for now PdfTab owns them.
 from __future__ import annotations
 
 import copy
+import html as html_mod
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -100,10 +101,13 @@ class _EditTextDialog(QDialog):
     earlier shrink-to-fit hackery is gone.
     """
 
-    def __init__(self, parent, text: str, fontsize: float) -> None:
+    def __init__(self, parent, html_or_text: str, fontsize: float,
+                 is_html: bool = False) -> None:
         super().__init__(parent)
         self.setWindowTitle("Edit text")
         self.resize(720, 520)
+        self._initial_is_html = is_html
+        self._initial_content = html_or_text
         layout = QVBoxLayout(self)
 
         # ----- Toolbar -----
@@ -151,16 +155,24 @@ class _EditTextDialog(QDialog):
         # ----- Editor -----
         self._editor = QTextEdit(self)
         self._editor.setAcceptRichText(True)
-        self._editor.setPlainText(text)
-        # Apply the starting font size to all of the inserted content
-        # so future export reflects it.
-        cur = self._editor.textCursor()
-        cur.select(QTextCursor.Document)
-        fmt = QTextCharFormat()
-        fmt.setFontPointSize(float(max(4.0, fontsize)))
-        cur.mergeCharFormat(fmt)
-        cur.clearSelection()
-        self._editor.setTextCursor(cur)
+        if is_html:
+            # Wrap the block HTML in a span carrying the original font
+            # size so the editor renders it at the right scale and
+            # toHtml() round-trips the size on save.
+            sz = max(4.0, fontsize)
+            self._editor.setHtml(
+                f'<span style="font-size:{sz:.1f}pt;">'
+                f'{html_or_text}</span>'
+            )
+        else:
+            self._editor.setPlainText(html_or_text)
+            cur = self._editor.textCursor()
+            cur.select(QTextCursor.Document)
+            fmt = QTextCharFormat()
+            fmt.setFontPointSize(float(max(4.0, fontsize)))
+            cur.mergeCharFormat(fmt)
+            cur.clearSelection()
+            self._editor.setTextCursor(cur)
         self._editor.setFontPointSize(float(max(4.0, fontsize)))
         self._editor.currentCharFormatChanged.connect(self._sync_toolbar)
         self._editor.cursorPositionChanged.connect(self._sync_toolbar)
@@ -1268,15 +1280,26 @@ class PdfTab(QGraphicsView):
                 "No editable text block at that point.",
             )
             return
-        dlg = _EditTextDialog(self, info["text"], info["size"])
+        # Open with the HTML form (preserves super/subscripts) when
+        # available; fall back to plain text for older callers.
+        initial = info.get("html") or info["text"]
+        dlg = _EditTextDialog(
+            self, initial, info["size"],
+            is_html=("html" in info),
+        )
         if dlg.exec() != QDialog.Accepted:
             return
         html = dlg.html()
         new_plain = dlg.plain_text()
-        # Strip Qt's wrapping <p style=...></p> if the body is identical
-        # to the original *and* the dialog applied no extra formatting.
-        if new_plain == info["text"] and html.count("<span") == 0:
-            return
+        # If the user didn't actually change anything, skip the edit.
+        if new_plain.strip() == info["text"].strip() \
+                and "<sup>" not in html and "<sub>" not in html:
+            # Original may already have sup/sub; treat unchanged plain
+            # text + identical formatting as no-op only when neither
+            # the source nor the editor introduced sup/sub.
+            if not info.get("html") or "<sup>" not in info["html"] \
+                    and "<sub>" not in info["html"]:
+                return
         # Doc is about to be mutated — undo entry must include doc bytes.
         self._push_undo(include_doc=True)
         rect = fitz.Rect(*info["rect"])
@@ -1310,15 +1333,23 @@ class PdfTab(QGraphicsView):
 
     def _find_text_block_detailed(self, page: fitz.Page,
                                   x_pt: float, y_pt: float):
-        """Locate the text block at (x_pt, y_pt) and pull the first
-        span's font size and colour so the replacement matches roughly.
+        """Locate the text block at (x_pt, y_pt) and return its HTML
+        text plus the first span's font size and colour for the editor.
 
-        PDF dict "lines" within a block represent visual wraps, not
-        paragraph breaks. We stitch them back into one paragraph: lines
-        ending in a hyphen followed by a lowercase letter on the next
-        line are dehyphenated; other line breaks become spaces. Without
-        this the editor would show one hard newline per PDF line,
-        which is what produced the long ladder of returns the user saw.
+        Two kinds of structure are recovered from `get_text("dict")`
+        that a naive flatten would lose:
+
+          * **Visual wraps within a paragraph** — PDF dict "lines" are
+            visual wraps, not paragraph breaks. We stitch them back
+            into one paragraph: lines ending in "-" before a lowercase
+            letter dehyphenate; other breaks join with a space.
+          * **Superscript / subscript spans** — spans whose `size` is
+            smaller than the dominant line size and whose baseline
+            (`origin[1]`) sits above or below the line baseline are
+            wrapped in `<sup>` / `<sub>` HTML, so the editor can show
+            them with proper baseline shift and `insert_htmlbox`
+            renders them back correctly on save. PyMuPDF flag bit 0
+            (TEXT_FONT_SUPERSCRIPT) is also honoured when present.
         """
         d = page.get_text("dict")
         for block in d.get("blocks", []):
@@ -1327,33 +1358,79 @@ class PdfTab(QGraphicsView):
             x0, y0, x1, y1 = block["bbox"]
             if not (x0 <= x_pt <= x1 and y0 <= y_pt <= y1):
                 continue
-            paragraph = ""
+            line_htmls: list[str] = []
+            line_plains: list[str] = []
             first_span = None
             for line in block.get("lines", []):
                 spans = line.get("spans", [])
                 if not spans:
                     continue
-                if first_span is None:
-                    first_span = spans[0]
-                line_text = "".join(s.get("text", "") for s in spans).rstrip()
-                if not line_text:
-                    continue
-                if not paragraph:
-                    paragraph = line_text
-                elif (paragraph.endswith("-") and line_text
-                      and line_text[0].islower()):
-                    paragraph = paragraph[:-1] + line_text
+                # Dominant line size — used to tell normal text from
+                # smaller super/subscript spans.
+                max_size = max(s.get("size", 0.0) for s in spans) or 1.0
+                normal = [s for s in spans
+                          if s.get("size", 0.0) >= max_size * 0.9]
+                if normal:
+                    baseline = sum(s["origin"][1] for s in normal) / len(normal)
                 else:
-                    paragraph = paragraph + " " + line_text
-            if first_span is None or not paragraph:
+                    baseline = sum(s["origin"][1] for s in spans) / len(spans)
+                if first_span is None:
+                    first_span = normal[0] if normal else spans[0]
+                parts: list[str] = []
+                plain_parts: list[str] = []
+                for s in spans:
+                    text = s.get("text", "")
+                    if not text:
+                        continue
+                    plain_parts.append(text)
+                    esc = html_mod.escape(text)
+                    size = s.get("size", max_size)
+                    origin_y = s.get("origin", (0.0, baseline))[1]
+                    flags = int(s.get("flags", 0))
+                    smaller = size < max_size * 0.85
+                    is_super = (flags & 1) or (
+                        smaller and origin_y < baseline - 1.0)
+                    is_sub = smaller and origin_y > baseline + 1.0
+                    if is_super:
+                        parts.append(f"<sup>{esc}</sup>")
+                    elif is_sub:
+                        parts.append(f"<sub>{esc}</sub>")
+                    else:
+                        parts.append(esc)
+                if not parts:
+                    continue
+                line_htmls.append("".join(parts).rstrip())
+                line_plains.append("".join(plain_parts).rstrip())
+            if first_span is None or not line_htmls:
                 continue
+            # Stitch visual lines into a single paragraph. Use the
+            # plain-text trailing char to detect hyphenated breaks so
+            # we don't get fooled by trailing markup tags.
+            paragraph_html = line_htmls[0]
+            paragraph_plain = line_plains[0]
+            for h, p in zip(line_htmls[1:], line_plains[1:]):
+                if not p:
+                    continue
+                if (paragraph_plain.endswith("-")
+                        and p and p[0].islower()):
+                    # Drop the trailing "-" from both representations.
+                    paragraph_html = paragraph_html.rstrip()
+                    if paragraph_html.endswith("-"):
+                        paragraph_html = paragraph_html[:-1]
+                    paragraph_plain = paragraph_plain[:-1]
+                    paragraph_html += h
+                    paragraph_plain += p
+                else:
+                    paragraph_html += " " + h
+                    paragraph_plain += " " + p
             raw_color = int(first_span.get("color", 0))
             r = ((raw_color >> 16) & 0xff) / 255.0
             g = ((raw_color >> 8) & 0xff) / 255.0
             b = (raw_color & 0xff) / 255.0
             return {
                 "rect": (x0, y0, x1, y1),
-                "text": paragraph.rstrip(),
+                "html": paragraph_html.rstrip(),
+                "text": paragraph_plain.rstrip(),
                 "size": float(first_span.get("size", 11.0)),
                 "color": (r, g, b),
             }

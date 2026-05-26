@@ -24,10 +24,12 @@ from PySide6.QtWidgets import (
     QWidget, QWidgetAction,
 )
 
-from . import themes, version_string, last_commit_subject
+from . import git_backend, themes, version_string, last_commit_subject
+from .history_dialog import HistoryDialog
 from .icons import app_icon, icon
 from .outline import OutlinePanel
 from .pdftab import PdfTab, TOOL_DEFAULTS
+from .remote_dialog import RemoteDialog
 from .thumbnails import ThumbnailPanel
 
 
@@ -470,8 +472,12 @@ class MainWindow(QMainWindow):
             m_pages.addAction(QAction(label, self, triggered=self._noop))
 
         m_git = mb.addMenu("&Git")
-        for label in ("Commit &Now", "&History…", "&Remote…", "&Branch…"):
-            m_git.addAction(QAction(label, self, triggered=self._noop))
+        m_git.addAction(QAction(icon("commit"), "Commit &Now", self,
+                                triggered=self._git_commit_now))
+        m_git.addAction(QAction(icon("history"), "&History…", self,
+                                triggered=self._git_history))
+        m_git.addAction(QAction(icon("remote"), "&Remote / Push…", self,
+                                triggered=self._git_remote))
 
         m_help = mb.addMenu("&Help")
         m_help.addAction(QAction("&About KhervePDF", self,
@@ -697,9 +703,14 @@ class MainWindow(QMainWindow):
         if isinstance(w, PdfTab):
             self._lbl_page.setText(f"Page 1 of {w.page_count()}")
             self._lbl_zoom.setText(f"{w.zoom_percent()}%")
+            branch = git_backend.current_branch(w.path)
+            self._lbl_branch.setText(
+                f"⎇ {branch}" if branch else ""
+            )
         else:
             self._lbl_page.setText("—")
             self._lbl_zoom.setText("—")
+            self._lbl_branch.setText("")
         # Keep the toolbar's zoom combo in step with the actual zoom
         # (the user can change it via the combo, the +/- buttons,
         # Ctrl+wheel, Ctrl±, or a window resize triggering auto-fit).
@@ -939,7 +950,12 @@ class MainWindow(QMainWindow):
                 f"Could not save:<br>{e}",
             )
             return
-        self.statusBar().showMessage(f"Saved {saved}", 3000)
+        committed = git_backend.commit_file(
+            saved, message=f"Save {saved.name}",
+        )
+        suffix = " · committed to git" if committed else ""
+        self.statusBar().showMessage(f"Saved {saved}{suffix}", 4000)
+        self._refresh_status()
 
     def _save_as(self) -> None:
         t = self._current_pdf_tab()
@@ -959,7 +975,60 @@ class MainWindow(QMainWindow):
                 f"Could not save:<br>{e}",
             )
             return
-        self.statusBar().showMessage(f"Saved {saved}", 3000)
+        committed = git_backend.commit_file(
+            saved, message=f"Save {saved.name}",
+        )
+        suffix = " · committed to git" if committed else ""
+        self.statusBar().showMessage(f"Saved {saved}{suffix}", 4000)
+        self._refresh_status()
+
+    # ----- Git menu -----
+
+    def _git_commit_now(self) -> None:
+        t = self._current_pdf_tab()
+        if t is None:
+            return
+        if not git_backend.is_available():
+            QMessageBox.information(
+                self, "Git",
+                "pygit2 isn't installed — install it to enable Git "
+                "versioning of your PDFs.",
+            )
+            return
+        ok = git_backend.commit_file(
+            t.path, message=f"Manual commit — {t.path.name}",
+        )
+        if ok:
+            self.statusBar().showMessage(
+                f"Committed {t.path.name} to git", 3000,
+            )
+            self._refresh_status()
+        else:
+            QMessageBox.warning(
+                self, "Commit",
+                "Nothing to commit (no changes since last commit?) "
+                "or git operation failed.",
+            )
+
+    def _git_history(self) -> None:
+        t = self._current_pdf_tab()
+        if t is None:
+            return
+        if not git_backend.is_available():
+            QMessageBox.information(self, "Git",
+                                    "pygit2 isn't installed.")
+            return
+        HistoryDialog(self, t.path).exec()
+
+    def _git_remote(self) -> None:
+        t = self._current_pdf_tab()
+        if t is None:
+            return
+        if not git_backend.is_available():
+            QMessageBox.information(self, "Git",
+                                    "pygit2 isn't installed.")
+            return
+        RemoteDialog(self, t.path).exec()
 
     def _about(self) -> None:
         """Rich About dialog: app + author bio + every library the

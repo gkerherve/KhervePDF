@@ -16,14 +16,201 @@ from pathlib import Path
 from PySide6.QtCore import QSettings, Qt
 from PySide6.QtGui import QAction, QActionGroup, QColor
 from PySide6.QtWidgets import (
-    QColorDialog, QDoubleSpinBox, QFileDialog, QHBoxLayout, QLabel,
-    QMainWindow, QMessageBox, QSizePolicy, QSlider,
-    QStackedWidget, QStatusBar, QTabWidget, QToolBar, QToolButton, QWidget,
+    QButtonGroup, QColorDialog, QDoubleSpinBox, QFileDialog, QGridLayout,
+    QHBoxLayout, QLabel, QMainWindow, QMenu, QMessageBox, QPushButton,
+    QSlider, QStatusBar, QTabWidget, QToolBar, QToolButton, QVBoxLayout,
+    QWidget, QWidgetAction,
 )
 
 from . import themes, version_string, last_commit_subject
 from .icons import icon
-from .pdftab import PdfTab
+from .pdftab import PdfTab, TOOL_DEFAULTS
+
+
+# Curated colour grid used by _OptionsPopup. Office-style: a greyscale
+# ramp plus a set of vivid primaries and muted shades. Click any swatch
+# to apply it to the active tool's stroke colour.
+_PALETTE_GRID = [
+    ["#000000", "#262626", "#404040", "#595959", "#7F7F7F",
+     "#A6A6A6", "#BFBFBF", "#D9D9D9", "#F2F2F2", "#FFFFFF"],
+    ["#C00000", "#FF0000", "#FF6600", "#FFC000", "#FFFF00",
+     "#92D050", "#00B050", "#00B0F0", "#0070C0", "#7030A0"],
+    ["#7F1414", "#A6324E", "#A66232", "#A68F2F", "#638F1A",
+     "#1F8F4D", "#1F718F", "#2A4D8F", "#3A2A8F", "#582D7E"],
+    ["#F2D7D7", "#FAD7E0", "#FAE5D7", "#FAF6D7", "#E7FAD7",
+     "#D7FAE0", "#D7F0FA", "#D7E7FA", "#D7DDFA", "#E6D7FA"],
+]
+
+
+class _OptionsPopup(QWidget):
+    """Excel-style dropdown panel for the active tool: a colour grid,
+    a Custom-colour button, and (depending on tool) width / opacity /
+    font-size controls.
+
+    A single instance lives in MainWindow and is wrapped in a QMenu via
+    QWidgetAction so every drawing tool button can share it. The
+    menu's `aboutToShow` triggers `refresh()`, which reads the active
+    tool's settings off the active PdfTab and reconfigures which rows
+    are visible."""
+
+    def __init__(self, mw: "MainWindow") -> None:
+        super().__init__(mw)
+        self._mw = mw
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
+
+        # Colour grid
+        grid = QGridLayout()
+        grid.setSpacing(2)
+        grid.setContentsMargins(0, 0, 0, 0)
+        for r, row in enumerate(_PALETTE_GRID):
+            for c, color in enumerate(row):
+                btn = QToolButton(self)
+                btn.setFixedSize(20, 20)
+                btn.setStyleSheet(
+                    f"QToolButton {{ background:{color};"
+                    "border:1px solid #555; }"
+                    "QToolButton:hover { border:2px solid #000; }"
+                )
+                btn.setToolTip(color)
+                btn.clicked.connect(
+                    lambda _c=False, col=color: self._apply_color(col)
+                )
+                grid.addWidget(btn, r, c)
+        layout.addLayout(grid)
+
+        custom_btn = QPushButton("Custom colour…", self)
+        custom_btn.clicked.connect(self._on_custom)
+        layout.addWidget(custom_btn)
+
+        # Width slider row (drawing tools that have a stroke width).
+        self._width_row = QWidget(self)
+        wr = QHBoxLayout(self._width_row)
+        wr.setContentsMargins(0, 4, 0, 0)
+        wr.addWidget(QLabel("Width:"))
+        self._width_slider = QSlider(Qt.Horizontal, self)
+        self._width_slider.setRange(1, 30)
+        self._width_slider.setFixedWidth(160)
+        self._width_lbl = QLabel("2 pt")
+        self._width_lbl.setMinimumWidth(48)
+        self._width_slider.valueChanged.connect(self._on_width)
+        wr.addWidget(self._width_slider)
+        wr.addWidget(self._width_lbl)
+        layout.addWidget(self._width_row)
+
+        # Opacity slider row (pen/shapes/highlight).
+        self._opacity_row = QWidget(self)
+        opr = QHBoxLayout(self._opacity_row)
+        opr.setContentsMargins(0, 0, 0, 0)
+        opr.addWidget(QLabel("Opacity:"))
+        self._opacity_slider = QSlider(Qt.Horizontal, self)
+        self._opacity_slider.setRange(10, 100)
+        self._opacity_slider.setFixedWidth(160)
+        self._opacity_lbl = QLabel("100%")
+        self._opacity_lbl.setMinimumWidth(48)
+        self._opacity_slider.valueChanged.connect(self._on_opacity)
+        opr.addWidget(self._opacity_slider)
+        opr.addWidget(self._opacity_lbl)
+        layout.addWidget(self._opacity_row)
+
+        # Font-size row (text tools).
+        self._size_row = QWidget(self)
+        szr = QHBoxLayout(self._size_row)
+        szr.setContentsMargins(0, 0, 0, 0)
+        szr.addWidget(QLabel("Size:"))
+        self._size_spin = QDoubleSpinBox(self)
+        self._size_spin.setRange(4.0, 96.0)
+        self._size_spin.setDecimals(1)
+        self._size_spin.setSingleStep(1.0)
+        self._size_spin.setSuffix(" pt")
+        self._size_spin.valueChanged.connect(self._on_size)
+        szr.addWidget(self._size_spin)
+        szr.addStretch(1)
+        layout.addWidget(self._size_row)
+
+    def refresh(self) -> None:
+        tool = self._mw._current_tool
+        has_width = tool in ("pen", "line", "arrow", "rect", "ellipse")
+        has_opacity = tool in ("pen", "line", "arrow", "rect", "ellipse",
+                               "highlight")
+        has_size = tool in ("text", "edit_text")
+        self._width_row.setVisible(has_width)
+        self._opacity_row.setVisible(has_opacity)
+        self._size_row.setVisible(has_size)
+
+        tab = self._mw._current_pdf_tab()
+        if tab is not None:
+            width = tab.tool_width(tool)
+            opacity = tab.tool_opacity(tool)
+        else:
+            d = TOOL_DEFAULTS.get(tool, {})
+            width = d.get("width", 2.0)
+            opacity = d.get("opacity", 100)
+        if has_width:
+            self._width_slider.blockSignals(True)
+            self._width_slider.setValue(max(1, min(30, int(round(width)))))
+            self._width_slider.blockSignals(False)
+            self._width_lbl.setText(f"{int(round(width))} pt")
+        if has_size:
+            self._size_spin.blockSignals(True)
+            self._size_spin.setValue(float(width))
+            self._size_spin.blockSignals(False)
+        if has_opacity:
+            self._opacity_slider.blockSignals(True)
+            self._opacity_slider.setValue(int(opacity))
+            self._opacity_slider.blockSignals(False)
+            self._opacity_lbl.setText(f"{int(opacity)}%")
+
+    def _apply_color(self, color: str) -> None:
+        tab = self._mw._current_pdf_tab()
+        if tab is not None:
+            tab.set_tool_color(color, self._mw._current_tool)
+        self._mw._close_options_menu()
+
+    def _on_custom(self) -> None:
+        tab = self._mw._current_pdf_tab()
+        current = (tab.tool_color(self._mw._current_tool)
+                   if tab is not None else "#000000")
+        chosen = QColorDialog.getColor(QColor(current), self,
+                                       "Choose custom colour")
+        if chosen.isValid():
+            if tab is not None:
+                tab.set_tool_color(chosen.name(), self._mw._current_tool)
+            self._mw._close_options_menu()
+
+    def _on_width(self, v: int) -> None:
+        self._width_lbl.setText(f"{v} pt")
+        tab = self._mw._current_pdf_tab()
+        if tab is not None:
+            tab.set_tool_width(float(v), self._mw._current_tool)
+
+    def _on_opacity(self, v: int) -> None:
+        self._opacity_lbl.setText(f"{v}%")
+        tab = self._mw._current_pdf_tab()
+        if tab is not None:
+            tab.set_tool_opacity(v, self._mw._current_tool)
+
+    def _on_size(self, v: float) -> None:
+        tab = self._mw._current_pdf_tab()
+        if tab is not None:
+            tab.set_tool_width(float(v), self._mw._current_tool)
+
+
+class _ToolButton(QToolButton):
+    """Tool button with a popup-options dropdown. Clicking the arrow
+    activates this tool *before* showing the menu so the shared popup
+    syncs to it — without that the popup would reflect whichever tool
+    was active when the user last clicked anything else."""
+
+    def __init__(self, mw: "MainWindow", tool: str, parent=None) -> None:
+        super().__init__(parent)
+        self._mw = mw
+        self._tool = tool
+
+    def showMenu(self) -> None:  # noqa: N802 — Qt override
+        self._mw._activate_tool(self._tool)
+        super().showMenu()
 
 
 class MainWindow(QMainWindow):
@@ -41,9 +228,9 @@ class MainWindow(QMainWindow):
         self._tabs.currentChanged.connect(lambda _i: self._refresh_status())
         self.setCentralWidget(self._tabs)
 
+        self._current_tool = "select"
         self._build_menus()
         self._build_toolbar()
-        self._build_tool_options_toolbar()
         self._build_statusbar()
         self._apply_theme_qss()
         self._update_title()
@@ -139,21 +326,33 @@ class MainWindow(QMainWindow):
         tb.setMovable(False)
         self.addToolBar(Qt.TopToolBarArea, tb)
 
-        # Plain file/zoom actions.
+        # Plain file actions.
         for name, tip, handler in (
-            ("open",     "Open PDF (Ctrl+O)", self._open),
-            ("save",     "Save (Ctrl+S)",     self._save),
+            ("open", "Open PDF (Ctrl+O)", self._open),
+            ("save", "Save (Ctrl+S)",     self._save),
         ):
             act = QAction(icon(name), tip, self, triggered=handler)
             act.setToolTip(tip)
             tb.addAction(act)
         tb.addSeparator()
 
-        # Tool buttons — checkable, mutually exclusive. Triggering one
-        # sets the active PdfTab's current tool.
-        self._tool_group = QActionGroup(self)
+        # Shared options popup (used by every drawing tool with a
+        # dropdown). Built once and attached to multiple tool buttons.
+        self._options_menu = QMenu(self)
+        self._options_popup = _OptionsPopup(self)
+        qwa = QWidgetAction(self._options_menu)
+        qwa.setDefaultWidget(self._options_popup)
+        self._options_menu.addAction(qwa)
+        self._options_menu.aboutToShow.connect(self._options_popup.refresh)
+
+        # Tool buttons. Drawing tools that take options get a dropdown
+        # arrow (MenuButtonPopup) wired to _options_menu via _ToolButton
+        # so the popup syncs to the right tool.
+        self._tool_group = QButtonGroup(self)
         self._tool_group.setExclusive(True)
-        self._tool_actions: dict[str, QAction] = {}
+        self._tool_buttons: dict[str, QToolButton] = {}
+        OPTIONS_TOOLS = {"pen", "highlight", "line", "arrow", "rect",
+                         "ellipse", "text", "edit_text"}
         tools = [
             ("select",    "Select / Pan"),
             ("pen",       "Pen"),
@@ -166,16 +365,26 @@ class MainWindow(QMainWindow):
             ("ellipse",   "Ellipse"),
             ("note",      "Sticky Note"),
             ("signature", "Signature"),
-            ("redact",    "Redact"),
+            ("erase",     "Eraser — click an annotation to delete it"),
         ]
         for name, tip in tools:
-            act = QAction(icon(name), tip, self, checkable=True)
-            act.setToolTip(tip)
-            act.triggered.connect(lambda _c=False, n=name: self._set_tool(n))
-            self._tool_group.addAction(act)
-            self._tool_actions[name] = act
-            tb.addAction(act)
-        self._tool_actions["select"].setChecked(True)
+            if name in OPTIONS_TOOLS:
+                btn = _ToolButton(self, name, self)
+                btn.setMenu(self._options_menu)
+                btn.setPopupMode(QToolButton.MenuButtonPopup)
+            else:
+                btn = QToolButton(self)
+            btn.setIcon(icon(name))
+            btn.setToolTip(tip)
+            btn.setCheckable(True)
+            btn.setAutoExclusive(False)  # QButtonGroup owns exclusivity
+            btn.clicked.connect(
+                lambda _c=False, n=name: self._activate_tool(n)
+            )
+            self._tool_group.addButton(btn)
+            self._tool_buttons[name] = btn
+            tb.addWidget(btn)
+        self._tool_buttons["select"].setChecked(True)
 
         tb.addSeparator()
         for name, tip, handler in (
@@ -187,182 +396,19 @@ class MainWindow(QMainWindow):
             act.setToolTip(tip)
             tb.addAction(act)
 
-    # Shared palette across all tool option panels. "Custom..." is
-    # appended automatically by _make_palette_row and opens
-    # QColorDialog for free-form picks.
-    PALETTE = [
-        "#000000", "#c62828", "#1976d2", "#2e7d32", "#7b1fa2",
-        "#ef6c00", "#fbc02d", "#c2185b", "#0097a7", "#5d4037",
-    ]
+    def _activate_tool(self, name: str) -> None:
+        self._current_tool = name
+        btn = self._tool_buttons.get(name)
+        if btn is not None and not btn.isChecked():
+            btn.setChecked(True)
+        tab = self._current_pdf_tab()
+        if tab is not None:
+            tab.set_tool(name)
+        self._lbl_tool.setText(name.replace("_", " ").capitalize())
 
-    def _build_tool_options_toolbar(self) -> None:
-        """Per-tool options sub-toolbar (the strip below the main one).
-
-        A QStackedWidget swaps panels when the active tool changes.
-        Pen/Line/Arrow/Rect/Ellipse get a width slider + colour palette;
-        Highlight gets palette + opacity slider; Text/Edit-Text get a
-        font-size spinbox + palette. Tools without options (Select /
-        Redact / Note / Signature) show an empty placeholder so the row
-        height doesn't jump.
-        """
-        self.addToolBarBreak(Qt.TopToolBarArea)
-        tb = QToolBar("Tool Options", self)
-        tb.setMovable(False)
-        self.addToolBar(Qt.TopToolBarArea, tb)
-        self._opts_stack = QStackedWidget(self)
-        self._opts_stack.setSizePolicy(QSizePolicy.Expanding,
-                                       QSizePolicy.Preferred)
-        tb.addWidget(self._opts_stack)
-
-        self._opts_widgets: dict[str, dict] = {}
-        self._opts_index: dict[str, int] = {}
-
-        self._opts_empty = QWidget(self)
-        self._opts_empty.setFixedHeight(36)
-        self._opts_stack.addWidget(self._opts_empty)
-        self._opts_index["__empty__"] = self._opts_stack.indexOf(self._opts_empty)
-
-        for tool in ("pen", "line", "arrow", "rect", "ellipse"):
-            panel = self._build_stroke_panel(tool)
-            self._opts_index[tool] = self._opts_stack.addWidget(panel)
-        self._opts_index["highlight"] = self._opts_stack.addWidget(
-            self._build_highlight_panel())
-        for tool in ("text", "edit_text"):
-            self._opts_index[tool] = self._opts_stack.addWidget(
-                self._build_text_panel(tool))
-
-        self._opts_stack.setCurrentIndex(self._opts_index["__empty__"])
-
-    def _make_color_button(self, color: str, on_click) -> QToolButton:
-        btn = QToolButton(self)
-        btn.setFixedSize(22, 22)
-        btn.setStyleSheet(
-            f"QToolButton {{ background:{color}; border:1px solid #555;"
-            "border-radius:3px; } QToolButton:hover {border:2px solid #fff;}"
-        )
-        btn.setToolTip(color)
-        btn.clicked.connect(lambda _c=False, c=color: on_click(c))
-        return btn
-
-    def _make_palette_row(self, tool_name: str) -> QWidget:
-        w = QWidget(self)
-        lay = QHBoxLayout(w)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(3)
-        for color in self.PALETTE:
-            lay.addWidget(self._make_color_button(
-                color,
-                lambda c, t=tool_name: self._apply_color_for(t, c),
-            ))
-        more = QToolButton(self)
-        more.setFixedSize(22, 22)
-        more.setText("…")
-        more.setToolTip("Custom colour…")
-        more.clicked.connect(lambda _c=False, t=tool_name: self._pick_custom_color(t))
-        lay.addWidget(more)
-        return w
-
-    def _build_stroke_panel(self, tool: str) -> QWidget:
-        w = QWidget(self)
-        lay = QHBoxLayout(w)
-        lay.setContentsMargins(8, 2, 8, 2)
-        lay.setSpacing(8)
-        lay.addWidget(QLabel("Width:"))
-        slider = QSlider(Qt.Horizontal, self)
-        slider.setRange(1, 30)
-        slider.setFixedWidth(140)
-        val = QLabel("2 pt")
-        val.setMinimumWidth(50)
-        slider.valueChanged.connect(
-            lambda v, t=tool, l=val: self._on_width_changed(t, v, l)
-        )
-        lay.addWidget(slider)
-        lay.addWidget(val)
-        lay.addSpacing(16)
-        lay.addWidget(QLabel("Colour:"))
-        lay.addWidget(self._make_palette_row(tool))
-        lay.addStretch(1)
-        self._opts_widgets[tool] = {"width_slider": slider, "width_lbl": val}
-        return w
-
-    def _build_highlight_panel(self) -> QWidget:
-        w = QWidget(self)
-        lay = QHBoxLayout(w)
-        lay.setContentsMargins(8, 2, 8, 2)
-        lay.setSpacing(8)
-        lay.addWidget(QLabel("Colour:"))
-        lay.addWidget(self._make_palette_row("highlight"))
-        lay.addSpacing(16)
-        lay.addWidget(QLabel("Opacity:"))
-        op = QSlider(Qt.Horizontal, self)
-        op.setRange(10, 100)
-        op.setFixedWidth(140)
-        op_lbl = QLabel("35%")
-        op_lbl.setMinimumWidth(40)
-        op.valueChanged.connect(
-            lambda v, l=op_lbl: self._on_opacity_changed("highlight", v, l)
-        )
-        lay.addWidget(op)
-        lay.addWidget(op_lbl)
-        lay.addStretch(1)
-        self._opts_widgets["highlight"] = {"opacity": op, "opacity_lbl": op_lbl}
-        return w
-
-    def _build_text_panel(self, tool: str) -> QWidget:
-        w = QWidget(self)
-        lay = QHBoxLayout(w)
-        lay.setContentsMargins(8, 2, 8, 2)
-        lay.setSpacing(8)
-        lay.addWidget(QLabel("Size:"))
-        spin = QDoubleSpinBox(self)
-        spin.setRange(4.0, 96.0)
-        spin.setDecimals(1)
-        spin.setSingleStep(1.0)
-        spin.setSuffix(" pt")
-        spin.valueChanged.connect(
-            lambda v, t=tool: self._apply_width_for(t, float(v))
-        )
-        lay.addWidget(spin)
-        lay.addSpacing(16)
-        lay.addWidget(QLabel("Colour:"))
-        lay.addWidget(self._make_palette_row(tool))
-        lay.addStretch(1)
-        self._opts_widgets[tool] = {"size_spin": spin}
-        return w
-
-    # ----- option panel handlers -----
-
-    def _on_width_changed(self, tool: str, v: int, lbl: QLabel) -> None:
-        lbl.setText(f"{v} pt")
-        self._apply_width_for(tool, float(v))
-
-    def _on_opacity_changed(self, tool: str, v: int, lbl: QLabel) -> None:
-        lbl.setText(f"{v}%")
-        t = self._current_pdf_tab()
-        if t is not None:
-            t.set_tool_opacity(v, tool)
-
-    def _apply_color_for(self, tool: str, color: str) -> None:
-        t = self._current_pdf_tab()
-        if t is not None:
-            t.set_tool_color(color, tool)
-
-    def _apply_width_for(self, tool: str, w: float) -> None:
-        t = self._current_pdf_tab()
-        if t is not None:
-            t.set_tool_width(w, tool)
-
-    def _pick_custom_color(self, tool: str) -> None:
-        t = self._current_pdf_tab()
-        if t is not None:
-            current = t.tool_color(tool)
-        else:
-            from .pdftab import TOOL_DEFAULTS
-            current = TOOL_DEFAULTS.get(tool, {"color": "#000000"})["color"]
-        chosen = QColorDialog.getColor(QColor(current), self,
-                                       "Choose custom colour")
-        if chosen.isValid():
-            self._apply_color_for(tool, chosen.name())
+    def _close_options_menu(self) -> None:
+        if getattr(self, "_options_menu", None) is not None:
+            self._options_menu.close()
 
     def _build_statusbar(self) -> None:
         sb = QStatusBar(self)
@@ -440,19 +486,8 @@ class MainWindow(QMainWindow):
             return
         self._tabs.addTab(tab, path.name)
         self._tabs.setCurrentWidget(tab)
-        checked = self._tool_group.checkedAction()
-        if checked is not None:
-            for n, a in self._tool_actions.items():
-                if a is checked:
-                    tab.set_tool(n)
-                    break
+        tab.set_tool(self._current_tool)
         self._push_recent(path)
-        checked = self._tool_group.checkedAction()
-        if checked is not None:
-            for n, a in self._tool_actions.items():
-                if a is checked:
-                    self._sync_tool_options(n)
-                    break
         self._refresh_status()
 
     # ----- view actions -----
@@ -478,50 +513,6 @@ class MainWindow(QMainWindow):
         if t:
             t.fit_width()
             self._refresh_status()
-
-    def _set_tool(self, name: str) -> None:
-        t = self._current_pdf_tab()
-        if t:
-            t.set_tool(name)
-        self._lbl_tool.setText(name.replace("_", " ").capitalize())
-        # Swap the options sub-toolbar to the panel for this tool.
-        idx = self._opts_index.get(name, self._opts_index["__empty__"])
-        self._opts_stack.setCurrentIndex(idx)
-        self._sync_tool_options(name)
-
-    def _sync_tool_options(self, tool: str) -> None:
-        """Push the active tab's stored colour/width/opacity for `tool`
-        into the matching option-panel widgets (blocking signals to
-        avoid feedback)."""
-        widgets = self._opts_widgets.get(tool)
-        if not widgets:
-            return
-        t = self._current_pdf_tab()
-        if t is not None:
-            width = t.tool_width(tool)
-            opacity = t.tool_opacity(tool)
-        else:
-            from .pdftab import TOOL_DEFAULTS
-            d = TOOL_DEFAULTS.get(tool, {})
-            width = d.get("width", 2.0)
-            opacity = d.get("opacity", 100)
-        if "width_slider" in widgets:
-            s: QSlider = widgets["width_slider"]
-            s.blockSignals(True)
-            s.setValue(max(1, min(30, int(round(width)))))
-            s.blockSignals(False)
-            widgets["width_lbl"].setText(f"{int(round(width))} pt")
-        if "size_spin" in widgets:
-            spin: QDoubleSpinBox = widgets["size_spin"]
-            spin.blockSignals(True)
-            spin.setValue(float(width))
-            spin.blockSignals(False)
-        if "opacity" in widgets:
-            op: QSlider = widgets["opacity"]
-            op.blockSignals(True)
-            op.setValue(int(opacity))
-            op.blockSignals(False)
-            widgets["opacity_lbl"].setText(f"{int(opacity)}%")
 
     # ----- recent files -----
 

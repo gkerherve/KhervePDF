@@ -60,7 +60,7 @@ _GLYPHS: dict[str, str] = {
     "ellipse":   "fa5.circle",
     "note":      "fa5s.sticky-note",
     "signature": "fa5s.signature",
-    "redact":    "fa5s.eraser",
+    "erase":     "fa5s.eraser",
 
     # Pages
     "page_insert": "fa5s.file-medical",
@@ -123,7 +123,7 @@ _COLORS_LIGHT: dict[str, str] = {
     "ellipse":   "#7b1fa2",
     "note":      "#fbc02d",
     "signature": "#0d47a1",
-    "redact":    "#c62828",
+    "erase":     "#c62828",
 
     # Pages
     "page_insert": "#2e7d32",
@@ -172,7 +172,7 @@ _COLORS_DARK: dict[str, str] = {
     "ellipse":   "#ce93d8",
     "note":      "#ffe082",
     "signature": "#90caf9",
-    "redact":    "#ef9a9a",
+    "erase":     "#ef9a9a",
 
     "page_insert": "#6abf69", "page_delete": "#ef9a9a",
     "page_merge":  "#64b5f6", "page_split":  "#ffb74d",

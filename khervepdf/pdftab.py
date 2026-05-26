@@ -53,7 +53,7 @@ TOOL_DEFAULTS = {
     "line":      {"color": "#212121", "width": 2.0,  "opacity": 100},
     "arrow":     {"color": "#212121", "width": 2.0,  "opacity": 100},
     "text":      {"color": "#000000", "width": 11.0, "opacity": 100},
-    "redact":    {"color": "#000000", "width": 1.0,  "opacity": 100},
+    "erase":     {"color": "#000000", "width": 1.0,  "opacity": 100},
     "select":    {"color": "#000000", "width": 1.0,  "opacity": 100},
     "edit_text": {"color": "#000000", "width": 11.0, "opacity": 100},
     # Tools that don't have option panels still need defaults so the
@@ -301,6 +301,65 @@ class PdfTab(QGraphicsView):
         return (max(0.0, min(x_pt, lay["w_pt"])),
                 max(0.0, min(y_pt, lay["h_pt"])))
 
+    # ----- hit-test (for the eraser) -----
+
+    @staticmethod
+    def _dist_to_segment(p0: tuple[float, float], p1: tuple[float, float],
+                         p: tuple[float, float]) -> float:
+        x0, y0 = p0
+        x1, y1 = p1
+        x, y = p
+        dx, dy = x1 - x0, y1 - y0
+        if dx == 0 and dy == 0:
+            return ((x - x0) ** 2 + (y - y0) ** 2) ** 0.5
+        t = ((x - x0) * dx + (y - y0) * dy) / (dx * dx + dy * dy)
+        t = max(0.0, min(1.0, t))
+        px, py = x0 + t * dx, y0 + t * dy
+        return ((x - px) ** 2 + (y - py) ** 2) ** 0.5
+
+    def _find_annot_at(self, page_idx: int,
+                       x_pt: float, y_pt: float,
+                       tol_pt: float = 4.0) -> Optional[int]:
+        """Index of the top-most annotation containing (x_pt, y_pt) in
+        PDF points on page_idx, or None. Top-most = last in self._annots
+        (later annotations render on top, so the eraser should pick them
+        first). Tolerance widens the hit area so a thin line is still
+        clickable."""
+        for i in range(len(self._annots) - 1, -1, -1):
+            a = self._annots[i]
+            if a.page_idx != page_idx or not a.pts:
+                continue
+            if a.type in ("rect", "ellipse", "highlight"):
+                x0, y0 = a.pts[0]
+                x1, y1 = a.pts[1]
+                xmin, xmax = min(x0, x1), max(x0, x1)
+                ymin, ymax = min(y0, y1), max(y0, y1)
+                if (xmin - tol_pt <= x_pt <= xmax + tol_pt
+                        and ymin - tol_pt <= y_pt <= ymax + tol_pt):
+                    return i
+            elif a.type in ("line", "arrow"):
+                if self._dist_to_segment(a.pts[0], a.pts[1],
+                                         (x_pt, y_pt)) <= max(tol_pt, a.width):
+                    return i
+            elif a.type == "pen":
+                for j in range(len(a.pts) - 1):
+                    if self._dist_to_segment(a.pts[j], a.pts[j + 1],
+                                             (x_pt, y_pt)) <= max(tol_pt,
+                                                                  a.width):
+                        return i
+            elif a.type == "text":
+                x, y = a.pts[0]
+                lines = a.text.split("\n") if a.text else [""]
+                # Rough bbox — Qt fonts vary, but this is generous
+                # enough that the eraser feels forgiving.
+                h = max(1, len(lines)) * a.width * 1.2
+                w = (max(len(line) for line in lines) if a.text else 0) \
+                    * a.width * 0.55
+                if x - tol_pt <= x_pt <= x + w + tol_pt \
+                        and y - tol_pt <= y_pt <= y + h + tol_pt:
+                    return i
+        return None
+
     # ----- undo / redo -----
     #
     # Snapshot-based. Every state-changing tool MUST call _push_undo()
@@ -413,7 +472,6 @@ class PdfTab(QGraphicsView):
         """Translate every Annotation into a real PDF annotation on
         the given document. Redactions are queued per page and applied
         at the end so the page content stream is rewritten once."""
-        redacts_by_page: dict[int, list[fitz.Rect]] = {}
         for a in self._annots:
             if a.page_idx >= doc.page_count:
                 continue
@@ -471,16 +529,8 @@ class PdfTab(QGraphicsView):
                     (a.pts[0][0], a.pts[0][1] + max(4.0, a.width)),
                     a.text, fontsize=max(4.0, a.width), color=rgb,
                 )
-            elif a.type == "redact":
-                redacts_by_page.setdefault(a.page_idx, []).append(
-                    fitz.Rect(a.pts[0][0], a.pts[0][1],
-                              a.pts[1][0], a.pts[1][1])
-                )
-        for page_idx, rects in redacts_by_page.items():
-            page = doc[page_idx]
-            for r in rects:
-                page.add_redact_annot(r, fill=(0, 0, 0))
-            page.apply_redactions()
+            # Erase isn't an annotation type — it removes items from
+            # self._annots at gesture time, so there's nothing to bake.
 
     # ----- zoom -----
 
@@ -600,12 +650,6 @@ class PdfTab(QGraphicsView):
             item.setPen(QPen(Qt.NoPen))
             item.setBrush(QBrush(color))
             self._scene.addItem(item)
-        elif a.type == "redact":
-            r = self._rect_from_pts(a)
-            item = QGraphicsRectItem(r)
-            item.setPen(QPen(Qt.black, 1))
-            item.setBrush(QBrush(QColor(0, 0, 0, 220)))
-            self._scene.addItem(item)
         elif a.type == "text":
             anchor = self._page_to_scene(a.page_idx, *a.pts[0])
             item = QGraphicsTextItem(a.text)
@@ -686,12 +730,20 @@ class PdfTab(QGraphicsView):
             item.setBrush(QBrush(self._qcolor(color_hex, alpha=90)))
             self._scene.addItem(item)
             self._preview_item = item
-        elif self._tool == "redact":
-            item = QGraphicsRectItem(QRectF(scene_pt, scene_pt))
-            item.setPen(QPen(Qt.black, 1))
-            item.setBrush(QBrush(QColor(0, 0, 0, 220)))
-            self._scene.addItem(item)
-            self._preview_item = item
+        elif self._tool == "erase":
+            # Eraser: click on the topmost annotation under the cursor
+            # and remove it (with undo). Doesn't create a preview item
+            # — the gesture finishes on press.
+            idx = self._find_annot_at(page_idx, px, py)
+            if idx is not None:
+                self._push_undo()
+                del self._annots[idx]
+                self._render_all()
+            self._drag_start = None
+            self._drag_page = None
+            self._preview_item = None
+            event.accept()
+            return
         elif self._tool == "text":
             self._place_text_box(page_idx, (px, py), color_hex, width)
             self._drag_start = None
@@ -765,7 +817,7 @@ class PdfTab(QGraphicsView):
                 ))
         elif self._tool == "highlight":
             self._commit_highlight(page, start_pt, end_pt, color, opacity)
-        elif self._tool in ("line", "arrow", "rect", "ellipse", "redact"):
+        elif self._tool in ("line", "arrow", "rect", "ellipse"):
             if (abs(end_pt[0] - start_pt[0]) < 0.5
                     and abs(end_pt[1] - start_pt[1]) < 0.5):
                 pass

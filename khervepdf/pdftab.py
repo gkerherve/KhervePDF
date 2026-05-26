@@ -36,8 +36,8 @@ from PySide6.QtWidgets import (
     QGraphicsEllipseItem, QGraphicsItem, QGraphicsLineItem,
     QGraphicsPathItem, QGraphicsPixmapItem, QGraphicsRectItem,
     QGraphicsScene, QGraphicsTextItem, QGraphicsView, QHBoxLayout,
-    QInputDialog, QLabel, QMessageBox, QTextEdit, QToolBar, QToolButton,
-    QVBoxLayout,
+    QInputDialog, QLabel, QMessageBox, QPushButton, QTextEdit,
+    QToolBar, QToolButton, QVBoxLayout, QWidget,
 )
 
 from .icons import icon
@@ -95,6 +95,10 @@ class Annotation:
     # Text-annotation rotation in degrees (0 / 90 / 180 / 270). 0 for
     # everything else.
     rotation: int = 0
+    # PNG bytes for image / signature annotations. Empty for other
+    # types. Stored verbatim so we can re-emit on save and round-trip
+    # through undo snapshots.
+    image_bytes: bytes = b""
 
 
 _FONT_SIZES = [6, 7, 8, 9, 10, 11, 12, 14, 16, 18, 20, 24, 28, 36, 48]
@@ -391,6 +395,114 @@ class _EditTextDialog(QDialog):
 
     def rotation(self) -> int:
         return int(self._rotation_combo.currentData() or 0)
+
+
+class _SignatureCanvas(QWidget):
+    """Plain freehand drawing widget used by SignatureDialog.
+
+    Pure mouse capture into per-stroke polylines + a QPainter
+    paintEvent — no scene graph, no document model. Exports the
+    drawn ink to a transparent QImage so it can be stamped onto
+    the page at the click-dragged rect with `page.insert_image`.
+    """
+
+    def __init__(self, parent, target_size: tuple[float, float]) -> None:
+        super().__init__(parent)
+        self._strokes: list[list[QPointF]] = []
+        self._cur: Optional[list[QPointF]] = None
+        # Scale the canvas up from the click-dragged rect so the user
+        # has comfortable room to sign, capped at ~900×450.
+        w, h = max(40.0, target_size[0]), max(20.0, target_size[1])
+        scale = min(900.0 / w, 450.0 / h, 6.0)
+        self.setFixedSize(int(w * scale), int(h * scale))
+        self.setStyleSheet(
+            "background:white; border:1px solid #888; border-radius:4px;"
+        )
+        self.setCursor(Qt.CrossCursor)
+
+    def mousePressEvent(self, ev):  # noqa: N802
+        if ev.button() == Qt.LeftButton:
+            self._cur = [ev.position()]
+            self._strokes.append(self._cur)
+            self.update()
+
+    def mouseMoveEvent(self, ev):  # noqa: N802
+        if self._cur is not None and ev.buttons() & Qt.LeftButton:
+            self._cur.append(ev.position())
+            self.update()
+
+    def mouseReleaseEvent(self, ev):  # noqa: N802
+        self._cur = None
+
+    def paintEvent(self, _ev):  # noqa: N802
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.setPen(QPen(QColor("#1a1a1a"), 2.4, Qt.SolidLine,
+                       Qt.RoundCap, Qt.RoundJoin))
+        for stroke in self._strokes:
+            if len(stroke) < 2:
+                continue
+            for i in range(len(stroke) - 1):
+                p.drawLine(stroke[i], stroke[i + 1])
+        p.end()
+
+    def clear_canvas(self) -> None:
+        self._strokes = []
+        self._cur = None
+        self.update()
+
+    def to_image(self) -> QImage:
+        """Render strokes onto a transparent PNG so the signature
+        can sit on top of the page without a white background."""
+        img = QImage(self.width(), self.height(),
+                     QImage.Format_ARGB32)
+        img.fill(Qt.transparent)
+        p = QPainter(img)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.setPen(QPen(QColor("#1a1a1a"), 2.4, Qt.SolidLine,
+                       Qt.RoundCap, Qt.RoundJoin))
+        for stroke in self._strokes:
+            if len(stroke) < 2:
+                continue
+            for i in range(len(stroke) - 1):
+                p.drawLine(stroke[i], stroke[i + 1])
+        p.end()
+        return img
+
+    def is_empty(self) -> bool:
+        return not any(len(s) >= 2 for s in self._strokes)
+
+
+class SignatureDialog(QDialog):
+    def __init__(self, parent, rect_size_pt: tuple[float, float]) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Draw your signature")
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(
+            "Sign with the mouse / trackpad / pen below — the "
+            "drawing will be placed at the rectangle you dragged.",
+            self,
+        ))
+        self._canvas = _SignatureCanvas(self, rect_size_pt)
+        layout.addWidget(self._canvas)
+        bb = QHBoxLayout()
+        clear_btn = QPushButton("Clear", self)
+        clear_btn.clicked.connect(self._canvas.clear_canvas)
+        bb.addWidget(clear_btn)
+        bb.addStretch(1)
+        cancel = QPushButton("Cancel", self)
+        cancel.clicked.connect(self.reject)
+        ok = QPushButton("Stamp on page", self)
+        ok.setDefault(True)
+        ok.clicked.connect(self.accept)
+        bb.addWidget(cancel)
+        bb.addWidget(ok)
+        layout.addLayout(bb)
+
+    def image(self) -> Optional[QImage]:
+        if self._canvas.is_empty():
+            return None
+        return self._canvas.to_image()
 
 
 class _StickyNotePopup(QFrame):
@@ -1355,6 +1467,16 @@ class PdfTab(QGraphicsView):
                             (a.pts[0][0], a.pts[0][1] + fontsize),
                             plain, fontsize=fontsize, color=rgb,
                         )
+            elif a.type == "image":
+                if not a.image_bytes:
+                    continue
+                rect = fitz.Rect(a.pts[0][0], a.pts[0][1],
+                                 a.pts[1][0], a.pts[1][1])
+                try:
+                    page.insert_image(rect, stream=a.image_bytes,
+                                      keep_proportion=True)
+                except Exception:
+                    pass
             elif a.type == "note":
                 annot = page.add_text_annot(fitz.Point(*a.pts[0]), a.text)
                 try:
@@ -1591,6 +1713,25 @@ class PdfTab(QGraphicsView):
             item.setPen(QPen(Qt.NoPen))
             item.setBrush(QBrush(color))
             self._scene.addItem(item)
+        elif a.type == "image":
+            if not a.image_bytes:
+                return
+            img = QImage.fromData(a.image_bytes)
+            if img.isNull():
+                return
+            r = self._rect_from_pts(a)
+            pm = QPixmap.fromImage(img)
+            item = QGraphicsPixmapItem(pm)
+            item.setTransformationMode(Qt.SmoothTransformation)
+            if pm.width() > 0 and pm.height() > 0:
+                sx = r.width() / pm.width()
+                sy = r.height() / pm.height()
+                # Uniform scale via the matrix; size to the smaller
+                # dimension so aspect ratio is preserved.
+                scale = min(sx, sy)
+                item.setScale(scale)
+            item.setPos(r.x(), r.y())
+            self._scene.addItem(item)
         elif a.type == "note":
             # Sticky-note marker: a small yellow rounded rect with an "N"
             # glyph, anchored at the click point. The annotation's full
@@ -1822,6 +1963,22 @@ class PdfTab(QGraphicsView):
             item = QGraphicsRectItem(QRectF(scene_pt, scene_pt))
             item.setPen(QPen(Qt.NoPen))
             item.setBrush(QBrush(self._qcolor(color_hex, alpha=90)))
+            self._scene.addItem(item)
+            self._preview_item = item
+        elif self._tool == "signature":
+            # Drag a rectangle that determines where the signature
+            # will be stamped. The dashed preview reuses the rect-
+            # tool drawing path; the on-release branch in
+            # mouseReleaseEvent opens the signature dialog instead
+            # of storing a rect annotation.
+            scale = self._page_layout[page_idx]["scale"]
+            item = QGraphicsRectItem(QRectF(scene_pt, scene_pt))
+            pen = QPen(QColor("#1976d2"), 1.5, Qt.DashLine)
+            pen.setCosmetic(True)
+            item.setPen(pen)
+            fill = QColor("#1976d2")
+            fill.setAlpha(30)
+            item.setBrush(QBrush(fill))
             self._scene.addItem(item)
             self._preview_item = item
         elif self._tool == "erase":
@@ -2112,6 +2269,8 @@ class PdfTab(QGraphicsView):
                 ))
         elif self._tool == "highlight":
             self._commit_highlight(page, start_pt, end_pt, color, opacity)
+        elif self._tool == "signature":
+            self._commit_signature(page, start_pt, end_pt)
         elif self._tool in ("line", "arrow", "rect", "ellipse"):
             if (abs(end_pt[0] - start_pt[0]) < 0.5
                     and abs(end_pt[1] - start_pt[1]) < 0.5):
@@ -2190,6 +2349,57 @@ class PdfTab(QGraphicsView):
         super().wheelEvent(event)
 
     # ----- highlight: snap to words -----
+
+    def _commit_signature(self, page_idx: int,
+                          start_pt: tuple[float, float],
+                          end_pt: tuple[float, float]) -> None:
+        """Open the signature canvas, sized from the dragged rect,
+        and (on accept) bake the user's ink as an image annotation
+        at that rect."""
+        x0 = min(start_pt[0], end_pt[0])
+        y0 = min(start_pt[1], end_pt[1])
+        x1 = max(start_pt[0], end_pt[0])
+        y1 = max(start_pt[1], end_pt[1])
+        if (x1 - x0) < 5 or (y1 - y0) < 5:
+            return
+        dlg = SignatureDialog(self, (x1 - x0, y1 - y0))
+        if dlg.exec() != QDialog.Accepted:
+            return
+        img = dlg.image()
+        if img is None or img.isNull():
+            return
+        # Serialise to PNG bytes (transparent background) for the
+        # annotation's image_bytes field.
+        from PySide6.QtCore import QBuffer, QByteArray
+        ba = QByteArray()
+        buf = QBuffer(ba)
+        buf.open(QBuffer.WriteOnly)
+        img.save(buf, "PNG")
+        buf.close()
+        # Outer mouseReleaseEvent already pushed undo for this drag.
+        self.insert_image_bytes(
+            bytes(ba), page_idx, (x0, y0, x1, y1),
+            push_undo=False,
+        )
+
+    def insert_image_bytes(self, png_bytes: bytes, page_idx: int,
+                           rect_pt: tuple[float, float, float, float],
+                           push_undo: bool = True) -> None:
+        """Add an image annotation. Shared between the signature
+        flow (where the rect comes from the user's drag — outer
+        mouseReleaseEvent has already pushed undo, so push_undo
+        should be False) and the toolbar's Insert Image / Ctrl+V
+        (where this is the only mutation — push_undo=True)."""
+        x0, y0, x1, y1 = rect_pt
+        if push_undo:
+            self._push_undo()
+        self._annots.append(Annotation(
+            type="image", page_idx=page_idx,
+            color="#000000", width=1.0, opacity=100,
+            pts=[(x0, y0), (x1, y1)],
+            image_bytes=png_bytes,
+        ))
+        self._render_all()
 
     def _commit_highlight(self, page_idx: int,
                           start_pt: tuple[float, float],

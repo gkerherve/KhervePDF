@@ -517,6 +517,8 @@ class MainWindow(QMainWindow):
             ("save", "Save (Ctrl+S)",     self._save),
             ("undo", "Undo (Ctrl+Z)",     self._undo),
             ("redo", "Redo (Ctrl+Y)",     self._redo),
+            ("image", "Insert image from file (Ctrl+V to paste)",
+             self._insert_image_from_file),
         ):
             act = QAction(icon(name), tip, self, triggered=handler)
             act.setToolTip(tip)
@@ -1111,6 +1113,70 @@ class MainWindow(QMainWindow):
             return
         self.statusBar().showMessage(
             f"Wrote {len(paths)} file(s) to {out_dir}", 5000,
+        )
+
+    # ----- Insert image / paste -----
+
+    def _insert_image_from_file(self) -> None:
+        t = self._current_pdf_tab()
+        if t is None or t._doc is None:
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Insert image", str(t.path.parent),
+            "Image files (*.png *.jpg *.jpeg *.bmp *.gif *.tif *.tiff);;"
+            "All files (*)",
+        )
+        if not path:
+            return
+        img = QImage(path)
+        if img.isNull():
+            QMessageBox.warning(self, "Insert image",
+                                f"Could not read {path}.")
+            return
+        self._place_qimage(img)
+
+    def keyPressEvent(self, event):  # noqa: N802
+        # Ctrl+V → paste a clipboard image at the centre of the
+        # current page. Lets the user copy a screenshot / figure and
+        # drop it straight onto the PDF.
+        if (event.key() == Qt.Key_V
+                and event.modifiers() & Qt.ControlModifier):
+            md = QApplication.clipboard().mimeData()
+            if md.hasImage():
+                img = QImage(md.imageData())
+                if not img.isNull():
+                    self._place_qimage(img)
+                    event.accept()
+                    return
+        super().keyPressEvent(event)
+
+    def _place_qimage(self, img: QImage) -> None:
+        t = self._current_pdf_tab()
+        if t is None or t._doc is None:
+            return
+        page_idx = t.current_page_index()
+        page = t._doc[page_idx]
+        pw, ph = page.rect.width, page.rect.height
+        # Cap width at 60% of the page so big screenshots don't
+        # cover everything; preserve aspect ratio.
+        max_w = pw * 0.6
+        max_h = ph * 0.6
+        w = min(float(img.width()), max_w)
+        h = img.height() * (w / max(1, img.width()))
+        if h > max_h:
+            h = max_h
+            w = img.width() * (h / max(1, img.height()))
+        x0 = (pw - w) / 2
+        y0 = (ph - h) / 2
+        from PySide6.QtCore import QBuffer, QByteArray
+        ba = QByteArray()
+        buf = QBuffer(ba)
+        buf.open(QBuffer.WriteOnly)
+        img.save(buf, "PNG")
+        buf.close()
+        t.insert_image_bytes(
+            bytes(ba), page_idx, (x0, y0, x0 + w, y0 + h),
+            push_undo=True,
         )
 
     # ----- Print -----

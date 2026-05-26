@@ -5,7 +5,7 @@ from pathlib import Path
 
 # Bumped on every commit (user request — title bar surfaces the count).
 # Patch component (.N) and +sha7 are appended automatically from pygit2.
-__version__ = "0.60"
+__version__ = "0.61"
 
 
 def _git_build_info() -> tuple[int, str, str] | None:

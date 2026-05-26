@@ -272,9 +272,17 @@ def app_icon() -> QIcon:
         p.setPen(Qt.NoPen)
         p.setBrush(QColor("#c62828"))  # red, matches the Eraser accent
         p.drawRoundedRect(QRectF(0, 0, sz, sz), radius, radius)
-        f = QFont("Georgia")
-        f.setPixelSize(int(sz * 0.52))
+        # Pick a font Qt will actually find on every platform — using
+        # an explicit family that's not installed produces tofu
+        # rectangles offscreen (e.g. during the PyInstaller .ico
+        # build), and the StyleHint guarantees a sans-serif fallback.
+        f = QFont()
+        f.setFamily("Arial")
+        f.setStyleHint(QFont.SansSerif)
+        f.setPixelSize(int(sz * 0.5))
         f.setBold(True)
+        # Slight letter-spacing tightens the KP at very small sizes.
+        f.setLetterSpacing(QFont.PercentageSpacing, 92)
         p.setFont(f)
         p.setPen(QColor("#ffffff"))
         p.drawText(QRectF(0, 0, sz, sz), Qt.AlignCenter, "KP")

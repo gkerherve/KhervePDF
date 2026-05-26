@@ -27,10 +27,11 @@ from PySide6.QtGui import (
     QBrush, QColor, QFont, QImage, QPainter, QPainterPath, QPen, QPixmap,
 )
 from PySide6.QtWidgets import (
+    QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout,
     QGraphicsEllipseItem, QGraphicsItem, QGraphicsLineItem,
     QGraphicsPathItem, QGraphicsPixmapItem, QGraphicsRectItem,
-    QGraphicsScene, QGraphicsTextItem, QGraphicsView, QInputDialog,
-    QMessageBox,
+    QGraphicsScene, QGraphicsTextItem, QGraphicsView, QMessageBox,
+    QPlainTextEdit, QVBoxLayout,
 )
 
 
@@ -39,17 +40,20 @@ PAGE_GAP = 12  # px between stacked pages in the scene
 # Per-tool default colours and widths. The toolbar's colour swatch +
 # width spinbox edit these per active tab, so the user can pick once
 # per session and have it stick.
+# Per-tool defaults — colour, width (or font pt for text tools), and
+# stroke opacity in percent (0-100). Highlight is translucent by
+# default so it reads as a marker.
 TOOL_DEFAULTS = {
-    "pen":       {"color": "#1976d2", "width": 2.0},
-    "highlight": {"color": "#fbc02d", "width": 14.0},
-    "rect":      {"color": "#388e3c", "width": 2.0},
-    "ellipse":   {"color": "#7b1fa2", "width": 2.0},
-    "line":      {"color": "#212121", "width": 2.0},
-    "arrow":     {"color": "#212121", "width": 2.0},
-    "text":      {"color": "#000000", "width": 11.0},   # width = font pt
-    "redact":    {"color": "#000000", "width": 1.0},
-    "select":    {"color": "#000000", "width": 1.0},
-    "edit_text": {"color": "#000000", "width": 11.0},
+    "pen":       {"color": "#1976d2", "width": 2.0,  "opacity": 100},
+    "highlight": {"color": "#fbc02d", "width": 14.0, "opacity": 35},
+    "rect":      {"color": "#388e3c", "width": 2.0,  "opacity": 100},
+    "ellipse":   {"color": "#7b1fa2", "width": 2.0,  "opacity": 100},
+    "line":      {"color": "#212121", "width": 2.0,  "opacity": 100},
+    "arrow":     {"color": "#212121", "width": 2.0,  "opacity": 100},
+    "text":      {"color": "#000000", "width": 11.0, "opacity": 100},
+    "redact":    {"color": "#000000", "width": 1.0,  "opacity": 100},
+    "select":    {"color": "#000000", "width": 1.0,  "opacity": 100},
+    "edit_text": {"color": "#000000", "width": 11.0, "opacity": 100},
 }
 
 
@@ -69,6 +73,63 @@ class Annotation:
     width: float
     pts: list[tuple[float, float]] = field(default_factory=list)
     text: str = ""
+    opacity: int = 100  # percent, 0-100
+
+
+_ALIGN_LABELS = ["Left", "Center", "Right", "Justify"]
+_ALIGN_TO_FITZ = {
+    "Left":    0,  # fitz.TEXT_ALIGN_LEFT
+    "Center":  1,  # fitz.TEXT_ALIGN_CENTER
+    "Right":   2,  # fitz.TEXT_ALIGN_RIGHT
+    "Justify": 3,  # fitz.TEXT_ALIGN_JUSTIFY
+}
+
+
+class _EditTextDialog(QDialog):
+    """Replacement editor for an existing PDF text block. Offers font
+    size and alignment in addition to the raw text — without these the
+    only choice was the original size, which often pushed the new text
+    out of the box and produced empty output."""
+
+    def __init__(self, parent, text: str, fontsize: float,
+                 align: str = "Left") -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Edit text")
+        self.resize(560, 380)
+        layout = QVBoxLayout(self)
+
+        self._text_edit = QPlainTextEdit(text, self)
+        layout.addWidget(self._text_edit, 1)
+
+        form = QFormLayout()
+        self._size = QDoubleSpinBox(self)
+        self._size.setRange(4.0, 96.0)
+        self._size.setSingleStep(0.5)
+        self._size.setSuffix(" pt")
+        self._size.setValue(max(4.0, fontsize))
+        form.addRow("Font size:", self._size)
+
+        self._align = QComboBox(self)
+        self._align.addItems(_ALIGN_LABELS)
+        if align in _ALIGN_LABELS:
+            self._align.setCurrentText(align)
+        form.addRow("Alignment:", self._align)
+        layout.addLayout(form)
+
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel,
+                              parent=self)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        layout.addWidget(bb)
+        self._text_edit.setFocus()
+
+    def values(self) -> tuple[str, float, int]:
+        """Return (text, fontsize, fitz_align_int)."""
+        return (
+            self._text_edit.toPlainText(),
+            float(self._size.value()),
+            _ALIGN_TO_FITZ.get(self._align.currentText(), 0),
+        )
 
 
 class _EditableTextItem(QGraphicsTextItem):
@@ -255,11 +316,18 @@ class PdfTab(QGraphicsView):
     def tool_width(self, name: Optional[str] = None) -> float:
         return self._tool_settings[name or self._tool]["width"]
 
+    def tool_opacity(self, name: Optional[str] = None) -> int:
+        return int(self._tool_settings[name or self._tool].get("opacity", 100))
+
     def set_tool_color(self, color: str, name: Optional[str] = None) -> None:
         self._tool_settings[name or self._tool]["color"] = color
 
     def set_tool_width(self, w: float, name: Optional[str] = None) -> None:
         self._tool_settings[name or self._tool]["width"] = float(w)
+
+    def set_tool_opacity(self, op: int, name: Optional[str] = None) -> None:
+        self._tool_settings[name or self._tool]["opacity"] = \
+            max(0, min(100, int(op)))
 
     def _apply_drag_mode(self) -> None:
         if self._tool == "select":
@@ -282,7 +350,9 @@ class PdfTab(QGraphicsView):
         if a.page_idx not in self._page_layout:
             return
         scale = self._page_layout[a.page_idx]["scale"]
+        alpha = int(max(0, min(100, a.opacity)) * 255 / 100)
         color = QColor(a.color)
+        color.setAlpha(alpha)
         pw_px = a.width * scale
 
         if a.type == "pen":
@@ -318,7 +388,7 @@ class PdfTab(QGraphicsView):
             r = self._rect_from_pts(a)
             item = QGraphicsRectItem(r)
             item.setPen(QPen(Qt.NoPen))
-            item.setBrush(QBrush(self._qcolor(a.color, alpha=90)))
+            item.setBrush(QBrush(color))
             self._scene.addItem(item)
         elif a.type == "redact":
             r = self._rect_from_pts(a)
@@ -453,6 +523,7 @@ class PdfTab(QGraphicsView):
         # Convert preview into a stored Annotation in page coords.
         color = self.tool_color()
         width = self.tool_width()
+        opacity = self.tool_opacity()
         mapped_end = self._scene_to_page(scene_end)
         end_pt: tuple[float, float]
         if mapped_end is not None and mapped_end[0] == page:
@@ -476,19 +547,18 @@ class PdfTab(QGraphicsView):
             if len(self._stroke_pts_page) >= 2:
                 self._annots.append(Annotation(
                     type="pen", page_idx=page, color=color, width=width,
-                    pts=list(self._stroke_pts_page),
+                    pts=list(self._stroke_pts_page), opacity=opacity,
                 ))
         elif self._tool == "highlight":
-            self._commit_highlight(page, start_pt, end_pt, color)
+            self._commit_highlight(page, start_pt, end_pt, color, opacity)
         elif self._tool in ("line", "arrow", "rect", "ellipse", "redact"):
-            # Skip degenerate clicks.
             if (abs(end_pt[0] - start_pt[0]) < 0.5
                     and abs(end_pt[1] - start_pt[1]) < 0.5):
                 pass
             else:
                 self._annots.append(Annotation(
                     type=self._tool, page_idx=page, color=color, width=width,
-                    pts=[start_pt, end_pt],
+                    pts=[start_pt, end_pt], opacity=opacity,
                 ))
 
         # Drop the preview; the replay path will redraw from storage so
@@ -509,7 +579,7 @@ class PdfTab(QGraphicsView):
     def _commit_highlight(self, page_idx: int,
                           start_pt: tuple[float, float],
                           end_pt: tuple[float, float],
-                          color: str) -> None:
+                          color: str, opacity: int = 35) -> None:
         """Highlight behaves like a marker: it covers the text you
         swiped over, not an empty rectangle. We pull every word whose
         bbox intersects the drag rect and create one tight highlight
@@ -536,13 +606,14 @@ class PdfTab(QGraphicsView):
                     type="highlight", page_idx=page_idx,
                     color=color, width=0.0,
                     pts=[(wx0, wy0 - pad), (wx1, wy1 + pad)],
+                    opacity=opacity,
                 ))
                 added += 1
         if added == 0:
             self._annots.append(Annotation(
                 type="highlight", page_idx=page_idx,
                 color=color, width=0.0,
-                pts=[(x0, y0), (x1, y1)],
+                pts=[(x0, y0), (x1, y1)], opacity=opacity,
             ))
 
     # ----- text tool -----
@@ -591,28 +662,28 @@ class PdfTab(QGraphicsView):
                 "No editable text block at that point.",
             )
             return
-        new_text, ok = QInputDialog.getMultiLineText(
-            self, "Edit text", "Replace this block:", info["text"],
-        )
-        if not ok or new_text == info["text"]:
+        dlg = _EditTextDialog(self, info["text"], info["size"], align="Left")
+        if dlg.exec() != QDialog.Accepted:
+            return
+        new_text, requested_size, fitz_align = dlg.values()
+        if new_text == info["text"] and abs(requested_size - info["size"]) < 0.1:
             return
         rect = fitz.Rect(*info["rect"])
-        # White out the original block in-place. apply_redactions
-        # rewrites the page content stream so the original glyphs are
-        # gone — without this the new text would sit on top of the old.
+        # White out the original glyphs by rewriting the page content
+        # stream — without apply_redactions the new text would sit on
+        # top of the old.
         page.add_redact_annot(rect, fill=(1, 1, 1))
         page.apply_redactions()
-        # Try inserting at the original size. insert_textbox returns
-        # >=0 when all text fits, negative when truncated; shrink the
-        # font in 0.5pt steps until it fits, otherwise fall back to a
-        # plain single-line insert at the original baseline.
-        fontsize = max(4.0, info["size"])
+        # Start from the size the user picked. insert_textbox returns
+        # >=0 when all text fits; on overflow, shrink in 0.5pt steps
+        # before falling back to a baseline insert_text.
+        fontsize = max(4.0, requested_size)
         color = info["color"]
         inserted = False
         while fontsize >= 4.0:
             rc = page.insert_textbox(
                 rect, new_text, fontsize=fontsize, color=color,
-                align=fitz.TEXT_ALIGN_LEFT,
+                align=fitz_align,
             )
             if rc >= 0:
                 inserted = True
@@ -620,8 +691,8 @@ class PdfTab(QGraphicsView):
             fontsize -= 0.5
         if not inserted:
             page.insert_text(
-                (rect.x0, rect.y0 + max(4.0, info["size"])),
-                new_text, fontsize=max(4.0, info["size"]), color=color,
+                (rect.x0, rect.y0 + max(4.0, requested_size)),
+                new_text, fontsize=max(4.0, requested_size), color=color,
             )
         self._render_all()
 

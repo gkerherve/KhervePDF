@@ -37,6 +37,13 @@ def main() -> int:
 
     win = MainWindow(theme_name=theme_name)
     win.show()
+    # Centre on the primary screen now that frameGeometry is known.
+    screen = app.primaryScreen()
+    if screen is not None:
+        avail = screen.availableGeometry()
+        fg = win.frameGeometry()
+        fg.moveCenter(avail.center())
+        win.move(fg.topLeft())
 
     args = [a for a in sys.argv[1:] if not a.startswith("-")]
     if args:

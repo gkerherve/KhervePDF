@@ -498,6 +498,9 @@ class MainWindow(QMainWindow):
         m_file.addAction(QAction(icon("export_txt"),
                                  "Export &Text…", self,
                                  triggered=self._export_text))
+        m_file.addAction(QAction(icon("save_as"),
+                                 "&Compress / shrink…", self,
+                                 triggered=self._compress_pdf))
         m_file.addAction(QAction(icon("print"), "&Print…", self,
                                  shortcut="Ctrl+P", triggered=self._print))
         m_file.addAction(QAction(icon("print"), "Print Pre&view…", self,
@@ -1253,6 +1256,41 @@ class MainWindow(QMainWindow):
                               page.rect.width, page.rect.height)
         t._render_all()
         self._refresh_thumbs()
+
+    def _compress_pdf(self) -> None:
+        """Save a recompressed copy of the active PDF. Uses the
+        usual PyMuPDF compaction switches (deflate=True,
+        garbage=4 — clean unused objects, deduplicate streams,
+        and re-compress everything) without re-encoding embedded
+        images. Reports size before / after."""
+        t = self._current_pdf_tab()
+        if t is None or t._doc is None:
+            return
+        suggested = t.path.with_name(f"{t.path.stem}_compressed.pdf")
+        path_s, _ = QFileDialog.getSaveFileName(
+            self, "Save compressed PDF as", str(suggested),
+            "PDF files (*.pdf);;All files (*)",
+        )
+        if not path_s:
+            return
+        try:
+            t._doc.save(path_s, deflate=True, deflate_images=True,
+                        deflate_fonts=True, garbage=4, clean=True)
+        except Exception as e:
+            QMessageBox.warning(self, "Compress", str(e))
+            return
+        try:
+            before = t.path.stat().st_size
+            after = Path(path_s).stat().st_size
+            pct = (1.0 - after / before) * 100 if before else 0
+            self.statusBar().showMessage(
+                f"Compressed: {before / 1024:.0f} KB → "
+                f"{after / 1024:.0f} KB ({pct:+.0f}%)", 6000,
+            )
+        except Exception:
+            self.statusBar().showMessage(
+                f"Saved compressed copy to {path_s}", 5000,
+            )
 
     def _export_text(self) -> None:
         """Save every page's text as a single UTF-8 .txt file. Each

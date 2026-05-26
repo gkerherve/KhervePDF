@@ -946,6 +946,17 @@ class PdfTab(QGraphicsView):
     def zoom_out(self) -> None:
         self._set_zoom(self._zoom / 1.25)
 
+    def scroll_to_page(self, page_idx: int) -> None:
+        """Center the main view on the given page (used by the side
+        thumbnails panel)."""
+        if page_idx not in self._page_layout:
+            return
+        lay = self._page_layout[page_idx]
+        cx = lay["w_px"] / 2
+        cy = lay["y_origin"] + min(lay["h_px"] / 2,
+                                   self.viewport().height() / 2)
+        self.centerOn(cx, cy)
+
     def fit_width(self) -> None:
         if self._doc is None or self._doc.page_count == 0:
             return

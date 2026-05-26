@@ -17,15 +17,16 @@ from typing import Optional
 from PySide6.QtCore import QSettings, Qt
 from PySide6.QtGui import QAction, QActionGroup, QColor
 from PySide6.QtWidgets import (
-    QButtonGroup, QCheckBox, QColorDialog, QDoubleSpinBox, QFileDialog,
-    QGridLayout, QHBoxLayout, QLabel, QMainWindow, QMenu, QMessageBox,
-    QPushButton, QSlider, QStatusBar, QTabWidget, QToolBar, QToolButton,
-    QVBoxLayout, QWidget, QWidgetAction,
+    QButtonGroup, QCheckBox, QColorDialog, QDockWidget, QDoubleSpinBox,
+    QFileDialog, QGridLayout, QHBoxLayout, QLabel, QMainWindow, QMenu,
+    QMessageBox, QPushButton, QSlider, QStatusBar, QTabWidget, QToolBar,
+    QToolButton, QVBoxLayout, QWidget, QWidgetAction,
 )
 
 from . import themes, version_string, last_commit_subject
 from .icons import app_icon, icon
 from .pdftab import PdfTab, TOOL_DEFAULTS
+from .thumbnails import ThumbnailPanel
 
 
 # Curated colour grid used by _OptionsPopup. Office-style: a greyscale
@@ -329,7 +330,7 @@ class MainWindow(QMainWindow):
         self._tabs.setTabsClosable(True)
         self._tabs.setMovable(True)
         self._tabs.tabCloseRequested.connect(self._close_tab)
-        self._tabs.currentChanged.connect(lambda _i: self._refresh_status())
+        self._tabs.currentChanged.connect(self._on_tab_changed)
         # Empty pane shouldn't be a white slab — match the grey of the
         # PdfTab viewport so "no document open" reads the same as
         # "document open but with margin around the page".
@@ -339,6 +340,17 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(self._tabs)
 
         self._current_tool = "hand"
+        # Side thumbnails panel (dock-widget). Built before the menus
+        # so View → Show Page Thumbnails can hook its toggleViewAction.
+        self._thumbs = ThumbnailPanel(self)
+        self._thumbs_dock = QDockWidget("Pages", self)
+        self._thumbs_dock.setObjectName("PagesDock")
+        self._thumbs_dock.setWidget(self._thumbs)
+        self._thumbs_dock.setAllowedAreas(
+            Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea
+        )
+        self.addDockWidget(Qt.LeftDockWidgetArea, self._thumbs_dock)
+        self._thumbs.page_clicked.connect(self._goto_page)
         self._build_menus()
         self._build_toolbar()
         self._build_statusbar()
@@ -399,6 +411,11 @@ class MainWindow(QMainWindow):
         m_view.addSeparator()
         m_view.addAction(QAction("Rotate &Left", self, triggered=self._noop))
         m_view.addAction(QAction("Rotate &Right", self, triggered=self._noop))
+        m_view.addSeparator()
+        toggle_thumbs = self._thumbs_dock.toggleViewAction()
+        toggle_thumbs.setText("Show Page &Thumbnails")
+        toggle_thumbs.setIcon(icon("thumbs"))
+        m_view.addAction(toggle_thumbs)
         m_view.addSeparator()
 
         m_theme = m_view.addMenu("&Theme")
@@ -580,6 +597,20 @@ class MainWindow(QMainWindow):
             f"KhervePDF {version_string()}{subj_part} — {name}"
         )
 
+    def _on_tab_changed(self, _idx: int) -> None:
+        self._refresh_status()
+        self._refresh_thumbs()
+
+    def _refresh_thumbs(self) -> None:
+        tab = self._current_pdf_tab()
+        doc = getattr(tab, "_doc", None) if tab is not None else None
+        self._thumbs.set_document(doc)
+
+    def _goto_page(self, page_idx: int) -> None:
+        tab = self._current_pdf_tab()
+        if tab is not None:
+            tab.scroll_to_page(page_idx)
+
     def _refresh_status(self) -> None:
         w = self._tabs.currentWidget()
         if isinstance(w, PdfTab):
@@ -605,6 +636,7 @@ class MainWindow(QMainWindow):
             w.close_doc()
         if w is not None:
             w.deleteLater()
+        self._refresh_thumbs()
         self._refresh_status()
 
     # ----- file actions (stubs — concrete logic in pdftab v0.3) -----
@@ -626,6 +658,7 @@ class MainWindow(QMainWindow):
         # settings (each PdfTab keeps its own colour state).
         for t in self.OPTIONS_TOOLS:
             self._refresh_tool_icon(t)
+        self._refresh_thumbs()
         self._refresh_status()
 
     # ----- view actions -----

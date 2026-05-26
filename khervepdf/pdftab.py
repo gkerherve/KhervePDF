@@ -1375,6 +1375,7 @@ class PdfTab(QGraphicsView):
         self._drag_page = page_idx
         color_hex = self.tool_color()
         width = self.tool_width()
+        opacity = self.tool_opacity()
         qcolor = QColor(color_hex)
 
         if self._tool == "pen":
@@ -1993,15 +1994,20 @@ class PdfTab(QGraphicsView):
             r = ((raw_color >> 16) & 0xff) / 255.0
             g = ((raw_color >> 8) & 0xff) / 255.0
             b = (raw_color & 0xff) / 255.0
-            align = self._detect_alignment(
-                block, float(first_span.get("size", 11.0))
+            # Pick the *dominant* font + size across the whole block,
+            # weighted by character count — first_span alone can be a
+            # superscript marker (smaller, different font) and would
+            # mislead the editor.
+            dom_font_raw, dom_size = self._dominant_font_and_size(
+                block, fallback_size=float(first_span.get("size", 11.0)),
             )
-            font = self._clean_font_name(first_span.get("font", ""))
+            align = self._detect_alignment(block, dom_size)
+            font = self._clean_font_name(dom_font_raw)
             return {
                 "rect": (x0, y0, x1, y1),
                 "html": paragraph_html.rstrip(),
                 "text": paragraph_plain.rstrip(),
-                "size": float(first_span.get("size", 11.0)),
+                "size": dom_size,
                 "color": (r, g, b),
                 "align": align,
                 "font": font,
@@ -2009,30 +2015,79 @@ class PdfTab(QGraphicsView):
         return None
 
     @staticmethod
+    def _dominant_font_and_size(block, fallback_size: float
+                                ) -> tuple[str, float]:
+        """Pick the font name + size that covers the most characters
+        in the block. Paragraphs sometimes have small sup/sub spans
+        with a different (smaller) font; weighting by character count
+        keeps those from hijacking the detection."""
+        font_chars: dict[str, int] = {}
+        size_chars: dict[float, int] = {}
+        for line in block.get("lines", []):
+            for span in line.get("spans", []):
+                text = span.get("text", "")
+                if not text:
+                    continue
+                n = len(text)
+                f = span.get("font") or ""
+                font_chars[f] = font_chars.get(f, 0) + n
+                # Bucket sizes to 0.1pt — float keys are otherwise hash-
+                # equal only when bit-identical.
+                s = round(float(span.get("size", fallback_size)), 1)
+                size_chars[s] = size_chars.get(s, 0) + n
+        if not font_chars:
+            return ("", fallback_size)
+        dom_font = max(font_chars, key=font_chars.get)
+        dom_size = max(size_chars, key=size_chars.get) if size_chars \
+            else fallback_size
+        return dom_font, float(dom_size)
+
+    @staticmethod
     def _clean_font_name(font: str) -> str:
-        """PDF font names often carry a 6-char subset prefix like
-        "ABCDEF+Helvetica" or trailing style markers like
-        "Helvetica,Bold" or "Arial-BoldItalicMT". Return the base
-        family the user would recognise so it can be looked up in
-        Qt's font registry and passed straight to insert_htmlbox's
-        CSS font-family."""
+        """Normalise a PDF font name down to a family Qt and MuPDF
+        can recognise.
+
+        PDF names carry a lot of decoration:
+          * 6-char subset prefix: "ABCDEF+TimesNewRomanPSMT"
+          * Style suffixes after "," "-" or via terms appended
+            directly (BoldItalic, Oblique, …)
+          * Adobe TrueType markers MT / PS / Std / Pro
+          * CamelCase rather than spaces ("TimesNewRoman")
+        We strip / normalise each of those so the result is something
+        like "Times New Roman" rather than "ABCDEF+TimesNewRomanPSMT".
+        """
         if not font:
             return ""
         # Strip subset prefix (six uppercase letters + "+")
         if "+" in font:
             font = font.split("+", 1)[1]
-        # Strip Adobe-style style suffix after comma or dash
-        for sep in (",", "-"):
+        # Strip explicit style suffix after a separator. Try multiple
+        # separators because PDFs aren't consistent.
+        for sep in (",", "-", "_"):
             if sep in font:
-                base, _ = font.split(sep, 1)
+                base = font.split(sep, 1)[0]
                 if base:
                     font = base
                     break
-        # Strip trailing "MT" / "PS" / "Std" markers that show up on
-        # Adobe-licensed TrueType variants.
-        for suffix in ("MT", "PS", "Std"):
-            if font.endswith(suffix):
-                font = font[: -len(suffix)]
+        # Strip only the font-tech markers that aren't part of any
+        # family name (MT = MultipleMaster TrueType, PS = PostScript,
+        # MS = Microsoft). Things like "Pro", "Std", "Light", "Roman"
+        # ARE legitimate name fragments (Minion Pro, Adobe Caslon
+        # Pro, Times New Roman) and stripping them mangles the
+        # detection.
+        changed = True
+        while changed:
+            changed = False
+            for suffix in ("MT", "PS", "MS"):
+                if font.endswith(suffix) and len(font) > len(suffix):
+                    font = font[: -len(suffix)]
+                    changed = True
+        # CamelCase → spaces ("TimesNewRoman" → "Times New Roman").
+        import re as _re
+        font = _re.sub(r"(?<=[a-z])(?=[A-Z])", " ", font)
+        # Insert a space between consecutive uppercase + lower
+        # ("ABCRoman" → "ABC Roman").
+        font = _re.sub(r"(?<=[A-Z])(?=[A-Z][a-z])", " ", font)
         return font.strip()
 
     @staticmethod

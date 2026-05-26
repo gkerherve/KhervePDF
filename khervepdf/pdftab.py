@@ -470,6 +470,7 @@ class PdfTab(QGraphicsView):
             else (0.0, 0.0)
         end_pt = self._clamp_to_page(page, *end_pt)
         start_pt = self._clamp_to_page(page, *start_pt)
+        n_before = len(self._annots)
 
         if self._tool == "pen":
             if len(self._stroke_pts_page) >= 2:
@@ -477,8 +478,9 @@ class PdfTab(QGraphicsView):
                     type="pen", page_idx=page, color=color, width=width,
                     pts=list(self._stroke_pts_page),
                 ))
-        elif self._tool in ("line", "arrow", "rect", "ellipse",
-                            "highlight", "redact"):
+        elif self._tool == "highlight":
+            self._commit_highlight(page, start_pt, end_pt, color)
+        elif self._tool in ("line", "arrow", "rect", "ellipse", "redact"):
             # Skip degenerate clicks.
             if (abs(end_pt[0] - start_pt[0]) < 0.5
                     and abs(end_pt[1] - start_pt[1]) < 0.5):
@@ -498,9 +500,50 @@ class PdfTab(QGraphicsView):
         self._stroke_pts_page = []
         self._drag_start = None
         self._drag_page = None
-        if self._annots:
-            self._draw_annot(self._annots[-1])
+        for a in self._annots[n_before:]:
+            self._draw_annot(a)
         event.accept()
+
+    # ----- highlight: snap to words -----
+
+    def _commit_highlight(self, page_idx: int,
+                          start_pt: tuple[float, float],
+                          end_pt: tuple[float, float],
+                          color: str) -> None:
+        """Highlight behaves like a marker: it covers the text you
+        swiped over, not an empty rectangle. We pull every word whose
+        bbox intersects the drag rect and create one tight highlight
+        annotation per word. If the swipe hits no text (e.g. a figure
+        or blank area), fall back to a freeform rect so the gesture
+        isn't silently dropped."""
+        if self._doc is None:
+            return
+        x0 = min(start_pt[0], end_pt[0])
+        y0 = min(start_pt[1], end_pt[1])
+        x1 = max(start_pt[0], end_pt[0])
+        y1 = max(start_pt[1], end_pt[1])
+        if (x1 - x0) < 0.5 and (y1 - y0) < 0.5:
+            return
+        drag = fitz.Rect(x0, y0, x1, y1)
+        page = self._doc[page_idx]
+        added = 0
+        for w in page.get_text("words"):
+            wx0, wy0, wx1, wy1, *_ = w
+            wrect = fitz.Rect(wx0, wy0, wx1, wy1)
+            if drag.intersects(wrect):
+                pad = (wy1 - wy0) * 0.08
+                self._annots.append(Annotation(
+                    type="highlight", page_idx=page_idx,
+                    color=color, width=0.0,
+                    pts=[(wx0, wy0 - pad), (wx1, wy1 + pad)],
+                ))
+                added += 1
+        if added == 0:
+            self._annots.append(Annotation(
+                type="highlight", page_idx=page_idx,
+                color=color, width=0.0,
+                pts=[(x0, y0), (x1, y1)],
+            ))
 
     # ----- text tool -----
 
@@ -541,35 +584,79 @@ class PdfTab(QGraphicsView):
         if self._doc is None:
             return
         page = self._doc[page_idx]
-        block = self._find_text_block(page, x_pt, y_pt)
-        if block is None:
+        info = self._find_text_block_detailed(page, x_pt, y_pt)
+        if info is None:
             QMessageBox.information(
                 self, "Edit text",
                 "No editable text block at that point.",
             )
             return
-        x0, y0, x1, y1, original_text = block
         new_text, ok = QInputDialog.getMultiLineText(
-            self, "Edit text", "Replace this block:", original_text,
+            self, "Edit text", "Replace this block:", info["text"],
         )
-        if not ok or new_text == original_text:
+        if not ok or new_text == info["text"]:
             return
-        # White-out the original block, then re-insert with the new
-        # string. Font face won't match the original — see module note.
-        rect = fitz.Rect(x0, y0, x1, y1)
+        rect = fitz.Rect(*info["rect"])
+        # White out the original block in-place. apply_redactions
+        # rewrites the page content stream so the original glyphs are
+        # gone — without this the new text would sit on top of the old.
         page.add_redact_annot(rect, fill=(1, 1, 1))
         page.apply_redactions()
-        page.insert_textbox(
-            rect, new_text,
-            fontsize=11, color=(0, 0, 0), align=fitz.TEXT_ALIGN_LEFT,
-        )
+        # Try inserting at the original size. insert_textbox returns
+        # >=0 when all text fits, negative when truncated; shrink the
+        # font in 0.5pt steps until it fits, otherwise fall back to a
+        # plain single-line insert at the original baseline.
+        fontsize = max(4.0, info["size"])
+        color = info["color"]
+        inserted = False
+        while fontsize >= 4.0:
+            rc = page.insert_textbox(
+                rect, new_text, fontsize=fontsize, color=color,
+                align=fitz.TEXT_ALIGN_LEFT,
+            )
+            if rc >= 0:
+                inserted = True
+                break
+            fontsize -= 0.5
+        if not inserted:
+            page.insert_text(
+                (rect.x0, rect.y0 + max(4.0, info["size"])),
+                new_text, fontsize=max(4.0, info["size"]), color=color,
+            )
         self._render_all()
 
-    def _find_text_block(self, page: fitz.Page,
-                         x_pt: float, y_pt: float):
-        for b in page.get_text("blocks"):
-            x0, y0, x1, y1, text, *_ = b
-            if (x0 <= x_pt <= x1 and y0 <= y_pt <= y1
-                    and text and text.strip()):
-                return x0, y0, x1, y1, text.rstrip("\n")
+    def _find_text_block_detailed(self, page: fitz.Page,
+                                  x_pt: float, y_pt: float):
+        """Locate the text block at (x_pt, y_pt) and pull the first
+        span's font size and colour so the replacement matches roughly.
+        get_text("blocks") only returns the bbox+text — we need the
+        richer dict form to recover font metrics."""
+        d = page.get_text("dict")
+        for block in d.get("blocks", []):
+            if block.get("type") != 0:
+                continue
+            x0, y0, x1, y1 = block["bbox"]
+            if not (x0 <= x_pt <= x1 and y0 <= y_pt <= y1):
+                continue
+            lines_text: list[str] = []
+            first_span = None
+            for line in block.get("lines", []):
+                spans = line.get("spans", [])
+                if not spans:
+                    continue
+                if first_span is None:
+                    first_span = spans[0]
+                lines_text.append("".join(s.get("text", "") for s in spans))
+            if first_span is None or not lines_text:
+                continue
+            raw_color = int(first_span.get("color", 0))
+            r = ((raw_color >> 16) & 0xff) / 255.0
+            g = ((raw_color >> 8) & 0xff) / 255.0
+            b = (raw_color & 0xff) / 255.0
+            return {
+                "rect": (x0, y0, x1, y1),
+                "text": "\n".join(lines_text).rstrip(),
+                "size": float(first_span.get("size", 11.0)),
+                "color": (r, g, b),
+            }
         return None

@@ -42,6 +42,7 @@ class MainWindow(QMainWindow):
 
         self._build_menus()
         self._build_toolbar()
+        self._build_pens_toolbar()
         self._build_statusbar()
         self._apply_theme_qss()
         self._update_title()
@@ -205,6 +206,63 @@ class MainWindow(QMainWindow):
             act.setToolTip(tip)
             tb.addAction(act)
         self._sync_tool_widgets()
+
+    # Visible palette of pre-set pens. Each is (label, hex_color, width_pt).
+    # Click one and the Pen tool activates with that colour/width on the
+    # current tab — same idea as KherveTeX's brush row.
+    PEN_PRESETS = [
+        ("Fine black",     "#212121", 0.8),
+        ("Medium black",   "#212121", 1.8),
+        ("Fine blue",      "#1976d2", 1.0),
+        ("Medium blue",    "#1976d2", 2.2),
+        ("Bold red",       "#c62828", 3.0),
+        ("Bold green",     "#2e7d32", 3.0),
+        ("Marker purple",  "#7b1fa2", 5.0),
+        ("Marker orange",  "#ef6c00", 5.0),
+        ("Thick black",    "#212121", 6.0),
+    ]
+
+    def _build_pens_toolbar(self) -> None:
+        self.addToolBarBreak(Qt.TopToolBarArea)
+        tb = QToolBar("Pens", self)
+        tb.setMovable(False)
+        tb.setToolTip("Pen presets — click to set Pen tool colour and width")
+        self.addToolBar(Qt.TopToolBarArea, tb)
+        tb.addWidget(QLabel(" Pens: "))
+        for label, color, width in self.PEN_PRESETS:
+            btn = QToolButton(self)
+            btn.setIcon(self._stroke_preset_icon(color, width))
+            btn.setToolTip(f"{label} — {width:g} pt")
+            btn.clicked.connect(
+                lambda _c=False, col=color, w=width:
+                    self._apply_pen_preset(col, w)
+            )
+            tb.addWidget(btn)
+
+    @staticmethod
+    def _stroke_preset_icon(color: str, width: float, size: int = 32) -> QIcon:
+        """Draw a sample stroke at the given colour and width."""
+        pm = QPixmap(size, size)
+        pm.fill(Qt.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        # Cap visual width so a 6pt preset still fits in the icon.
+        visual_w = min(width * 2.0, size * 0.55)
+        p.setPen(QPen(QColor(color), visual_w, Qt.SolidLine, Qt.RoundCap))
+        p.drawLine(4, size // 2, size - 4, size // 2)
+        p.end()
+        return QIcon(pm)
+
+    def _apply_pen_preset(self, color: str, width: float) -> None:
+        t = self._current_pdf_tab()
+        if t is not None:
+            t.set_tool_color(color, "pen")
+            t.set_tool_width(width, "pen")
+        # Switch to Pen tool so the click is immediately useful.
+        pen_act = self._tool_actions.get("pen")
+        if pen_act is not None and not pen_act.isChecked():
+            pen_act.setChecked(True)
+        self._set_tool("pen")
 
     def _build_statusbar(self) -> None:
         sb = QStatusBar(self)

@@ -39,6 +39,10 @@ OutputDir=installer
 OutputBaseFilename=Setup_KhervePDF_{#MyAppVersion}
 UninstallDisplayIcon={app}\{#MyAppExeName}
 LicenseFile=LICENSE
+; Setup wizard icon — same red KP monogram baked into the .exe.
+; build_release.ps1 / KhervePDF.spec produces this from
+; tools/generate_icon.py.
+SetupIconFile=build\KhervePDF.ico
 Compression=lzma2/ultra64
 SolidCompression=yes
 WizardStyle=modern

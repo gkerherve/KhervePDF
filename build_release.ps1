@@ -27,6 +27,13 @@ if ($initPy -match '__version__\s*=\s*"([^"]+)"') {
 }
 Write-Host "Building KhervePDF v$Version" -ForegroundColor Cyan
 
+# 0. Icon — render from icons.app_icon() into a multi-res .ico so
+# both the PyInstaller EXE block and the Inno Setup wizard pick up
+# the red KP monogram.
+Write-Host "==> Generating build\KhervePDF.ico from icons.app_icon()" -ForegroundColor Yellow
+py tools\generate_icon.py
+if ($LASTEXITCODE -ne 0) { throw "Icon generation failed" }
+
 # 1. PyInstaller
 Write-Host "==> pyinstaller KhervePDF.spec --noconfirm" -ForegroundColor Yellow
 py -m PyInstaller KhervePDF.spec --noconfirm

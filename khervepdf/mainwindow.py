@@ -497,7 +497,7 @@ class MainWindow(QMainWindow):
                                  triggered=self._export_images))
         m_file.addAction(QAction(icon("export_txt"),
                                  "Export &Text…", self,
-                                 triggered=self._noop))
+                                 triggered=self._export_text))
         m_file.addAction(QAction(icon("print"), "&Print…", self,
                                  shortcut="Ctrl+P", triggered=self._print))
         m_file.addAction(QAction(icon("print"), "Print Pre&view…", self,
@@ -1253,6 +1253,36 @@ class MainWindow(QMainWindow):
                               page.rect.width, page.rect.height)
         t._render_all()
         self._refresh_thumbs()
+
+    def _export_text(self) -> None:
+        """Save every page's text as a single UTF-8 .txt file. Each
+        page is separated by a form-feed (\\f) so downstream tools
+        (less, pagers) can show page boundaries."""
+        t = self._current_pdf_tab()
+        if t is None or t._doc is None:
+            return
+        suggested = t.path.with_suffix(".txt")
+        path_s, _ = QFileDialog.getSaveFileName(
+            self, "Export text", str(suggested),
+            "Text files (*.txt);;All files (*)",
+        )
+        if not path_s:
+            return
+        chunks: list[str] = []
+        for i in range(t._doc.page_count):
+            try:
+                chunks.append(t._doc[i].get_text("text"))
+            except Exception:
+                chunks.append("")
+        try:
+            Path(path_s).write_text("\f".join(chunks), encoding="utf-8")
+        except Exception as e:
+            QMessageBox.warning(self, "Export text", str(e))
+            return
+        self.statusBar().showMessage(
+            f"Wrote text of {t._doc.page_count} page(s) to {path_s}",
+            5000,
+        )
 
     def _export_images(self) -> None:
         t = self._current_pdf_tab()

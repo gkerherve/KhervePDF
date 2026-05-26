@@ -436,6 +436,7 @@ class MainWindow(QMainWindow):
             ("highlight", "Highlight"),
             ("text",      "Text (add new)"),
             ("edit_text", "Edit existing text"),
+            ("move_text", "Move a paragraph — drag to reposition"),
             ("line",      "Line"),
             ("arrow",     "Arrow"),
             ("rect",      "Rectangle"),

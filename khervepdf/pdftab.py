@@ -62,6 +62,7 @@ TOOL_DEFAULTS = {
     "erase":     {"color": "#000000", "width": 1.0,  "opacity": 100},
     "select":    {"color": "#000000", "width": 1.0,  "opacity": 100},
     "edit_text": {"color": "#000000", "width": 11.0, "opacity": 100},
+    "move_text": {"color": "#000000", "width": 1.0,  "opacity": 100},
     # Tools that don't have option panels still need defaults so the
     # mousePressEvent lookup doesn't KeyError.
     "note":      {"color": "#fbc02d", "width": 1.0,  "opacity": 100},
@@ -334,6 +335,10 @@ class PdfTab(QGraphicsView):
         # intersects the marquee becomes selected.
         self._marquee_start: Optional[QPointF] = None
         self._marquee_item: Optional[QGraphicsRectItem] = None
+        # Move-text drag state: the dict carries the block info, the
+        # original press point, and the ghost rect rendered while the
+        # user is dragging the paragraph.
+        self._move_text_state: Optional[dict] = None
         # Undo/redo: each entry is a state snapshot. Annotation-only
         # actions snapshot just the annot list (cheap); actions that
         # mutate the underlying PDF (edit_text) also snapshot doc bytes.
@@ -957,6 +962,9 @@ class PdfTab(QGraphicsView):
         elif self._tool == "select":
             self.setDragMode(QGraphicsView.NoDrag)
             self.viewport().setCursor(Qt.ArrowCursor)
+        elif self._tool == "move_text":
+            self.setDragMode(QGraphicsView.NoDrag)
+            self.viewport().setCursor(Qt.SizeAllCursor)
         else:
             self.setDragMode(QGraphicsView.NoDrag)
             cursor = Qt.IBeamCursor if self._tool in ("text", "edit_text") \
@@ -1090,6 +1098,29 @@ class PdfTab(QGraphicsView):
             anchor = self._page_to_scene(a.page_idx, *a.pts[0])
             return QRectF(anchor.x(), anchor.y(), 22, 18)
         return None
+
+    def _make_block_marker(self, page_idx: int,
+                           rect_pt: tuple[float, float, float, float]
+                           ) -> Optional[QGraphicsRectItem]:
+        """Add a dashed-blue translucent rectangle covering a PDF text
+        block, in scene coords. Used by Edit-Text and Move-Text so the
+        user can see which paragraph is being acted on. Returns the
+        item so callers can remove it when done."""
+        if page_idx not in self._page_layout:
+            return None
+        x0, y0, x1, y1 = rect_pt
+        p0 = self._page_to_scene(page_idx, x0, y0)
+        p1 = self._page_to_scene(page_idx, x1, y1)
+        item = QGraphicsRectItem(QRectF(p0, p1).normalized())
+        pen = QPen(QColor("#1976d2"), 1.5, Qt.DashLine)
+        pen.setCosmetic(True)
+        item.setPen(pen)
+        fill = QColor("#1976d2")
+        fill.setAlpha(30)
+        item.setBrush(QBrush(fill))
+        item.setZValue(150)
+        self._scene.addItem(item)
+        return item
 
     def _draw_selection_box(self, a: Annotation) -> None:
         bbox = self._annot_scene_bbox(a)
@@ -1266,11 +1297,51 @@ class PdfTab(QGraphicsView):
             self._edit_existing_text(page_idx, px, py)
             self._drag_start = None
             self._drag_page = None
+        elif self._tool == "move_text":
+            # Find the paragraph at the click point and start a drag.
+            # mouseMoveEvent re-positions the dashed preview; release
+            # commits the move (redact original + insert at new rect).
+            if self._doc is None:
+                event.accept()
+                return
+            info = self._find_text_block_detailed(
+                self._doc[page_idx], px, py)
+            if info is None:
+                event.accept()
+                return
+            preview = self._make_block_marker(page_idx, info["rect"])
+            if preview is None:
+                event.accept()
+                return
+            scale = self._page_layout[page_idx]["scale"]
+            self._move_text_state = {
+                "info": info,
+                "page_idx": page_idx,
+                "preview": preview,
+                "start_scene": scene_pt,
+                "orig_rect_scene": preview.rect(),
+                "scale": scale,
+            }
+            self._drag_start = None
+            self._drag_page = None
+            event.accept()
+            return
         else:
             return super().mousePressEvent(event)
         event.accept()
 
     def mouseMoveEvent(self, event):  # noqa: N802
+        if self._tool == "move_text" and self._move_text_state is not None:
+            state = self._move_text_state
+            scene_pt = self.mapToScene(event.position().toPoint())
+            delta = scene_pt - state["start_scene"]
+            r = state["orig_rect_scene"]
+            state["preview"].setRect(
+                QRectF(r.x() + delta.x(), r.y() + delta.y(),
+                       r.width(), r.height())
+            )
+            event.accept()
+            return
         if self._tool == "select" and self._marquee_item is not None:
             scene_pt = self.mapToScene(event.position().toPoint())
             self._marquee_item.setRect(
@@ -1310,6 +1381,51 @@ class PdfTab(QGraphicsView):
         event.accept()
 
     def mouseReleaseEvent(self, event):  # noqa: N802
+        if self._tool == "move_text" and self._move_text_state is not None:
+            state = self._move_text_state
+            self._move_text_state = None
+            self._scene.removeItem(state["preview"])
+            scene_pt = self.mapToScene(event.position().toPoint())
+            scale = state["scale"]
+            dx_pt = (scene_pt.x() - state["start_scene"].x()) / scale
+            dy_pt = (scene_pt.y() - state["start_scene"].y()) / scale
+            # Anything under ~1pt in either axis is treated as a stray
+            # click and dropped — no destructive redact.
+            if abs(dx_pt) < 1.0 and abs(dy_pt) < 1.0:
+                event.accept()
+                return
+            info = state["info"]
+            page_idx = state["page_idx"]
+            page = self._doc[page_idx] if self._doc is not None else None
+            if page is None:
+                event.accept()
+                return
+            x0, y0, x1, y1 = info["rect"]
+            new_rect = fitz.Rect(x0 + dx_pt, y0 + dy_pt,
+                                 x1 + dx_pt, y1 + dy_pt)
+            # Clamp to page bounds so insert_htmlbox always has a
+            # valid target rect.
+            page_r = page.rect
+            new_rect &= page_r
+            if new_rect.is_empty:
+                event.accept()
+                return
+            self._push_undo(include_doc=True)
+            page.add_redact_annot(fitz.Rect(x0, y0, x1, y1), fill=(1, 1, 1))
+            page.apply_redactions()
+            html_body = info.get("html") or html_mod.escape(info["text"])
+            sz = max(4.0, info["size"])
+            wrapped = (f'<span style="font-size:{sz:.1f}pt;">'
+                       f'{html_body}</span>')
+            try:
+                page.insert_htmlbox(new_rect, wrapped)
+            except AttributeError:
+                page.insert_textbox(new_rect, info["text"],
+                                    fontsize=info["size"],
+                                    color=info["color"])
+            self._render_all()
+            event.accept()
+            return
         if self._tool == "select" and self._marquee_item is not None:
             marquee = self._marquee_item.rect()
             ctrl = bool(event.modifiers() & Qt.ControlModifier)
@@ -1516,15 +1632,23 @@ class PdfTab(QGraphicsView):
                 "No editable text block at that point.",
             )
             return
-        # Open with the HTML form (preserves super/subscripts) when
-        # available; fall back to plain text for older callers.
-        initial = info.get("html") or info["text"]
-        dlg = _EditTextDialog(
-            self, initial, info["size"],
-            is_html=("html" in info),
-        )
-        if dlg.exec() != QDialog.Accepted:
-            return
+        # Visual feedback: draw a dashed rectangle around the block
+        # being edited so the user sees which paragraph the dialog
+        # will replace. Removed in `finally:` regardless of accept /
+        # cancel — and _render_all() will rebuild the scene on accept
+        # anyway.
+        marker = self._make_block_marker(page_idx, info["rect"])
+        try:
+            initial = info.get("html") or info["text"]
+            dlg = _EditTextDialog(
+                self, initial, info["size"],
+                is_html=("html" in info),
+            )
+            if dlg.exec() != QDialog.Accepted:
+                return
+        finally:
+            if marker is not None and marker.scene() is self._scene:
+                self._scene.removeItem(marker)
         html = dlg.html()
         new_plain = dlg.plain_text()
         # If the user didn't actually change anything, skip the edit.

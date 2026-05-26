@@ -91,6 +91,9 @@ class Annotation:
     # Optional separate fill colour for rect / ellipse. None means
     # "fall back to the stroke colour" (the v0.14 behaviour).
     fill_color: Optional[str] = None
+    # Text-annotation rotation in degrees (0 / 90 / 180 / 270). 0 for
+    # everything else.
+    rotation: int = 0
 
 
 _FONT_SIZES = [6, 7, 8, 9, 10, 11, 12, 14, 16, 18, 20, 24, 28, 36, 48]
@@ -109,9 +112,11 @@ class _EditTextDialog(QDialog):
     def __init__(self, parent, html_or_text: str, fontsize: float,
                  is_html: bool = False, align: str = "left",
                  preserve_line_breaks: bool = False,
-                 font_family: str = "") -> None:
+                 font_family: str = "",
+                 rotation: int = 0,
+                 title: str = "Edit text") -> None:
         super().__init__(parent)
-        self.setWindowTitle("Edit text")
+        self.setWindowTitle(title)
         self.resize(720, 520)
         # Snapshot the inputs so toggling "Preserve line breaks" can
         # re-render the editor without re-querying the document.
@@ -183,6 +188,21 @@ class _EditTextDialog(QDialog):
             align, align_map["left"]
         )
         self._align_acts[initial_act_name].setChecked(True)
+        tb.addSeparator()
+
+        # Rotation combobox — applies to the whole text annotation
+        # on save (text reads vertically / upside down). 0° is the
+        # default and matches "normal" reading direction.
+        tb.addWidget(QLabel(" Rotation: "))
+        self._rotation_combo = QComboBox(self)
+        for deg in (0, 90, 180, 270):
+            self._rotation_combo.addItem(f"{deg}°", deg)
+        # Pick the entry that matches the passed-in rotation.
+        for i in range(self._rotation_combo.count()):
+            if self._rotation_combo.itemData(i) == int(rotation):
+                self._rotation_combo.setCurrentIndex(i)
+                break
+        tb.addWidget(self._rotation_combo)
 
         # "Preserve PDF line breaks" — controls how the original
         # paragraph is displayed in the editor. State persists in
@@ -368,39 +388,8 @@ class _EditTextDialog(QDialog):
     def plain_text(self) -> str:
         return self._editor.toPlainText()
 
-
-class _EditableTextItem(QGraphicsTextItem):
-    """QGraphicsTextItem that commits its text back to the owning tab on
-    focus loss, so a placed text annotation persists into self._annots
-    and survives re-renders."""
-
-    def __init__(self, tab: "PdfTab", page_idx: int,
-                 anchor_pt: tuple[float, float], color: str,
-                 fontsize: float, initial: str = "") -> None:
-        super().__init__(initial)
-        self._tab = tab
-        self._page_idx = page_idx
-        self._anchor_pt = anchor_pt
-        self._color = color
-        self._fontsize = fontsize
-        self.setDefaultTextColor(QColor(color))
-        f = QFont()
-        f.setPointSizeF(max(4.0, fontsize))
-        self.setFont(f)
-        self.setTextInteractionFlags(Qt.TextEditorInteraction)
-        self.setFlag(QGraphicsItem.ItemIsMovable, False)
-        self.setFlag(QGraphicsItem.ItemIsSelectable, True)
-
-    def focusOutEvent(self, ev):  # noqa: N802
-        super().focusOutEvent(ev)
-        text = self.toPlainText().strip()
-        if not text:
-            self._tab._cancel_text_item(self)
-            return
-        self._tab._commit_text_item(
-            self._page_idx, self._anchor_pt, text,
-            self._color, self._fontsize,
-        )
+    def rotation(self) -> int:
+        return int(self._rotation_combo.currentData() or 0)
 
 
 class PdfTab(QGraphicsView):
@@ -623,11 +612,10 @@ class PdfTab(QGraphicsView):
                         return i
             elif a.type == "text":
                 x, y = a.pts[0]
-                lines = a.text.split("\n") if a.text else [""]
-                # Rough bbox — Qt fonts vary, but this is generous
-                # enough that the eraser feels forgiving.
+                plain = self._strip_html(a.text)
+                lines = plain.split("\n") if plain else [""]
                 h = max(1, len(lines)) * a.width * 1.2
-                w = (max(len(line) for line in lines) if a.text else 0) \
+                w = (max(len(line) for line in lines) if plain else 0) \
                     * a.width * 0.55
                 if x - tol_pt <= x_pt <= x + w + tol_pt \
                         and y - tol_pt <= y_pt <= y + h + tol_pt:
@@ -890,6 +878,27 @@ class PdfTab(QGraphicsView):
         return None
 
     @staticmethod
+    def _strip_html(s: str) -> str:
+        """Strip HTML tags from a string. Used to recover a plain-text
+        representation of text annotations for width estimation,
+        comparison, and add_freetext_annot fallback."""
+        if not s:
+            return ""
+        import re as _re
+        # First convert <br> to newlines so the plain form keeps the
+        # visible line breaks; then strip remaining tags.
+        s = _re.sub(r"<br\s*/?>", "\n", s, flags=_re.IGNORECASE)
+        s = _re.sub(r"<[^>]+>", "", s)
+        # Decode common HTML entities introduced by html.escape().
+        s = (s.replace("&amp;", "&")
+               .replace("&lt;", "<")
+               .replace("&gt;", ">")
+               .replace("&quot;", '"')
+               .replace("&#39;", "'")
+               .replace("&nbsp;", " "))
+        return s
+
+    @staticmethod
     def _hex_to_rgb01(hex_str: str) -> tuple[float, float, float]:
         s = hex_str.lstrip("#")
         return (int(s[0:2], 16) / 255.0,
@@ -973,28 +982,54 @@ class PdfTab(QGraphicsView):
                         pass
                 annot.update()
             elif a.type == "text":
-                # Use a FreeText annotation rather than insert_text so
-                # the text is editable after save. Rect sized
-                # generously so the text fits at the chosen size.
+                # Text annotations may carry either plain text (older
+                # data) or HTML (added via the Add-Text dialog).
+                # Rich content goes through insert_htmlbox so super /
+                # subscript, bold etc. render correctly; plain text
+                # uses add_freetext_annot so it stays editable as an
+                # annotation after save. Rotation is supported only
+                # by the freetext branch (insert_htmlbox has no
+                # rotate parameter).
                 fontsize = max(4.0, a.width)
-                lines = a.text.split("\n") if a.text else [""]
+                source = a.text or ""
+                has_rich = bool(source) and (
+                    "<sub" in source or "<sup" in source
+                    or "<b>" in source or "<b " in source
+                    or "<i>" in source or "<i " in source
+                    or "<span" in source or "<div" in source
+                    or "<p " in source or "<p>" in source
+                )
+                plain = self._strip_html(source) if has_rich else source
+                lines = plain.split("\n") if plain else [""]
                 w = max(80.0, fontsize * 0.65
                         * max(len(line) for line in lines))
                 h = max(fontsize * 1.4, fontsize * 1.3 * len(lines))
                 rect = fitz.Rect(a.pts[0][0], a.pts[0][1],
                                  a.pts[0][0] + w, a.pts[0][1] + h)
-                try:
-                    annot = page.add_freetext_annot(
-                        rect, a.text, fontsize=fontsize, text_color=rgb,
-                    )
-                    annot.set_opacity(op)
-                    annot.update()
-                except Exception:
-                    # Fall back to insert_text on older PyMuPDF.
-                    page.insert_text(
-                        (a.pts[0][0], a.pts[0][1] + fontsize),
-                        a.text, fontsize=fontsize, color=rgb,
-                    )
+                if has_rich:
+                    wrapped = (f'<div style="font-size:{fontsize:.1f}pt;">'
+                               f'{source}</div>')
+                    try:
+                        page.insert_htmlbox(rect, wrapped)
+                    except Exception:
+                        page.insert_text(
+                            (a.pts[0][0], a.pts[0][1] + fontsize),
+                            plain, fontsize=fontsize, color=rgb,
+                        )
+                else:
+                    try:
+                        kwargs = dict(rect=rect, text=plain,
+                                      fontsize=fontsize, text_color=rgb)
+                        if a.rotation:
+                            kwargs["rotate"] = a.rotation
+                        annot = page.add_freetext_annot(**kwargs)
+                        annot.set_opacity(op)
+                        annot.update()
+                    except Exception:
+                        page.insert_text(
+                            (a.pts[0][0], a.pts[0][1] + fontsize),
+                            plain, fontsize=fontsize, color=rgb,
+                        )
             elif a.type == "note":
                 annot = page.add_text_annot(fitz.Point(*a.pts[0]), a.text)
                 try:
@@ -1210,15 +1245,22 @@ class PdfTab(QGraphicsView):
             label.setPos(6, 0)
         elif a.type == "text":
             anchor = self._page_to_scene(a.page_idx, *a.pts[0])
-            item = QGraphicsTextItem(a.text)
+            item = QGraphicsTextItem()
+            t = a.text or ""
+            # Treat anything containing HTML tags as rich; setHtml
+            # handles font sizes, sub/sup, bold etc. Plain text falls
+            # back to setPlainText.
+            if "<" in t and ">" in t:
+                item.setHtml(t)
+            else:
+                item.setPlainText(t)
             f = QFont()
-            f.setPointSizeF(a.width * scale * 72.0 / self._base_dpi
-                            / self._zoom)
-            # ^ width is stored in pt; convert back to point-size for Qt
             f.setPointSizeF(max(4.0, a.width))
             item.setFont(f)
             item.setDefaultTextColor(color)
             item.setPos(anchor)
+            if a.rotation:
+                item.setRotation(a.rotation)
             self._scene.addItem(item)
         # If this annotation is selected by the Select tool, overlay a
         # dashed marquee so the user knows what Delete will remove.
@@ -1460,9 +1502,13 @@ class PdfTab(QGraphicsView):
             event.accept()
             return
         elif self._tool == "text":
-            self._place_text_box(page_idx, (px, py), color_hex, width)
+            self._add_text_at(page_idx, (px, py),
+                              color_hex, width, opacity)
             self._drag_start = None
             self._drag_page = None
+            self._preview_item = None
+            event.accept()
+            return
         elif self._tool == "edit_text":
             self._edit_existing_text(page_idx, px, py)
             self._drag_start = None
@@ -1819,30 +1865,37 @@ class PdfTab(QGraphicsView):
 
     # ----- text tool -----
 
-    def _place_text_box(self, page_idx: int,
-                        anchor_pt: tuple[float, float],
-                        color: str, fontsize: float) -> None:
-        scene_pt = self._page_to_scene(page_idx, *anchor_pt)
-        item = _EditableTextItem(self, page_idx, anchor_pt, color, fontsize)
-        item.setPos(scene_pt)
-        self._scene.addItem(item)
-        item.setFocus()
-
-    def _commit_text_item(self, page_idx: int,
-                          anchor_pt: tuple[float, float], text: str,
-                          color: str, fontsize: float) -> None:
+    def _add_text_at(self, page_idx: int,
+                     anchor_pt: tuple[float, float],
+                     color: str, fontsize: float, opacity: int) -> None:
+        """Add Text tool: open the Edit-Text dialog with an empty
+        editor at the click point, then store the result as a text
+        annotation. Replaces the inline _EditableTextItem flow whose
+        focusOutEvent → _render_all sequence had a habit of freeing
+        the item while Qt was still on the focus call stack
+        (0xC0000005 access-violation crash)."""
+        dlg = _EditTextDialog(
+            self, "", fontsize,
+            is_html=False, align="left",
+            preserve_line_breaks=False,
+            font_family="",
+            rotation=0,
+            title="Add text",
+        )
+        if dlg.exec() != QDialog.Accepted:
+            return
+        html = dlg.html()
+        plain = dlg.plain_text().strip()
+        if not plain:
+            return
         self._push_undo()
         self._annots.append(Annotation(
-            type="text", page_idx=page_idx, color=color, width=fontsize,
-            pts=[anchor_pt], text=text,
+            type="text", page_idx=page_idx, color=color,
+            width=fontsize, opacity=opacity,
+            pts=[anchor_pt], text=html,
+            rotation=dlg.rotation(),
         ))
-        # The editable item was a one-shot; replace by a clean render so
-        # subsequent zooms recreate it from storage.
         self._render_all()
-
-    def _cancel_text_item(self, item: _EditableTextItem) -> None:
-        if item.scene() is self._scene:
-            self._scene.removeItem(item)
 
     # ----- edit existing PDF text -----
     #

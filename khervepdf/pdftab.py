@@ -54,8 +54,8 @@ TOOL_DEFAULTS = {
     "hand":      {"color": "#000000", "width": 1.0,  "opacity": 100},
     "pen":       {"color": "#1976d2", "width": 2.0,  "opacity": 100},
     "highlight": {"color": "#fbc02d", "width": 14.0, "opacity": 35},
-    "rect":      {"color": "#388e3c", "width": 2.0,  "opacity": 100, "filled": False},
-    "ellipse":   {"color": "#7b1fa2", "width": 2.0,  "opacity": 100, "filled": False},
+    "rect":      {"color": "#388e3c", "width": 2.0,  "opacity": 100, "filled": False, "fill_color": None},
+    "ellipse":   {"color": "#7b1fa2", "width": 2.0,  "opacity": 100, "filled": False, "fill_color": None},
     "line":      {"color": "#212121", "width": 2.0,  "opacity": 100},
     "arrow":     {"color": "#212121", "width": 2.0,  "opacity": 100},
     "text":      {"color": "#000000", "width": 11.0, "opacity": 100},
@@ -88,6 +88,9 @@ class Annotation:
     text: str = ""
     opacity: int = 100  # percent, 0-100
     filled: bool = False  # rect / ellipse interior fill
+    # Optional separate fill colour for rect / ellipse. None means
+    # "fall back to the stroke colour" (the v0.14 behaviour).
+    fill_color: Optional[str] = None
 
 
 _FONT_SIZES = [6, 7, 8, 9, 10, 11, 12, 14, 16, 18, 20, 24, 28, 36, 48]
@@ -350,9 +353,16 @@ class PdfTab(QGraphicsView):
         # Selection (used by the Select tool — Delete removes selected
         # annotations). Indices into self._annots.
         self._selected: set[int] = set()
-        # Erase-drag flag: True between mouse-press and -release on the
-        # eraser so mouseMoveEvent keeps deleting under the cursor.
+        # Erase-drag state. The trail (semi-transparent red path) is
+        # the visible breadcrumb showing where the eraser has passed;
+        # _erase_queue collects indices of annotations the trail
+        # crossed. Actual deletion is deferred to mouseReleaseEvent so
+        # the trail remains visible without _render_all wiping it out
+        # mid-gesture, and so the whole sweep is a single undo step.
         self._erasing = False
+        self._erase_path: Optional[QPainterPath] = None
+        self._erase_trail: Optional[QGraphicsPathItem] = None
+        self._erase_queue: set[int] = set()
         # Select-tool marquee: dragging on blank page draws a dashed
         # rect; on release, every annotation whose bounding rect
         # intersects the marquee becomes selected.
@@ -752,15 +762,19 @@ class PdfTab(QGraphicsView):
                               color=color_hex, width=0.0, opacity=opacity,
                               pts=[(rect.x0, rect.y0), (rect.x1, rect.y1)])
         if a_type == "Square":
+            fill_hex = self._rgb01_to_hex(fill) if fill else None
             return Annotation(type="rect", page_idx=page_idx,
                               color=color_hex, width=width, opacity=opacity,
                               pts=[(rect.x0, rect.y0), (rect.x1, rect.y1)],
-                              filled=fill is not None)
+                              filled=fill is not None,
+                              fill_color=fill_hex)
         if a_type == "Circle":
+            fill_hex = self._rgb01_to_hex(fill) if fill else None
             return Annotation(type="ellipse", page_idx=page_idx,
                               color=color_hex, width=width, opacity=opacity,
                               pts=[(rect.x0, rect.y0), (rect.x1, rect.y1)],
-                              filled=fill is not None)
+                              filled=fill is not None,
+                              fill_color=fill_hex)
         if a_type == "Line":
             verts = getattr(annot, "vertices", None) or []
             if len(verts) >= 2:
@@ -849,7 +863,9 @@ class PdfTab(QGraphicsView):
                                  a.pts[1][0], a.pts[1][1])
                 annot = page.add_rect_annot(rect)
                 if a.filled:
-                    annot.set_colors(stroke=rgb, fill=rgb)
+                    fill_rgb = (self._hex_to_rgb01(a.fill_color)
+                                if a.fill_color else rgb)
+                    annot.set_colors(stroke=rgb, fill=fill_rgb)
                 else:
                     annot.set_colors(stroke=rgb)
                 annot.set_border(width=max(0.5, a.width))
@@ -860,7 +876,9 @@ class PdfTab(QGraphicsView):
                                  a.pts[1][0], a.pts[1][1])
                 annot = page.add_circle_annot(rect)
                 if a.filled:
-                    annot.set_colors(stroke=rgb, fill=rgb)
+                    fill_rgb = (self._hex_to_rgb01(a.fill_color)
+                                if a.fill_color else rgb)
+                    annot.set_colors(stroke=rgb, fill=fill_rgb)
                 else:
                     annot.set_colors(stroke=rgb)
                 annot.set_border(width=max(0.5, a.width))
@@ -977,6 +995,13 @@ class PdfTab(QGraphicsView):
     def set_tool_filled(self, val: bool, name: Optional[str] = None) -> None:
         self._tool_settings[name or self._tool]["filled"] = bool(val)
 
+    def tool_fill_color(self, name: Optional[str] = None) -> Optional[str]:
+        return self._tool_settings[name or self._tool].get("fill_color")
+
+    def set_tool_fill_color(self, color: Optional[str],
+                            name: Optional[str] = None) -> None:
+        self._tool_settings[name or self._tool]["fill_color"] = color
+
     def _apply_drag_mode(self) -> None:
         # Hand = pan; Select = click annotations; everything else = draw.
         if self._tool == "hand":
@@ -1035,8 +1060,7 @@ class PdfTab(QGraphicsView):
             item = QGraphicsRectItem(r)
             item.setPen(QPen(color, pw_px))
             if a.filled:
-                # Fill uses the same hex with the annotation's alpha.
-                fill = QColor(a.color)
+                fill = QColor(a.fill_color or a.color)
                 fill.setAlpha(alpha)
                 item.setBrush(QBrush(fill))
             self._scene.addItem(item)
@@ -1044,7 +1068,7 @@ class PdfTab(QGraphicsView):
             item = QGraphicsEllipseItem(self._rect_from_pts(a))
             item.setPen(QPen(color, pw_px))
             if a.filled:
-                fill = QColor(a.color)
+                fill = QColor(a.fill_color or a.color)
                 fill.setAlpha(alpha)
                 item.setBrush(QBrush(fill))
             self._scene.addItem(item)
@@ -1266,7 +1290,8 @@ class PdfTab(QGraphicsView):
             item = cls(QRectF(scene_pt, scene_pt))
             item.setPen(QPen(qcolor, width * scale))
             if self.tool_filled():
-                fill = QColor(color_hex)
+                fc_hex = self.tool_fill_color() or color_hex
+                fill = QColor(fc_hex)
                 fill.setAlpha(int(opacity * 255 / 100))
                 item.setBrush(QBrush(fill))
             self._scene.addItem(item)
@@ -1278,15 +1303,25 @@ class PdfTab(QGraphicsView):
             self._scene.addItem(item)
             self._preview_item = item
         elif self._tool == "erase":
-            # Eraser: click + drag. One undo entry covers the whole
-            # gesture; mouseMoveEvent keeps deleting while _erasing.
-            self._push_undo()
+            # Eraser: queue deletions while showing a red trail. The
+            # deletion happens on mouseReleaseEvent in one batch so
+            # the trail remains visible during the gesture and the
+            # whole sweep is a single undo step.
             self._erasing = True
             self._selected.clear()
+            self._erase_queue = set()
+            self._erase_path = QPainterPath(scene_pt)
+            pen = QPen(QColor("#c62828"), 4.0,
+                       Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+            pen.setCosmetic(True)
+            self._erase_trail = QGraphicsPathItem(self._erase_path)
+            self._erase_trail.setPen(pen)
+            self._erase_trail.setOpacity(0.5)
+            self._erase_trail.setZValue(200)
+            self._scene.addItem(self._erase_trail)
             idx = self._find_annot_at(page_idx, px, py)
             if idx is not None:
-                del self._annots[idx]
-                self._render_all()
+                self._erase_queue.add(idx)
             self._drag_start = None
             self._drag_page = None
             self._preview_item = None
@@ -1374,13 +1409,15 @@ class PdfTab(QGraphicsView):
             return
         if self._tool == "erase" and self._erasing:
             scene_pt = self.mapToScene(event.position().toPoint())
+            if self._erase_path is not None and self._erase_trail is not None:
+                self._erase_path.lineTo(scene_pt)
+                self._erase_trail.setPath(self._erase_path)
             mapped = self._scene_to_page(scene_pt)
             if mapped is not None:
                 page_idx, px, py = mapped
                 idx = self._find_annot_at(page_idx, px, py)
                 if idx is not None:
-                    del self._annots[idx]
-                    self._render_all()
+                    self._erase_queue.add(idx)
             event.accept()
             return
         if self._preview_item is None:
@@ -1484,6 +1521,19 @@ class PdfTab(QGraphicsView):
             return
         if self._tool == "erase" and self._erasing:
             self._erasing = False
+            # Remove the visible trail.
+            if self._erase_trail is not None:
+                self._scene.removeItem(self._erase_trail)
+            self._erase_trail = None
+            self._erase_path = None
+            queue = list(self._erase_queue)
+            self._erase_queue = set()
+            if queue:
+                self._push_undo()
+                for i in sorted(queue, reverse=True):
+                    if 0 <= i < len(self._annots):
+                        del self._annots[i]
+                self._render_all()
             event.accept()
             return
         if self._preview_item is None or self._drag_page is None:
@@ -1532,9 +1582,11 @@ class PdfTab(QGraphicsView):
             else:
                 filled = (self._tool in ("rect", "ellipse")
                           and self.tool_filled())
+                fc = self.tool_fill_color() if filled else None
                 self._annots.append(Annotation(
                     type=self._tool, page_idx=page, color=color, width=width,
                     pts=[start_pt, end_pt], opacity=opacity, filled=filled,
+                    fill_color=fc,
                 ))
 
         # Drop the preview; the replay path will redraw from storage so

@@ -12,6 +12,7 @@ subsequent commits. The shell already wires up:
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Optional
 
 from PySide6.QtCore import QSettings, Qt
 from PySide6.QtGui import QAction, QActionGroup, QColor
@@ -111,13 +112,22 @@ class _OptionsPopup(QWidget):
         opr.addWidget(self._opacity_lbl)
         layout.addWidget(self._opacity_row)
 
-        # Fill toggle row — rect / ellipse only.
+        # Fill toggle + fill-colour swatch — rect / ellipse only.
         self._fill_row = QWidget(self)
         fr = QHBoxLayout(self._fill_row)
         fr.setContentsMargins(0, 0, 0, 0)
         self._fill_check = QCheckBox("Fill shape", self)
         self._fill_check.toggled.connect(self._on_fill)
         fr.addWidget(self._fill_check)
+        # Small coloured square — click to pick a different fill
+        # colour (otherwise the stroke colour is used).
+        self._fill_color_btn = QToolButton(self)
+        self._fill_color_btn.setFixedSize(22, 22)
+        self._fill_color_btn.setToolTip(
+            "Fill colour — defaults to stroke colour; click to override"
+        )
+        self._fill_color_btn.clicked.connect(self._on_fill_color)
+        fr.addWidget(self._fill_color_btn)
         fr.addStretch(1)
         layout.addWidget(self._fill_row)
 
@@ -203,6 +213,10 @@ class _OptionsPopup(QWidget):
             self._fill_check.blockSignals(True)
             self._fill_check.setChecked(bool(filled))
             self._fill_check.blockSignals(False)
+            self._fill_color_btn.setEnabled(bool(filled))
+            fc = (tab.tool_fill_color(tool)
+                  if tab is not None else None) or current_color
+            self._update_fill_swatch(fc)
         # Nudge the QMenu to re-measure when rows toggle.
         self.adjustSize()
         menu = getattr(self._mw, "_options_menu", None)
@@ -255,6 +269,27 @@ class _OptionsPopup(QWidget):
         tab = self._mw._current_pdf_tab()
         if tab is not None:
             tab.set_tool_filled(checked, self._mw._current_tool)
+        self._fill_color_btn.setEnabled(checked)
+
+    def _on_fill_color(self) -> None:
+        tool = self._mw._current_tool
+        tab = self._mw._current_pdf_tab()
+        if tab is None:
+            return
+        current = tab.tool_fill_color(tool) or tab.tool_color(tool)
+        chosen = QColorDialog.getColor(QColor(current), self,
+                                       "Choose fill colour")
+        if chosen.isValid():
+            tab.set_tool_fill_color(chosen.name(), tool)
+            self._update_fill_swatch(chosen.name())
+
+    def _update_fill_swatch(self, color: Optional[str]) -> None:
+        c = color or "#888888"
+        self._fill_color_btn.setStyleSheet(
+            f"QToolButton {{ background:{c}; border:1px solid #555;"
+            "border-radius:3px; } "
+            "QToolButton:hover { border:2px solid #000; }"
+        )
 
 
 class _ToolButton(QToolButton):

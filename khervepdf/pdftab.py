@@ -32,8 +32,8 @@ from PySide6.QtWidgets import (
     QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout,
     QGraphicsEllipseItem, QGraphicsItem, QGraphicsLineItem,
     QGraphicsPathItem, QGraphicsPixmapItem, QGraphicsRectItem,
-    QGraphicsScene, QGraphicsTextItem, QGraphicsView, QMessageBox,
-    QPlainTextEdit, QVBoxLayout,
+    QGraphicsScene, QGraphicsTextItem, QGraphicsView, QInputDialog,
+    QMessageBox, QPlainTextEdit, QVBoxLayout,
 )
 
 
@@ -358,7 +358,43 @@ class PdfTab(QGraphicsView):
                 if x - tol_pt <= x_pt <= x + w + tol_pt \
                         and y - tol_pt <= y_pt <= y + h + tol_pt:
                     return i
+            elif a.type == "note":
+                # Marker is roughly 14 PDF pts wide × 12 high. Be
+                # generous so a click anywhere near the marker erases.
+                x, y = a.pts[0]
+                if (x - tol_pt <= x_pt <= x + 14 + tol_pt
+                        and y - tol_pt <= y_pt <= y + 12 + tol_pt):
+                    return i
         return None
+
+    def _note_at_scene(self, scene_pt: QPointF) -> Optional[int]:
+        """Index of the top-most sticky-note annotation whose marker
+        bounding rect contains the given scene point, or None."""
+        for i in range(len(self._annots) - 1, -1, -1):
+            a = self._annots[i]
+            if a.type != "note" or a.page_idx not in self._page_layout:
+                continue
+            anchor = self._page_to_scene(a.page_idx, *a.pts[0])
+            if (anchor.x() <= scene_pt.x() <= anchor.x() + 22
+                    and anchor.y() <= scene_pt.y() <= anchor.y() + 18):
+                return i
+        return None
+
+    def _edit_note(self, idx: int) -> None:
+        a = self._annots[idx]
+        new_text, ok = QInputDialog.getMultiLineText(
+            self, "Sticky note", "Note text:", a.text,
+        )
+        if not ok or new_text == a.text:
+            return
+        self._push_undo()
+        # dataclass field — replace via deepcopy-friendly assignment
+        self._annots[idx] = Annotation(
+            type=a.type, page_idx=a.page_idx, color=a.color,
+            width=a.width, opacity=a.opacity, pts=list(a.pts),
+            text=new_text,
+        )
+        self._render_all()
 
     # ----- undo / redo -----
     #
@@ -529,6 +565,13 @@ class PdfTab(QGraphicsView):
                     (a.pts[0][0], a.pts[0][1] + max(4.0, a.width)),
                     a.text, fontsize=max(4.0, a.width), color=rgb,
                 )
+            elif a.type == "note":
+                annot = page.add_text_annot(fitz.Point(*a.pts[0]), a.text)
+                try:
+                    annot.set_colors(stroke=(0.71, 0.55, 0.0))
+                    annot.update()
+                except Exception:
+                    pass
             # Erase isn't an annotation type — it removes items from
             # self._annots at gesture time, so there's nothing to bake.
 
@@ -650,6 +693,25 @@ class PdfTab(QGraphicsView):
             item.setPen(QPen(Qt.NoPen))
             item.setBrush(QBrush(color))
             self._scene.addItem(item)
+        elif a.type == "note":
+            # Sticky-note marker: a small yellow rounded rect with an "N"
+            # glyph, anchored at the click point. The annotation's full
+            # text is shown as the item's tooltip and reachable via the
+            # edit dialog (Select / Note tool + click).
+            anchor = self._page_to_scene(a.page_idx, *a.pts[0])
+            marker = QGraphicsRectItem(0, 0, 22, 18)
+            marker.setPos(anchor)
+            marker.setPen(QPen(QColor("#b58900"), 1))
+            marker.setBrush(QBrush(QColor("#fff59d")))
+            marker.setToolTip(a.text or "(empty note)")
+            self._scene.addItem(marker)
+            label = QGraphicsTextItem("N", marker)
+            f = QFont()
+            f.setBold(True)
+            f.setPointSize(8)
+            label.setFont(f)
+            label.setDefaultTextColor(QColor("#5d4037"))
+            label.setPos(6, 0)
         elif a.type == "text":
             anchor = self._page_to_scene(a.page_idx, *a.pts[0])
             item = QGraphicsTextItem(a.text)
@@ -686,6 +748,18 @@ class PdfTab(QGraphicsView):
     # ----- mouse: drawing -----
 
     def mousePressEvent(self, event):  # noqa: N802
+        # Always check first whether the click landed on a sticky-note
+        # marker — even in Select mode, a click on a note should open
+        # its edit dialog instead of starting a pan.
+        if event.button() == Qt.LeftButton:
+            scene_pt0 = self.mapToScene(event.position().toPoint())
+            mapped0 = self._scene_to_page(scene_pt0)
+            if mapped0 is not None:
+                note_idx = self._note_at_scene(scene_pt0)
+                if note_idx is not None and self._tool in ("select", "note"):
+                    self._edit_note(note_idx)
+                    event.accept()
+                    return
         if self._tool == "select" or event.button() != Qt.LeftButton:
             return super().mousePressEvent(event)
         scene_pt = self.mapToScene(event.position().toPoint())
@@ -738,6 +812,26 @@ class PdfTab(QGraphicsView):
             if idx is not None:
                 self._push_undo()
                 del self._annots[idx]
+                self._render_all()
+            self._drag_start = None
+            self._drag_page = None
+            self._preview_item = None
+            event.accept()
+            return
+        elif self._tool == "note":
+            # Prompt for the note's body; on accept, store an anchor +
+            # the text. The marker is drawn from storage so it'll
+            # survive zoom/scroll like every other annotation.
+            text, ok = QInputDialog.getMultiLineText(
+                self, "New sticky note", "Note text:", "",
+            )
+            if ok and text.strip():
+                self._push_undo()
+                self._annots.append(Annotation(
+                    type="note", page_idx=page_idx,
+                    color="#fff59d", width=1.0,
+                    pts=[(px, py)], text=text,
+                ))
                 self._render_all()
             self._drag_start = None
             self._drag_page = None

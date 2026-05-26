@@ -130,14 +130,18 @@ class _OptionsPopup(QWidget):
         layout.addWidget(self._size_row)
 
     def refresh(self) -> None:
+        """Sync slider/spin values from the active tool's stored state.
+
+        Width and opacity rows are shown for every tool the popup
+        applies to; the font-size row only for text tools. Hiding rows
+        per-tool inside a QMenu's QWidgetAction proved unreliable
+        (the menu caches size on first show), so we keep them all
+        visible apart from the size row's text-only branch."""
         tool = self._mw._current_tool
-        has_width = tool in ("pen", "line", "arrow", "rect", "ellipse")
-        has_opacity = tool in ("pen", "line", "arrow", "rect", "ellipse",
-                               "highlight")
-        has_size = tool in ("text", "edit_text")
-        self._width_row.setVisible(has_width)
-        self._opacity_row.setVisible(has_opacity)
-        self._size_row.setVisible(has_size)
+        is_text = tool in ("text", "edit_text")
+        self._width_row.setVisible(not is_text)
+        self._opacity_row.setVisible(not is_text)
+        self._size_row.setVisible(is_text)
 
         tab = self._mw._current_pdf_tab()
         if tab is not None:
@@ -147,20 +151,22 @@ class _OptionsPopup(QWidget):
             d = TOOL_DEFAULTS.get(tool, {})
             width = d.get("width", 2.0)
             opacity = d.get("opacity", 100)
-        if has_width:
-            self._width_slider.blockSignals(True)
-            self._width_slider.setValue(max(1, min(30, int(round(width)))))
-            self._width_slider.blockSignals(False)
-            self._width_lbl.setText(f"{int(round(width))} pt")
-        if has_size:
-            self._size_spin.blockSignals(True)
-            self._size_spin.setValue(float(width))
-            self._size_spin.blockSignals(False)
-        if has_opacity:
-            self._opacity_slider.blockSignals(True)
-            self._opacity_slider.setValue(int(opacity))
-            self._opacity_slider.blockSignals(False)
-            self._opacity_lbl.setText(f"{int(opacity)}%")
+        self._width_slider.blockSignals(True)
+        self._width_slider.setValue(max(1, min(30, int(round(width)))))
+        self._width_slider.blockSignals(False)
+        self._width_lbl.setText(f"{int(round(width))} pt")
+        self._size_spin.blockSignals(True)
+        self._size_spin.setValue(float(width))
+        self._size_spin.blockSignals(False)
+        self._opacity_slider.blockSignals(True)
+        self._opacity_slider.setValue(int(opacity))
+        self._opacity_slider.blockSignals(False)
+        self._opacity_lbl.setText(f"{int(opacity)}%")
+        # Nudge the QMenu to re-measure when rows toggle.
+        self.adjustSize()
+        menu = getattr(self._mw, "_options_menu", None)
+        if menu is not None:
+            menu.adjustSize()
 
     def _apply_color(self, color: str) -> None:
         tab = self._mw._current_pdf_tab()
@@ -327,10 +333,13 @@ class MainWindow(QMainWindow):
         tb.setMovable(False)
         self.addToolBar(Qt.TopToolBarArea, tb)
 
-        # Plain file actions.
+        # Plain file actions + undo/redo (mirrored from the Edit menu
+        # so the user has fast keyboard-or-mouse access).
         for name, tip, handler in (
             ("open", "Open PDF (Ctrl+O)", self._open),
             ("save", "Save (Ctrl+S)",     self._save),
+            ("undo", "Undo (Ctrl+Z)",     self._undo),
+            ("redo", "Redo (Ctrl+Y)",     self._redo),
         ):
             act = QAction(icon(name), tip, self, triggered=handler)
             act.setToolTip(tip)

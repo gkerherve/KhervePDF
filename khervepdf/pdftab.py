@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Optional
 
 import fitz
-from PySide6.QtCore import QPointF, QRectF, QSettings, Qt
+from PySide6.QtCore import QPointF, QRectF, QSettings, Qt, QTimer
 from PySide6.QtGui import (
     QAction, QActionGroup, QBrush, QColor, QFont, QImage, QPainter,
     QPainterPath, QPen, QPixmap, QTextBlockFormat, QTextCharFormat,
@@ -345,6 +345,11 @@ class PdfTab(QGraphicsView):
         # devicePixelRatio oversampling in _render_all, text reads
         # crisp on both 1x and HiDPI displays.
         self._base_dpi = 144
+        # Auto-fit-width: when True, the page rescales to fill the
+        # viewport whenever the window resizes (set on by default and
+        # on every fit_width() call; flipped off by zoom_in/out so
+        # the user's chosen zoom isn't overridden by a resize).
+        self._auto_fit_width = True
         self._tool = "select"
         # tool -> {"color": "#hex", "width": float} (per-tab state).
         self._tool_settings = {k: dict(v) for k, v in TOOL_DEFAULTS.items()}
@@ -941,9 +946,13 @@ class PdfTab(QGraphicsView):
         return int(round(self._zoom * 100))
 
     def zoom_in(self) -> None:
+        # Manual zoom disables auto-fit so the user's choice survives
+        # the next window resize.
+        self._auto_fit_width = False
         self._set_zoom(self._zoom * 1.25)
 
     def zoom_out(self) -> None:
+        self._auto_fit_width = False
         self._set_zoom(self._zoom / 1.25)
 
     def scroll_to_page(self, page_idx: int) -> None:
@@ -958,12 +967,35 @@ class PdfTab(QGraphicsView):
         self.centerOn(cx, cy)
 
     def fit_width(self) -> None:
+        """Fit page width to viewport and re-arm auto-fit so window
+        resizes keep refitting."""
+        self._auto_fit_width = True
+        self._apply_fit_width()
+
+    def _apply_fit_width(self) -> None:
         if self._doc is None or self._doc.page_count == 0:
             return
-        page_w_pt = self._doc[0].rect.width
-        view_w = max(1, self.viewport().width() - 24)
+        page_w_pt = self._doc[0].rect.width or 1.0
+        # 24px padding so the page doesn't bleed into the scrollbar.
+        view_w = self.viewport().width() - 24
+        if view_w < 10:
+            # Viewport isn't laid out yet — showEvent / resizeEvent
+            # will retry.
+            return
         new_zoom = view_w / ((self._base_dpi / 72.0) * page_w_pt)
         self._set_zoom(new_zoom)
+
+    def resizeEvent(self, event):  # noqa: N802
+        super().resizeEvent(event)
+        if self._auto_fit_width and self._doc is not None:
+            # Defer one tick so the viewport has settled to its new
+            # size before we measure.
+            QTimer.singleShot(0, self._apply_fit_width)
+
+    def showEvent(self, event):  # noqa: N802
+        super().showEvent(event)
+        if self._auto_fit_width and self._doc is not None:
+            QTimer.singleShot(0, self._apply_fit_width)
 
     def _set_zoom(self, z: float) -> None:
         z = max(0.1, min(z, 8.0))

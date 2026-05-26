@@ -32,11 +32,12 @@ from PySide6.QtGui import (
     QTextCursor, QTextDocumentFragment,
 )
 from PySide6.QtWidgets import (
-    QComboBox, QDialog, QDialogButtonBox, QFontComboBox,
+    QComboBox, QDialog, QDialogButtonBox, QFontComboBox, QFrame,
     QGraphicsEllipseItem, QGraphicsItem, QGraphicsLineItem,
     QGraphicsPathItem, QGraphicsPixmapItem, QGraphicsRectItem,
-    QGraphicsScene, QGraphicsTextItem, QGraphicsView, QInputDialog,
-    QLabel, QMessageBox, QTextEdit, QToolBar, QVBoxLayout,
+    QGraphicsScene, QGraphicsTextItem, QGraphicsView, QHBoxLayout,
+    QInputDialog, QLabel, QMessageBox, QTextEdit, QToolBar, QToolButton,
+    QVBoxLayout,
 )
 
 from .icons import icon
@@ -392,6 +393,236 @@ class _EditTextDialog(QDialog):
         return int(self._rotation_combo.currentData() or 0)
 
 
+class _EditableTextItem(QGraphicsTextItem):
+    """In-place text editor that lives on the page canvas. The user
+    types directly on the PDF; commit is *deferred* via QTimer so
+    Qt finishes processing the focus event before the scene gets
+    re-rendered (the v0.35 crash was a 0xC0000005 access violation
+    triggered by re-rendering inside focusOutEvent)."""
+
+    def __init__(self, tab: "PdfTab", page_idx: int,
+                 anchor_pt: tuple[float, float], color: str,
+                 fontsize: float) -> None:
+        super().__init__()
+        self._tab = tab
+        self._page_idx = page_idx
+        self._anchor_pt = anchor_pt
+        self._color = color
+        self._fontsize = fontsize
+        self._rotation = 0
+        self._committed = False
+        self.setDefaultTextColor(QColor(color))
+        f = QFont()
+        f.setPointSizeF(max(4.0, fontsize))
+        self.setFont(f)
+        self.setTextInteractionFlags(Qt.TextEditorInteraction)
+
+    def set_rotation_deg(self, deg: int) -> None:
+        self._rotation = int(deg)
+        self.setRotation(self._rotation)
+
+    def focusOutEvent(self, ev):  # noqa: N802
+        super().focusOutEvent(ev)
+        if self._committed:
+            return
+        # Defer the focus-target check by one tick so QApplication's
+        # focusWidget() reflects the *new* target. If the user clicked
+        # something inside the floating toolbar (e.g. the size combo),
+        # we don't want to commit — they're still editing.
+        QTimer.singleShot(0, self._maybe_commit)
+
+    def _maybe_commit(self) -> None:
+        if self._committed:
+            return
+        from PySide6.QtWidgets import QApplication as _QApp
+        bar = getattr(self._tab, "_inline_format_bar", None)
+        new_focus = _QApp.focusWidget()
+        if bar is not None and new_focus is not None:
+            # Focus moved into the toolbar — keep editing.
+            if bar is new_focus or bar.isAncestorOf(new_focus):
+                return
+        self._committed = True
+        plain = self.toPlainText().strip()
+        rich = self.toHtml()
+        tab = self._tab
+        page_idx = self._page_idx
+        anchor = self._anchor_pt
+        color = self._color
+        fontsize = self._fontsize
+        rotation = self._rotation
+        tab._commit_inline_text(page_idx, anchor, plain, rich,
+                                color, fontsize, rotation)
+
+
+class _TextFormatBar(QFrame):
+    """Floating toolbar that hovers next to an _EditableTextItem.
+
+    Hosts the same formatting controls as the Edit-Text dialog —
+    font family, size, B / I / U, super / sub, alignment, rotation —
+    but applies them to the inline editor's textCursor instead of
+    opening a modal. Closed automatically when the editor loses
+    focus.
+    """
+
+    _SIZES = [6, 7, 8, 9, 10, 11, 12, 14, 16, 18, 20, 24, 28, 36, 48]
+
+    def __init__(self, target: _EditableTextItem,
+                 parent: QGraphicsView) -> None:
+        super().__init__(parent, Qt.Tool | Qt.FramelessWindowHint
+                         | Qt.WindowStaysOnTopHint)
+        self.setAttribute(Qt.WA_ShowWithoutActivating, True)
+        # Critical: no widget in the bar may steal focus from the
+        # editor item — clicking a button would otherwise trigger
+        # focusOutEvent and commit / dismiss mid-edit.
+        self.setFocusPolicy(Qt.NoFocus)
+        self.setFrameShape(QFrame.StyledPanel)
+        self.setStyleSheet(
+            "QFrame { background:#fafafa; border:1px solid #888;"
+            "border-radius:4px; }"
+        )
+        self._target = target
+
+        h = QHBoxLayout(self)
+        h.setContentsMargins(6, 4, 6, 4)
+        h.setSpacing(4)
+
+        self._font_combo = QFontComboBox(self)
+        self._font_combo.setMaximumWidth(150)
+        self._font_combo.currentFontChanged.connect(self._on_font)
+        h.addWidget(self._font_combo)
+
+        self._size_combo = QComboBox(self)
+        self._size_combo.setEditable(True)
+        self._size_combo.setMaximumWidth(60)
+        for sz in self._SIZES:
+            self._size_combo.addItem(str(sz))
+        self._size_combo.setCurrentText(
+            str(int(round(target.font().pointSizeF())))
+        )
+        self._size_combo.editTextChanged.connect(self._on_size)
+        h.addWidget(self._size_combo)
+
+        # Bold / italic / underline / super / sub — toggle buttons.
+        self._bold = self._toggle(h, "bold", self._on_bold)
+        self._italic = self._toggle(h, "italic", self._on_italic)
+        self._underline = self._toggle(h, "underline", self._on_underline)
+        self._super = self._toggle(h, "superscript", self._on_super)
+        self._sub = self._toggle(h, "subscript", self._on_sub)
+
+        # Alignment — exclusive group.
+        self._align_btns: dict[str, QToolButton] = {}
+        for name, flag in (
+            ("align_left",    Qt.AlignLeft),
+            ("align_center",  Qt.AlignHCenter),
+            ("align_right",   Qt.AlignRight),
+            ("align_justify", Qt.AlignJustify),
+        ):
+            btn = QToolButton(self)
+            btn.setIcon(icon(name))
+            btn.setCheckable(True)
+            btn.setAutoExclusive(True)
+            btn.setFocusPolicy(Qt.NoFocus)
+            btn.clicked.connect(
+                lambda _c=False, f=flag: self._on_align(f)
+            )
+            h.addWidget(btn)
+            self._align_btns[name] = btn
+        self._align_btns["align_left"].setChecked(True)
+
+        # Rotation.
+        h.addWidget(QLabel("Rot:", self))
+        self._rotation_combo = QComboBox(self)
+        for deg in (0, 90, 180, 270):
+            self._rotation_combo.addItem(f"{deg}°", deg)
+        self._rotation_combo.currentIndexChanged.connect(self._on_rotation)
+        h.addWidget(self._rotation_combo)
+
+        self.adjustSize()
+
+    def _toggle(self, layout, icon_name, handler) -> QToolButton:
+        btn = QToolButton(self)
+        btn.setIcon(icon(icon_name))
+        btn.setCheckable(True)
+        btn.setFocusPolicy(Qt.NoFocus)
+        btn.toggled.connect(handler)
+        layout.addWidget(btn)
+        return btn
+
+    # ----- formatting slots (apply to target's QTextCursor) -----
+
+    def _merge_format(self, fmt: QTextCharFormat) -> None:
+        cur = self._target.textCursor()
+        cur.mergeCharFormat(fmt)
+        self._target.setTextCursor(cur)
+        # Keep the target's default char format in sync for new typing
+        # at the cursor position.
+        self._target.setFocus()
+
+    def _on_font(self, font: QFont) -> None:
+        fmt = QTextCharFormat()
+        fmt.setFontFamily(font.family())
+        self._merge_format(fmt)
+
+    def _on_size(self, txt: str) -> None:
+        try:
+            sz = float(txt)
+        except ValueError:
+            return
+        if sz < 4.0 or sz > 200.0:
+            return
+        fmt = QTextCharFormat()
+        fmt.setFontPointSize(sz)
+        self._merge_format(fmt)
+
+    def _on_bold(self, checked: bool) -> None:
+        fmt = QTextCharFormat()
+        fmt.setFontWeight(QFont.Bold if checked else QFont.Normal)
+        self._merge_format(fmt)
+
+    def _on_italic(self, checked: bool) -> None:
+        fmt = QTextCharFormat()
+        fmt.setFontItalic(checked)
+        self._merge_format(fmt)
+
+    def _on_underline(self, checked: bool) -> None:
+        fmt = QTextCharFormat()
+        fmt.setFontUnderline(checked)
+        self._merge_format(fmt)
+
+    def _on_super(self, checked: bool) -> None:
+        if checked:
+            self._sub.setChecked(False)
+            va = QTextCharFormat.AlignSuperScript
+        else:
+            va = QTextCharFormat.AlignNormal
+        fmt = QTextCharFormat()
+        fmt.setVerticalAlignment(va)
+        self._merge_format(fmt)
+
+    def _on_sub(self, checked: bool) -> None:
+        if checked:
+            self._super.setChecked(False)
+            va = QTextCharFormat.AlignSubScript
+        else:
+            va = QTextCharFormat.AlignNormal
+        fmt = QTextCharFormat()
+        fmt.setVerticalAlignment(va)
+        self._merge_format(fmt)
+
+    def _on_align(self, flag) -> None:
+        cur = self._target.textCursor()
+        blk = QTextBlockFormat()
+        blk.setAlignment(flag)
+        cur.mergeBlockFormat(blk)
+        self._target.setTextCursor(cur)
+        self._target.setFocus()
+
+    def _on_rotation(self, _idx: int) -> None:
+        deg = int(self._rotation_combo.currentData() or 0)
+        self._target.set_rotation_deg(deg)
+        self._target.setFocus()
+
+
 class PdfTab(QGraphicsView):
     def __init__(self, path: Path, parent=None) -> None:
         super().__init__(parent)
@@ -434,6 +665,9 @@ class PdfTab(QGraphicsView):
         # original press point, and the ghost rect rendered while the
         # user is dragging the paragraph.
         self._move_text_state: Optional[dict] = None
+        # Add-Text inline editing state.
+        self._inline_text_item: Optional[_EditableTextItem] = None
+        self._inline_format_bar: Optional[_TextFormatBar] = None
         # Undo/redo: each entry is a state snapshot. Annotation-only
         # actions snapshot just the annot list (cheap); actions that
         # mutate the underlying PDF (edit_text) also snapshot doc bytes.
@@ -1868,32 +2102,64 @@ class PdfTab(QGraphicsView):
     def _add_text_at(self, page_idx: int,
                      anchor_pt: tuple[float, float],
                      color: str, fontsize: float, opacity: int) -> None:
-        """Add Text tool: open the Edit-Text dialog with an empty
-        editor at the click point, then store the result as a text
-        annotation. Replaces the inline _EditableTextItem flow whose
-        focusOutEvent → _render_all sequence had a habit of freeing
-        the item while Qt was still on the focus call stack
-        (0xC0000005 access-violation crash)."""
-        dlg = _EditTextDialog(
-            self, "", fontsize,
-            is_html=False, align="left",
-            preserve_line_breaks=False,
-            font_family="",
-            rotation=0,
-            title="Add text",
-        )
-        if dlg.exec() != QDialog.Accepted:
-            return
-        html = dlg.html()
-        plain = dlg.plain_text().strip()
+        """Add Text tool: drop an editable text item on the page at
+        the click point and pop up a floating toolbar with font /
+        size / B / I / U / sub-sup / alignment / rotation controls.
+        The user types straight onto the PDF — no modal dialog. The
+        commit (focusOut → _annots) is deferred via QTimer so the
+        re-render doesn't tear down the item under Qt's focus
+        machinery."""
+        # If another inline edit is in progress, commit (focus out)
+        # before starting a new one.
+        if self._inline_text_item is not None:
+            self._inline_text_item.clearFocus()
+        scene_pt = self._page_to_scene(page_idx, *anchor_pt)
+        item = _EditableTextItem(self, page_idx, anchor_pt, color, fontsize)
+        item.setPos(scene_pt)
+        self._scene.addItem(item)
+        item.setFocus()
+        self._inline_text_item = item
+        # Position the floating toolbar just above the click point in
+        # the viewport. Use mapToGlobal because the bar is a Qt.Tool
+        # top-level — its coordinates are screen-global.
+        bar = _TextFormatBar(item, self)
+        view_pt = self.mapFromScene(scene_pt)
+        global_pt = self.viewport().mapToGlobal(view_pt)
+        bar.move(global_pt.x(), max(0, global_pt.y() - 44))
+        bar.show()
+        self._inline_format_bar = bar
+
+    def _commit_inline_text(self, page_idx: int,
+                            anchor_pt: tuple[float, float],
+                            plain: str, html: str,
+                            color: str, fontsize: float,
+                            rotation: int) -> None:
+        """Slot called via QTimer.singleShot from
+        _EditableTextItem.focusOutEvent. Safe to mutate the scene
+        here — Qt has finished its focus processing by now."""
+        # Tear down the floating toolbar regardless of whether we
+        # actually commit (might be a cancel — empty text).
+        if getattr(self, "_inline_format_bar", None) is not None:
+            self._inline_format_bar.hide()
+            self._inline_format_bar.deleteLater()
+            self._inline_format_bar = None
+        self._inline_text_item = None
         if not plain:
+            # Empty — just refresh so the temporary item disappears.
+            self._render_all()
             return
+        # Use the rich HTML when it carries any sup/sub/bold/italic
+        # spans; otherwise store the plain string so the saved PDF
+        # gets a real editable annotation (add_freetext_annot).
+        rich_markers = ("<sub", "<sup", "<b>", "<b ", "<i>", "<i ",
+                        "<span", "<u>", "<u ")
+        store = html if any(m in html for m in rich_markers) else plain
         self._push_undo()
         self._annots.append(Annotation(
             type="text", page_idx=page_idx, color=color,
-            width=fontsize, opacity=opacity,
-            pts=[anchor_pt], text=html,
-            rotation=dlg.rotation(),
+            width=fontsize, opacity=100,
+            pts=[anchor_pt], text=store,
+            rotation=int(rotation),
         ))
         self._render_all()
 

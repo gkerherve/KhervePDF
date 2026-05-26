@@ -14,10 +14,10 @@ from __future__ import annotations
 from pathlib import Path
 
 from PySide6.QtCore import QSettings, Qt
-from PySide6.QtGui import QAction, QActionGroup
+from PySide6.QtGui import QAction, QActionGroup, QColor, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
-    QFileDialog, QLabel, QMainWindow, QMenu, QMessageBox, QStatusBar,
-    QTabWidget, QToolBar, QWidget,
+    QColorDialog, QDoubleSpinBox, QFileDialog, QLabel, QMainWindow, QMenu,
+    QMessageBox, QStatusBar, QTabWidget, QToolBar, QToolButton, QWidget,
 )
 
 from . import themes, version_string, last_commit_subject
@@ -56,6 +56,9 @@ class MainWindow(QMainWindow):
                                  triggered=self._new))
         m_file.addAction(QAction(icon("open"), "&Open…", self, shortcut="Ctrl+O",
                                  triggered=self._open))
+        self._m_recent = m_file.addMenu("Open &Recent")
+        self._m_recent.setIcon(icon("history"))
+        self._refresh_recent_menu()
         m_file.addSeparator()
         m_file.addAction(QAction(icon("save"), "&Save", self, shortcut="Ctrl+S",
                                  triggered=self._save))
@@ -153,7 +156,8 @@ class MainWindow(QMainWindow):
             ("select",    "Select / Pan"),
             ("pen",       "Pen"),
             ("highlight", "Highlight"),
-            ("text",      "Text"),
+            ("text",      "Text (add new)"),
+            ("edit_text", "Edit existing text"),
             ("line",      "Line"),
             ("arrow",     "Arrow"),
             ("rect",      "Rectangle"),
@@ -172,6 +176,26 @@ class MainWindow(QMainWindow):
         self._tool_actions["select"].setChecked(True)
 
         tb.addSeparator()
+        # Stroke colour swatch + width spinbox edit the active tool's
+        # stored color/width on the current PdfTab. Switching tools
+        # refreshes both widgets to that tool's stored values.
+        self._color_btn = QToolButton(self)
+        self._color_btn.setToolTip("Stroke colour (for the active tool)")
+        self._color_btn.clicked.connect(self._pick_color)
+        tb.addWidget(self._color_btn)
+
+        self._width_spin = QDoubleSpinBox(self)
+        self._width_spin.setRange(0.5, 60.0)
+        self._width_spin.setDecimals(1)
+        self._width_spin.setSingleStep(0.5)
+        self._width_spin.setSuffix(" pt")
+        self._width_spin.setToolTip(
+            "Stroke width (for pen/line/shapes) or font size (for text)"
+        )
+        self._width_spin.valueChanged.connect(self._set_width)
+        tb.addWidget(self._width_spin)
+
+        tb.addSeparator()
         for name, tip, handler in (
             ("zoom_out",  "Zoom Out",  self._zoom_out),
             ("zoom_in",   "Zoom In",   self._zoom_in),
@@ -180,6 +204,7 @@ class MainWindow(QMainWindow):
             act = QAction(icon(name), tip, self, triggered=handler)
             act.setToolTip(tip)
             tb.addAction(act)
+        self._sync_tool_widgets()
 
     def _build_statusbar(self) -> None:
         sb = QStatusBar(self)
@@ -263,6 +288,8 @@ class MainWindow(QMainWindow):
                 if a is checked:
                     tab.set_tool(n)
                     break
+        self._push_recent(path)
+        self._sync_tool_widgets()
         self._refresh_status()
 
     # ----- view actions -----
@@ -293,7 +320,109 @@ class MainWindow(QMainWindow):
         t = self._current_pdf_tab()
         if t:
             t.set_tool(name)
-        self._lbl_tool.setText(name.capitalize())
+        self._lbl_tool.setText(name.replace("_", " ").capitalize())
+        self._sync_tool_widgets()
+
+    # ----- color / width pickers -----
+
+    def _sync_tool_widgets(self) -> None:
+        """Refresh the colour swatch and width spinbox to reflect the
+        active tool on the active PdfTab (or the toolbar default)."""
+        t = self._current_pdf_tab()
+        checked = self._tool_group.checkedAction()
+        tool_name = "select"
+        if checked is not None:
+            for n, a in self._tool_actions.items():
+                if a is checked:
+                    tool_name = n
+                    break
+        if t is not None:
+            color = t.tool_color(tool_name)
+            width = t.tool_width(tool_name)
+        else:
+            from .pdftab import TOOL_DEFAULTS
+            d = TOOL_DEFAULTS.get(tool_name, {"color": "#000000", "width": 2.0})
+            color, width = d["color"], d["width"]
+        self._color_btn.setIcon(self._make_color_icon(QColor(color)))
+        # Block signal to avoid feedback when programmatically setting.
+        self._width_spin.blockSignals(True)
+        self._width_spin.setValue(float(width))
+        self._width_spin.blockSignals(False)
+        self._color_btn.setProperty("current_color", color)
+
+    @staticmethod
+    def _make_color_icon(color: QColor, size: int = 20) -> QIcon:
+        pm = QPixmap(size, size)
+        pm.fill(Qt.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.setBrush(color)
+        p.setPen(QPen(QColor("#666"), 1))
+        p.drawRoundedRect(1, 1, size - 2, size - 2, 3, 3)
+        p.end()
+        return QIcon(pm)
+
+    def _pick_color(self) -> None:
+        current = self._color_btn.property("current_color") or "#000000"
+        chosen = QColorDialog.getColor(
+            QColor(current), self, "Choose stroke colour",
+        )
+        if not chosen.isValid():
+            return
+        hex_str = chosen.name()
+        t = self._current_pdf_tab()
+        if t is not None:
+            t.set_tool_color(hex_str)
+        self._color_btn.setIcon(self._make_color_icon(chosen))
+        self._color_btn.setProperty("current_color", hex_str)
+
+    def _set_width(self, w: float) -> None:
+        t = self._current_pdf_tab()
+        if t is not None:
+            t.set_tool_width(w)
+
+    # ----- recent files -----
+
+    def _settings(self) -> QSettings:
+        return QSettings("kherve", "KhervePDF")
+
+    def _recent_files(self) -> list[str]:
+        s = self._settings()
+        raw = s.value("recent_files", [])
+        if isinstance(raw, str):
+            return [raw] if raw else []
+        return [str(p) for p in (raw or [])]
+
+    def _push_recent(self, path: Path) -> None:
+        files = [p for p in self._recent_files() if p != str(path)]
+        files.insert(0, str(path))
+        files = files[:10]
+        self._settings().setValue("recent_files", files)
+        self._refresh_recent_menu()
+
+    def _refresh_recent_menu(self) -> None:
+        m = self._m_recent
+        m.clear()
+        files = self._recent_files()
+        if not files:
+            act = QAction("(empty)", self)
+            act.setEnabled(False)
+            m.addAction(act)
+            return
+        for p in files:
+            label = Path(p).name
+            act = QAction(label, self)
+            act.setToolTip(p)
+            act.triggered.connect(lambda _c=False, path=p: self.open_path(Path(path)))
+            m.addAction(act)
+        m.addSeparator()
+        clear = QAction("Clear list", self)
+        clear.triggered.connect(self._clear_recent)
+        m.addAction(clear)
+
+    def _clear_recent(self) -> None:
+        self._settings().setValue("recent_files", [])
+        self._refresh_recent_menu()
 
     def _new(self) -> None:
         self._noop()

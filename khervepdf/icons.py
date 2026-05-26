@@ -50,6 +50,7 @@ _GLYPHS: dict[str, str] = {
 
     # Tools
     "select":    "fa5s.mouse-pointer",
+    "edit_text": "fa5s.i-cursor",
     "pen":       "fa5s.pen",
     "highlight": "fa5s.highlighter",
     "text":      "fa5s.font",
@@ -112,6 +113,7 @@ _COLORS_LIGHT: dict[str, str] = {
 
     # Tools — semantically coloured: pen=blue, highlight=yellow, etc.
     "select":    "#37474f",
+    "edit_text": "#5d4037",
     "pen":       "#1976d2",
     "highlight": "#fbc02d",
     "text":      "#5d4037",
@@ -161,6 +163,7 @@ _COLORS_DARK: dict[str, str] = {
     "thumbs":    "#b0bec5",
 
     "select":    "#cfd8dc",
+    "edit_text": "#bcaaa4",
     "pen":       "#64b5f6",
     "highlight": "#ffe082",
     "text":      "#bcaaa4",

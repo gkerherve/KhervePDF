@@ -368,6 +368,11 @@ class PdfTab(QGraphicsView):
 
     def _open(self) -> None:
         self._doc = fitz.open(str(self.path))
+        # Pull any existing PDF annotations into our editable model so
+        # the eraser / Delete can act on them — without this, anything
+        # already saved into the PDF would render as pixels and be
+        # uneditable.
+        self._load_pdf_annots()
         self._render_all()
 
     def close_doc(self) -> None:
@@ -394,7 +399,12 @@ class PdfTab(QGraphicsView):
         y = 0.0
         max_w = 0.0
         for idx, page in enumerate(self._doc):
-            pix = page.get_pixmap(matrix=matrix, alpha=False)
+            # annots=False so PyMuPDF doesn't render the PDF
+            # annotations into the pixmap — we draw them ourselves
+            # from self._annots, otherwise saved annotations would
+            # appear twice and the eraser couldn't peel the bottom
+            # layer off the pixmap.
+            pix = page.get_pixmap(matrix=matrix, alpha=False, annots=False)
             img = QImage(
                 pix.samples, pix.width, pix.height, pix.stride,
                 QImage.Format_RGB888,
@@ -631,11 +641,12 @@ class PdfTab(QGraphicsView):
             doc.close()
             self._doc = None
             os.replace(str(tmp), str(target))
-            # Reopen from disk so subsequent edits see the baked PDF.
+            # Reopen from disk and re-load the now-baked annotations
+            # back into self._annots so the user can keep editing them
+            # (erase, move, etc.). Without this, anything just saved
+            # would become uneditable pixels.
             self._doc = fitz.open(str(target))
-            # The annots have been baked into the PDF — clear them so
-            # the next save doesn't double-write.
-            self._annots.clear()
+            self._load_pdf_annots()
             self._undo_stack.clear()
             self._redo_stack.clear()
         else:
@@ -650,6 +661,119 @@ class PdfTab(QGraphicsView):
         self._render_all()
         return target
 
+    # ----- load PDF annotations back into self._annots -----
+
+    def _load_pdf_annots(self) -> None:
+        """Replace self._annots with annotations recovered from the
+        open PDF. Called on open() and after save() so anything
+        already on the page can be erased / moved / re-coloured."""
+        self._annots.clear()
+        if self._doc is None:
+            return
+        for page_idx, page in enumerate(self._doc):
+            try:
+                annots = list(page.annots())
+            except Exception:
+                continue
+            for annot in annots:
+                a = self._pdf_annot_to_annotation(page_idx, annot)
+                if a is not None:
+                    self._annots.append(a)
+
+    @staticmethod
+    def _rgb01_to_hex(rgb) -> str:
+        try:
+            r = int(round(float(rgb[0]) * 255))
+            g = int(round(float(rgb[1]) * 255))
+            b = int(round(float(rgb[2]) * 255))
+            return f"#{r:02x}{g:02x}{b:02x}"
+        except Exception:
+            return "#000000"
+
+    def _pdf_annot_to_annotation(self, page_idx: int,
+                                 annot) -> Optional[Annotation]:
+        try:
+            a_type = annot.type[1]
+        except Exception:
+            return None
+        colors = annot.colors or {}
+        stroke = colors.get("stroke") or (0.0, 0.0, 0.0)
+        fill = colors.get("fill")
+        color_hex = self._rgb01_to_hex(stroke)
+        op_f = annot.opacity if annot.opacity is not None else 1.0
+        opacity = max(0, min(100, int(round(op_f * 100))))
+        border = annot.border or {}
+        width = float(border.get("width") or 1.0) or 1.0
+        rect = annot.rect
+
+        if a_type == "Ink":
+            # PyMuPDF returns annot.vertices for Ink as a list of
+            # strokes, each a list of (x, y) tuples. (Older releases
+            # exposed get_inklist() for the same data, but that API
+            # is gone in newer PyMuPDF.)
+            strokes = getattr(annot, "vertices", None) or []
+            if not strokes or not isinstance(strokes[0], (list, tuple)) \
+                    or not strokes[0]:
+                return None
+            pts = [(float(p[0]), float(p[1])) for p in strokes[0]]
+            return Annotation(type="pen", page_idx=page_idx,
+                              color=color_hex, width=width,
+                              opacity=opacity, pts=pts)
+        if a_type == "Highlight":
+            return Annotation(type="highlight", page_idx=page_idx,
+                              color=color_hex, width=0.0, opacity=opacity,
+                              pts=[(rect.x0, rect.y0), (rect.x1, rect.y1)])
+        if a_type == "Square":
+            return Annotation(type="rect", page_idx=page_idx,
+                              color=color_hex, width=width, opacity=opacity,
+                              pts=[(rect.x0, rect.y0), (rect.x1, rect.y1)],
+                              filled=fill is not None)
+        if a_type == "Circle":
+            return Annotation(type="ellipse", page_idx=page_idx,
+                              color=color_hex, width=width, opacity=opacity,
+                              pts=[(rect.x0, rect.y0), (rect.x1, rect.y1)],
+                              filled=fill is not None)
+        if a_type == "Line":
+            verts = getattr(annot, "vertices", None) or []
+            if len(verts) >= 2:
+                pts = [(float(verts[0][0]), float(verts[0][1])),
+                       (float(verts[1][0]), float(verts[1][1]))]
+            else:
+                pts = [(rect.x0, rect.y0), (rect.x1, rect.y1)]
+            is_arrow = False
+            try:
+                le = annot.line_ends
+                if le and isinstance(le, (tuple, list)) and len(le) >= 2:
+                    if le[1] in ("OpenArrow", "ClosedArrow", 5, 6):
+                        is_arrow = True
+            except Exception:
+                pass
+            return Annotation(
+                type="arrow" if is_arrow else "line",
+                page_idx=page_idx, color=color_hex,
+                width=width, opacity=opacity, pts=pts,
+            )
+        if a_type == "Text":
+            return Annotation(type="note", page_idx=page_idx,
+                              color="#fff59d", width=1.0, opacity=opacity,
+                              pts=[(rect.x0, rect.y0)],
+                              text=annot.info.get("content", "") if annot.info
+                              else "")
+        if a_type == "FreeText":
+            # Recover font size from the annotation's text properties
+            # when possible, otherwise fall back to 11pt.
+            fontsize = 11.0
+            try:
+                ai = annot.info
+                content = ai.get("content", "") if ai else ""
+            except Exception:
+                content = ""
+            return Annotation(type="text", page_idx=page_idx,
+                              color=color_hex, width=fontsize,
+                              opacity=opacity, pts=[(rect.x0, rect.y0)],
+                              text=content)
+        return None
+
     @staticmethod
     def _hex_to_rgb01(hex_str: str) -> tuple[float, float, float]:
         s = hex_str.lstrip("#")
@@ -659,8 +783,14 @@ class PdfTab(QGraphicsView):
 
     def _bake_into(self, doc: fitz.Document) -> None:
         """Translate every Annotation into a real PDF annotation on
-        the given document. Redactions are queued per page and applied
-        at the end so the page content stream is rewritten once."""
+        the given document. Pre-existing PDF annotations are deleted
+        first — self._annots already mirrors them (loaded via
+        _load_pdf_annots), so re-baking from scratch keeps the on-disk
+        state exactly aligned with the in-memory model and avoids
+        duplication across save cycles."""
+        for page in doc:
+            for annot in list(page.annots()):
+                page.delete_annot(annot)
         for a in self._annots:
             if a.page_idx >= doc.page_count:
                 continue
@@ -668,8 +798,12 @@ class PdfTab(QGraphicsView):
             rgb = self._hex_to_rgb01(a.color)
             op = max(0.0, min(1.0, a.opacity / 100.0))
             if a.type == "pen":
+                # PyMuPDF wants a sequence of strokes, each a sequence
+                # of (x, y) tuples — passing fitz.Point instances
+                # raises "arg must be seq of seq of float pairs" on
+                # newer versions.
                 annot = page.add_ink_annot([
-                    [fitz.Point(x, y) for x, y in a.pts]
+                    [(float(x), float(y)) for x, y in a.pts]
                 ])
                 annot.set_colors(stroke=rgb)
                 annot.set_border(width=max(0.5, a.width))
@@ -720,10 +854,28 @@ class PdfTab(QGraphicsView):
                         pass
                 annot.update()
             elif a.type == "text":
-                page.insert_text(
-                    (a.pts[0][0], a.pts[0][1] + max(4.0, a.width)),
-                    a.text, fontsize=max(4.0, a.width), color=rgb,
-                )
+                # Use a FreeText annotation rather than insert_text so
+                # the text is editable after save. Rect sized
+                # generously so the text fits at the chosen size.
+                fontsize = max(4.0, a.width)
+                lines = a.text.split("\n") if a.text else [""]
+                w = max(80.0, fontsize * 0.65
+                        * max(len(line) for line in lines))
+                h = max(fontsize * 1.4, fontsize * 1.3 * len(lines))
+                rect = fitz.Rect(a.pts[0][0], a.pts[0][1],
+                                 a.pts[0][0] + w, a.pts[0][1] + h)
+                try:
+                    annot = page.add_freetext_annot(
+                        rect, a.text, fontsize=fontsize, text_color=rgb,
+                    )
+                    annot.set_opacity(op)
+                    annot.update()
+                except Exception:
+                    # Fall back to insert_text on older PyMuPDF.
+                    page.insert_text(
+                        (a.pts[0][0], a.pts[0][1] + fontsize),
+                        a.text, fontsize=fontsize, color=rgb,
+                    )
             elif a.type == "note":
                 annot = page.add_text_annot(fitz.Point(*a.pts[0]), a.text)
                 try:

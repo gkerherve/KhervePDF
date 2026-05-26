@@ -28,8 +28,8 @@ import fitz
 from PySide6.QtCore import QPointF, QRectF, Qt
 from PySide6.QtGui import (
     QAction, QActionGroup, QBrush, QColor, QFont, QImage, QPainter,
-    QPainterPath, QPen, QPixmap, QTextCharFormat, QTextCursor,
-    QTextDocumentFragment,
+    QPainterPath, QPen, QPixmap, QTextBlockFormat, QTextCharFormat,
+    QTextCursor, QTextDocumentFragment,
 )
 from PySide6.QtWidgets import (
     QComboBox, QDialog, QDialogButtonBox, QGraphicsEllipseItem,
@@ -104,7 +104,7 @@ class _EditTextDialog(QDialog):
     """
 
     def __init__(self, parent, html_or_text: str, fontsize: float,
-                 is_html: bool = False) -> None:
+                 is_html: bool = False, align: str = "left") -> None:
         super().__init__(parent)
         self.setWindowTitle("Edit text")
         self.resize(720, 520)
@@ -152,7 +152,19 @@ class _EditTextDialog(QDialog):
             self._align_group.addAction(act)
             self._align_acts[name] = act
             tb.addAction(act)
-        self._align_acts["align_left"].setChecked(True)
+        # Pre-select the alignment passed in (defaults to left). The
+        # editor's QTextBlockFormat is updated after the content has
+        # been loaded below so it actually takes effect.
+        align_map = {
+            "left":    ("align_left",    Qt.AlignLeft),
+            "center":  ("align_center",  Qt.AlignHCenter),
+            "right":   ("align_right",   Qt.AlignRight),
+            "justify": ("align_justify", Qt.AlignJustify),
+        }
+        initial_act_name, self._initial_qt_align = align_map.get(
+            align, align_map["left"]
+        )
+        self._align_acts[initial_act_name].setChecked(True)
 
         # ----- Editor -----
         self._editor = QTextEdit(self)
@@ -176,6 +188,17 @@ class _EditTextDialog(QDialog):
             cur.clearSelection()
             self._editor.setTextCursor(cur)
         self._editor.setFontPointSize(float(max(4.0, fontsize)))
+        # Apply the detected/initial alignment to every block in the
+        # document so an originally-justified paragraph reopens as
+        # justified in the editor and round-trips through toHtml.
+        cur_align = self._editor.textCursor()
+        cur_align.select(QTextCursor.Document)
+        blk_fmt = QTextBlockFormat()
+        blk_fmt.setAlignment(self._initial_qt_align)
+        cur_align.mergeBlockFormat(blk_fmt)
+        cur_align.clearSelection()
+        self._editor.setTextCursor(cur_align)
+        self._editor.setAlignment(self._initial_qt_align)
         self._editor.currentCharFormatChanged.connect(self._sync_toolbar)
         self._editor.cursorPositionChanged.connect(self._sync_toolbar)
         layout.addWidget(self._editor, 1)
@@ -1415,14 +1438,23 @@ class PdfTab(QGraphicsView):
             page.apply_redactions()
             html_body = info.get("html") or html_mod.escape(info["text"])
             sz = max(4.0, info["size"])
-            wrapped = (f'<span style="font-size:{sz:.1f}pt;">'
-                       f'{html_body}</span>')
+            align = info.get("align", "left")
+            # text-align is on the wrapping <div> so justify / center
+            # / right preserved from the original block apply to the
+            # rewrapped lines at the new location.
+            wrapped = (f'<div style="text-align:{align};'
+                       f'font-size:{sz:.1f}pt;">'
+                       f'{html_body}</div>')
             try:
                 page.insert_htmlbox(new_rect, wrapped)
             except AttributeError:
+                fitz_align = {
+                    "left": 0, "center": 1, "right": 2, "justify": 3,
+                }.get(align, 0)
                 page.insert_textbox(new_rect, info["text"],
                                     fontsize=info["size"],
-                                    color=info["color"])
+                                    color=info["color"],
+                                    align=fitz_align)
             self._render_all()
             event.accept()
             return
@@ -1643,6 +1675,7 @@ class PdfTab(QGraphicsView):
             dlg = _EditTextDialog(
                 self, initial, info["size"],
                 is_html=("html" in info),
+                align=info.get("align", "left"),
             )
             if dlg.exec() != QDialog.Accepted:
                 return
@@ -1787,11 +1820,64 @@ class PdfTab(QGraphicsView):
             r = ((raw_color >> 16) & 0xff) / 255.0
             g = ((raw_color >> 8) & 0xff) / 255.0
             b = (raw_color & 0xff) / 255.0
+            align = self._detect_alignment(
+                block, float(first_span.get("size", 11.0))
+            )
             return {
                 "rect": (x0, y0, x1, y1),
                 "html": paragraph_html.rstrip(),
                 "text": paragraph_plain.rstrip(),
                 "size": float(first_span.get("size", 11.0)),
                 "color": (r, g, b),
+                "align": align,
             }
         return None
+
+    @staticmethod
+    def _detect_alignment(block, fontsize: float) -> str:
+        """Infer one of "left" / "center" / "right" / "justify" from
+        the per-line bboxes within a text block.
+
+        Heuristic — measure each line's gap to the block's left and
+        right edges:
+          * all gaps small on both sides → justify (last line excepted)
+          * only left gaps small → left
+          * only right gaps small → right
+          * left gap ≈ right gap on every line → center
+        Tolerance scales with font size so a 24pt heading isn't
+        held to the same px budget as 9pt body text.
+        """
+        bx0, _, bx1, _ = block["bbox"]
+        block_w = bx1 - bx0
+        if block_w <= 1.0:
+            return "left"
+        lines = [ln for ln in block.get("lines", []) if ln.get("spans")]
+        if not lines:
+            return "left"
+        tol = max(2.0, fontsize * 0.4)
+        left_gaps: list[float] = []
+        right_gaps: list[float] = []
+        for ln in lines:
+            lx0, _, lx1, _ = ln["bbox"]
+            left_gaps.append(lx0 - bx0)
+            right_gaps.append(bx1 - lx1)
+        # Justify: every line but optionally the last reaches both
+        # edges. Need at least two lines for "justify" to be meaningful.
+        if len(lines) >= 2:
+            filled = sum(
+                1 for lg, rg in zip(left_gaps, right_gaps)
+                if lg < tol and rg < tol
+            )
+            if filled >= len(lines) - 1:
+                return "justify"
+        left_flush = all(lg < tol for lg in left_gaps)
+        right_flush = all(rg < tol for rg in right_gaps)
+        if left_flush and right_flush:
+            return "justify"
+        if left_flush:
+            return "left"
+        if right_flush:
+            return "right"
+        if all(abs(lg - rg) < tol for lg, rg in zip(left_gaps, right_gaps)):
+            return "center"
+        return "left"

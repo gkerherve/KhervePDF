@@ -1735,7 +1735,6 @@ class PdfTab(QGraphicsView):
     def keyPressEvent(self, event):  # noqa: N802
         if event.key() in (Qt.Key_Delete, Qt.Key_Backspace) and self._selected:
             self._push_undo()
-            # Sort descending so indices remain valid as we pop.
             for i in sorted(self._selected, reverse=True):
                 if 0 <= i < len(self._annots):
                     del self._annots[i]
@@ -1748,7 +1747,33 @@ class PdfTab(QGraphicsView):
             self._render_all()
             event.accept()
             return
+        # Ctrl + (or =) zooms in; Ctrl - zooms out; Ctrl 0 fits width.
+        if event.modifiers() & Qt.ControlModifier:
+            if event.key() in (Qt.Key_Plus, Qt.Key_Equal):
+                self.zoom_in()
+                event.accept()
+                return
+            if event.key() == Qt.Key_Minus:
+                self.zoom_out()
+                event.accept()
+                return
+            if event.key() == Qt.Key_0:
+                self.fit_width()
+                event.accept()
+                return
         super().keyPressEvent(event)
+
+    def wheelEvent(self, event):  # noqa: N802
+        # Ctrl + wheel zooms; without Ctrl, the default scroll
+        # behaviour pans the document.
+        if event.modifiers() & Qt.ControlModifier:
+            if event.angleDelta().y() > 0:
+                self.zoom_in()
+            else:
+                self.zoom_out()
+            event.accept()
+            return
+        super().wheelEvent(event)
 
     # ----- highlight: snap to words -----
 

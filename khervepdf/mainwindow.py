@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Optional
 
 from PySide6.QtCore import QSettings, Qt
-from PySide6.QtGui import QAction, QActionGroup, QColor
+from PySide6.QtGui import QAction, QActionGroup, QColor, QKeySequence
 from PySide6.QtWidgets import (
     QApplication, QButtonGroup, QCheckBox, QColorDialog, QDockWidget,
     QDoubleSpinBox, QFileDialog, QGridLayout, QHBoxLayout, QLabel,
@@ -420,12 +420,21 @@ class MainWindow(QMainWindow):
                                  triggered=self._noop))
 
         m_view = mb.addMenu("&View")
-        m_view.addAction(QAction(icon("zoom_in"), "Zoom &In", self,
-                                 shortcut="Ctrl++", triggered=self._zoom_in))
-        m_view.addAction(QAction(icon("zoom_out"), "Zoom &Out", self,
-                                 shortcut="Ctrl+-", triggered=self._zoom_out))
-        m_view.addAction(QAction(icon("fit_width"), "Fit &Width", self,
-                                 triggered=self._fit_width))
+        # Zoom shortcuts mirror the browser convention: Ctrl++ /
+        # Ctrl+= for zoom in (= is the unshifted key on most US
+        # keyboards), Ctrl+- for zoom out, Ctrl+0 for fit to width.
+        zoom_in_act = QAction(icon("zoom_in"), "Zoom &In", self)
+        zoom_in_act.setShortcuts([QKeySequence("Ctrl++"),
+                                  QKeySequence("Ctrl+=")])
+        zoom_in_act.triggered.connect(self._zoom_in)
+        m_view.addAction(zoom_in_act)
+        zoom_out_act = QAction(icon("zoom_out"), "Zoom &Out", self,
+                               shortcut="Ctrl+-", triggered=self._zoom_out)
+        m_view.addAction(zoom_out_act)
+        fit_width_act = QAction(icon("fit_width"), "Fit &Width", self,
+                                shortcut="Ctrl+0",
+                                triggered=self._fit_width)
+        m_view.addAction(fit_width_act)
         m_view.addAction(QAction(icon("fit_page"), "Fit &Page", self,
                                  triggered=self._noop))
         m_view.addSeparator()

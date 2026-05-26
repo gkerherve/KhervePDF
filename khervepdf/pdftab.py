@@ -50,6 +50,7 @@ PAGE_GAP = 12  # px between stacked pages in the scene
 # stroke opacity in percent (0-100). Highlight is translucent by
 # default so it reads as a marker.
 TOOL_DEFAULTS = {
+    "hand":      {"color": "#000000", "width": 1.0,  "opacity": 100},
     "pen":       {"color": "#1976d2", "width": 2.0,  "opacity": 100},
     "highlight": {"color": "#fbc02d", "width": 14.0, "opacity": 35},
     "rect":      {"color": "#388e3c", "width": 2.0,  "opacity": 100},
@@ -309,6 +310,12 @@ class PdfTab(QGraphicsView):
         self._tool_settings = {k: dict(v) for k, v in TOOL_DEFAULTS.items()}
         # Live storage of all annotations on this document.
         self._annots: list[Annotation] = []
+        # Selection (used by the Select tool — Delete removes selected
+        # annotations). Indices into self._annots.
+        self._selected: set[int] = set()
+        # Erase-drag flag: True between mouse-press and -release on the
+        # eraser so mouseMoveEvent keeps deleting under the cursor.
+        self._erasing = False
         # Undo/redo: each entry is a state snapshot. Annotation-only
         # actions snapshot just the annot list (cheap); actions that
         # mutate the underlying PDF (edit_text) also snapshot doc bytes.
@@ -332,6 +339,9 @@ class PdfTab(QGraphicsView):
         )
         self.setAlignment(Qt.AlignTop | Qt.AlignHCenter)
         self.setBackgroundBrush(Qt.gray)
+        # The view needs keyboard focus to receive Delete key presses
+        # from the Select tool.
+        self.setFocusPolicy(Qt.StrongFocus)
         self._apply_drag_mode()
 
         self._open()
@@ -396,8 +406,8 @@ class PdfTab(QGraphicsView):
         self._replay_annots()
 
     def _replay_annots(self) -> None:
-        for a in self._annots:
-            self._draw_annot(a)
+        for i, a in enumerate(self._annots):
+            self._draw_annot(a, idx=i)
 
     # ----- coord conversion -----
 
@@ -452,12 +462,15 @@ class PdfTab(QGraphicsView):
             if a.page_idx != page_idx or not a.pts:
                 continue
             if a.type in ("rect", "ellipse", "highlight"):
+                # Highlights are tight per-word — without a generous
+                # pad the eraser misses gaps between glyphs.
+                pad = max(tol_pt, 10.0) if a.type == "highlight" else tol_pt
                 x0, y0 = a.pts[0]
                 x1, y1 = a.pts[1]
                 xmin, xmax = min(x0, x1), max(x0, x1)
                 ymin, ymax = min(y0, y1), max(y0, y1)
-                if (xmin - tol_pt <= x_pt <= xmax + tol_pt
-                        and ymin - tol_pt <= y_pt <= ymax + tol_pt):
+                if (xmin - pad <= x_pt <= xmax + pad
+                        and ymin - pad <= y_pt <= ymax + pad):
                     return i
             elif a.type in ("line", "arrow"):
                 if self._dist_to_segment(a.pts[0], a.pts[1],
@@ -755,9 +768,13 @@ class PdfTab(QGraphicsView):
             max(0, min(100, int(op)))
 
     def _apply_drag_mode(self) -> None:
-        if self._tool == "select":
+        # Hand = pan; Select = click annotations; everything else = draw.
+        if self._tool == "hand":
             self.setDragMode(QGraphicsView.ScrollHandDrag)
             self.viewport().setCursor(Qt.OpenHandCursor)
+        elif self._tool == "select":
+            self.setDragMode(QGraphicsView.NoDrag)
+            self.viewport().setCursor(Qt.ArrowCursor)
         else:
             self.setDragMode(QGraphicsView.NoDrag)
             cursor = Qt.IBeamCursor if self._tool in ("text", "edit_text") \
@@ -771,7 +788,7 @@ class PdfTab(QGraphicsView):
         c.setAlpha(alpha)
         return c
 
-    def _draw_annot(self, a: Annotation) -> None:
+    def _draw_annot(self, a: Annotation, idx: Optional[int] = None) -> None:
         if a.page_idx not in self._page_layout:
             return
         scale = self._page_layout[a.page_idx]["scale"]
@@ -846,6 +863,55 @@ class PdfTab(QGraphicsView):
             item.setDefaultTextColor(color)
             item.setPos(anchor)
             self._scene.addItem(item)
+        # If this annotation is selected by the Select tool, overlay a
+        # dashed marquee so the user knows what Delete will remove.
+        if idx is not None and idx in self._selected:
+            self._draw_selection_box(a)
+
+    def _annot_scene_bbox(self, a: Annotation) -> Optional[QRectF]:
+        """Bounding rect (scene coords) of an annotation, used for the
+        selection marquee overlay."""
+        if a.page_idx not in self._page_layout:
+            return None
+        if a.type in ("rect", "ellipse", "highlight"):
+            return self._rect_from_pts(a)
+        if a.type in ("line", "arrow"):
+            p0 = self._page_to_scene(a.page_idx, *a.pts[0])
+            p1 = self._page_to_scene(a.page_idx, *a.pts[1])
+            return QRectF(p0, p1).normalized()
+        if a.type == "pen":
+            if not a.pts:
+                return None
+            pts = [self._page_to_scene(a.page_idx, x, y) for x, y in a.pts]
+            xs = [p.x() for p in pts]
+            ys = [p.y() for p in pts]
+            return QRectF(min(xs), min(ys),
+                          max(xs) - min(xs), max(ys) - min(ys))
+        if a.type == "text":
+            anchor = self._page_to_scene(a.page_idx, *a.pts[0])
+            scale = self._page_layout[a.page_idx]["scale"]
+            lines = a.text.split("\n") if a.text else [""]
+            h = max(1, len(lines)) * a.width * 1.3
+            w = (max(len(line) for line in lines) if a.text else 0) \
+                * a.width * 0.55
+            return QRectF(anchor.x(), anchor.y(), w * scale, h * scale)
+        if a.type == "note":
+            anchor = self._page_to_scene(a.page_idx, *a.pts[0])
+            return QRectF(anchor.x(), anchor.y(), 22, 18)
+        return None
+
+    def _draw_selection_box(self, a: Annotation) -> None:
+        bbox = self._annot_scene_bbox(a)
+        if bbox is None:
+            return
+        bbox = bbox.adjusted(-3, -3, 3, 3)
+        item = QGraphicsRectItem(bbox)
+        pen = QPen(QColor("#1976d2"), 1.5, Qt.DashLine)
+        pen.setCosmetic(True)
+        item.setPen(pen)
+        item.setBrush(QBrush(Qt.NoBrush))
+        item.setZValue(100)
+        self._scene.addItem(item)
 
     def _rect_from_pts(self, a: Annotation) -> QRectF:
         p0 = self._page_to_scene(a.page_idx, *a.pts[0])
@@ -882,13 +948,29 @@ class PdfTab(QGraphicsView):
                     self._edit_note(note_idx)
                     event.accept()
                     return
-        if self._tool == "select" or event.button() != Qt.LeftButton:
+        if self._tool == "hand" or event.button() != Qt.LeftButton:
             return super().mousePressEvent(event)
         scene_pt = self.mapToScene(event.position().toPoint())
         mapped = self._scene_to_page(scene_pt)
         if mapped is None:
+            # Click in the gap between pages — clear selection if any.
+            if self._tool == "select" and self._selected:
+                self._selected.clear()
+                self._render_all()
             return super().mousePressEvent(event)
         page_idx, px, py = mapped
+        if self._tool == "select":
+            # Select the topmost annotation at the click, or clear if
+            # the click landed on bare page. Delete key removes the
+            # current selection. (Multi-select / marquee can come later.)
+            idx = self._find_annot_at(page_idx, px, py)
+            if idx is not None:
+                self._selected = {idx}
+            else:
+                self._selected.clear()
+            self._render_all()
+            event.accept()
+            return
         self._drag_start = scene_pt
         self._drag_page = page_idx
         color_hex = self.tool_color()
@@ -927,12 +1009,13 @@ class PdfTab(QGraphicsView):
             self._scene.addItem(item)
             self._preview_item = item
         elif self._tool == "erase":
-            # Eraser: click on the topmost annotation under the cursor
-            # and remove it (with undo). Doesn't create a preview item
-            # — the gesture finishes on press.
+            # Eraser: click + drag. One undo entry covers the whole
+            # gesture; mouseMoveEvent keeps deleting while _erasing.
+            self._push_undo()
+            self._erasing = True
+            self._selected.clear()
             idx = self._find_annot_at(page_idx, px, py)
             if idx is not None:
-                self._push_undo()
                 del self._annots[idx]
                 self._render_all()
             self._drag_start = None
@@ -973,6 +1056,17 @@ class PdfTab(QGraphicsView):
         event.accept()
 
     def mouseMoveEvent(self, event):  # noqa: N802
+        if self._tool == "erase" and self._erasing:
+            scene_pt = self.mapToScene(event.position().toPoint())
+            mapped = self._scene_to_page(scene_pt)
+            if mapped is not None:
+                page_idx, px, py = mapped
+                idx = self._find_annot_at(page_idx, px, py)
+                if idx is not None:
+                    del self._annots[idx]
+                    self._render_all()
+            event.accept()
+            return
         if self._preview_item is None:
             return super().mouseMoveEvent(event)
         scene_pt = self.mapToScene(event.position().toPoint())
@@ -994,6 +1088,10 @@ class PdfTab(QGraphicsView):
         event.accept()
 
     def mouseReleaseEvent(self, event):  # noqa: N802
+        if self._tool == "erase" and self._erasing:
+            self._erasing = False
+            event.accept()
+            return
         if self._preview_item is None or self._drag_page is None:
             return super().mouseReleaseEvent(event)
         scene_end = self.mapToScene(event.position().toPoint())
@@ -1057,9 +1155,29 @@ class PdfTab(QGraphicsView):
         # meaningful.
         if len(self._annots) == n_before and self._undo_stack:
             self._undo_stack.pop()
-        for a in self._annots[n_before:]:
-            self._draw_annot(a)
+        for i, a in enumerate(self._annots[n_before:], start=n_before):
+            self._draw_annot(a, idx=i)
         event.accept()
+
+    # ----- keyboard: Delete clears selected annotations -----
+
+    def keyPressEvent(self, event):  # noqa: N802
+        if event.key() in (Qt.Key_Delete, Qt.Key_Backspace) and self._selected:
+            self._push_undo()
+            # Sort descending so indices remain valid as we pop.
+            for i in sorted(self._selected, reverse=True):
+                if 0 <= i < len(self._annots):
+                    del self._annots[i]
+            self._selected.clear()
+            self._render_all()
+            event.accept()
+            return
+        if event.key() == Qt.Key_Escape and self._selected:
+            self._selected.clear()
+            self._render_all()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     # ----- highlight: snap to words -----
 
@@ -1194,8 +1312,14 @@ class PdfTab(QGraphicsView):
                                   x_pt: float, y_pt: float):
         """Locate the text block at (x_pt, y_pt) and pull the first
         span's font size and colour so the replacement matches roughly.
-        get_text("blocks") only returns the bbox+text — we need the
-        richer dict form to recover font metrics."""
+
+        PDF dict "lines" within a block represent visual wraps, not
+        paragraph breaks. We stitch them back into one paragraph: lines
+        ending in a hyphen followed by a lowercase letter on the next
+        line are dehyphenated; other line breaks become spaces. Without
+        this the editor would show one hard newline per PDF line,
+        which is what produced the long ladder of returns the user saw.
+        """
         d = page.get_text("dict")
         for block in d.get("blocks", []):
             if block.get("type") != 0:
@@ -1203,7 +1327,7 @@ class PdfTab(QGraphicsView):
             x0, y0, x1, y1 = block["bbox"]
             if not (x0 <= x_pt <= x1 and y0 <= y_pt <= y1):
                 continue
-            lines_text: list[str] = []
+            paragraph = ""
             first_span = None
             for line in block.get("lines", []):
                 spans = line.get("spans", [])
@@ -1211,8 +1335,17 @@ class PdfTab(QGraphicsView):
                     continue
                 if first_span is None:
                     first_span = spans[0]
-                lines_text.append("".join(s.get("text", "") for s in spans))
-            if first_span is None or not lines_text:
+                line_text = "".join(s.get("text", "") for s in spans).rstrip()
+                if not line_text:
+                    continue
+                if not paragraph:
+                    paragraph = line_text
+                elif (paragraph.endswith("-") and line_text
+                      and line_text[0].islower()):
+                    paragraph = paragraph[:-1] + line_text
+                else:
+                    paragraph = paragraph + " " + line_text
+            if first_span is None or not paragraph:
                 continue
             raw_color = int(first_span.get("color", 0))
             r = ((raw_color >> 16) & 0xff) / 255.0
@@ -1220,7 +1353,7 @@ class PdfTab(QGraphicsView):
             b = (raw_color & 0xff) / 255.0
             return {
                 "rect": (x0, y0, x1, y1),
-                "text": "\n".join(lines_text).rstrip(),
+                "text": paragraph.rstrip(),
                 "size": float(first_span.get("size", 11.0)),
                 "color": (r, g, b),
             }

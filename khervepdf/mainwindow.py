@@ -235,7 +235,7 @@ class MainWindow(QMainWindow):
         self._tabs.currentChanged.connect(lambda _i: self._refresh_status())
         self.setCentralWidget(self._tabs)
 
-        self._current_tool = "select"
+        self._current_tool = "hand"
         self._build_menus()
         self._build_toolbar()
         self._build_statusbar()
@@ -364,7 +364,8 @@ class MainWindow(QMainWindow):
         OPTIONS_TOOLS = {"pen", "highlight", "line", "arrow", "rect",
                          "ellipse", "text", "edit_text"}
         tools = [
-            ("select",    "Select / Pan"),
+            ("hand",      "Hand — pan the document"),
+            ("select",    "Select — click an annotation; Delete removes it"),
             ("pen",       "Pen"),
             ("highlight", "Highlight"),
             ("text",      "Text (add new)"),
@@ -394,7 +395,7 @@ class MainWindow(QMainWindow):
             self._tool_group.addButton(btn)
             self._tool_buttons[name] = btn
             tb.addWidget(btn)
-        self._tool_buttons["select"].setChecked(True)
+        self._tool_buttons["hand"].setChecked(True)
 
         tb.addSeparator()
         for name, tip, handler in (

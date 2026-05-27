@@ -835,6 +835,10 @@ class PdfTab(QGraphicsView):
         # intersects the marquee becomes selected.
         self._marquee_start: Optional[QPointF] = None
         self._marquee_item: Optional[QGraphicsRectItem] = None
+        # Move-annotation drag state: when the user clicks on an
+        # already-selected annotation and drags, all selected
+        # annotations move together.
+        self._move_annot_state: Optional[dict] = None
         # Move-text drag state: the dict carries the block info, the
         # original press point, and the ghost rect rendered while the
         # user is dragging the paragraph.
@@ -1894,16 +1898,40 @@ class PdfTab(QGraphicsView):
             ctrl = bool(event.modifiers() & Qt.ControlModifier)
             idx = self._find_annot_at(page_idx, px, py)
             if idx is not None:
-                # Click on annotation: single-select, or Ctrl-click to
-                # toggle into the existing selection.
-                if ctrl:
+                if idx in self._selected and not ctrl:
+                    # Clicking on an already-selected annotation starts
+                    # a move drag.  Build ghost previews for every
+                    # selected annotation so the user sees where the
+                    # group will land.
+                    previews = []
+                    for si in self._selected:
+                        bbox = self._annot_scene_bbox(self._annots[si])
+                        if bbox is None:
+                            continue
+                        ghost = QGraphicsRectItem(bbox)
+                        pen = QPen(QColor("#1976d2"), 1.5, Qt.DashLine)
+                        pen.setCosmetic(True)
+                        ghost.setPen(pen)
+                        fill = QColor("#1976d2")
+                        fill.setAlpha(30)
+                        ghost.setBrush(QBrush(fill))
+                        ghost.setZValue(200)
+                        self._scene.addItem(ghost)
+                        previews.append((si, bbox, ghost))
+                    self._move_annot_state = {
+                        "start_scene": scene_pt,
+                        "previews": previews,
+                    }
+                elif ctrl:
+                    # Ctrl-click to toggle into the existing selection.
                     if idx in self._selected:
                         self._selected.discard(idx)
                     else:
                         self._selected.add(idx)
+                    self._render_all()
                 else:
                     self._selected = {idx}
-                self._render_all()
+                    self._render_all()
             else:
                 # Empty space: begin a marquee. mouseReleaseEvent
                 # decides whether the gesture was a click (clear
@@ -2083,6 +2111,13 @@ class PdfTab(QGraphicsView):
             )
             event.accept()
             return
+        if self._tool == "select" and self._move_annot_state is not None:
+            scene_pt = self.mapToScene(event.position().toPoint())
+            delta = scene_pt - self._move_annot_state["start_scene"]
+            for _si, orig_bbox, ghost in self._move_annot_state["previews"]:
+                ghost.setRect(orig_bbox.translated(delta.x(), delta.y()))
+            event.accept()
+            return
         if self._tool == "select" and self._marquee_item is not None:
             scene_pt = self.mapToScene(event.position().toPoint())
             self._marquee_item.setRect(
@@ -2186,6 +2221,30 @@ class PdfTab(QGraphicsView):
                                     fontsize=info["size"],
                                     color=info["color"],
                                     align=fitz_align)
+            self._render_all()
+            event.accept()
+            return
+        if self._tool == "select" and self._move_annot_state is not None:
+            state = self._move_annot_state
+            self._move_annot_state = None
+            for _si, _bbox, ghost in state["previews"]:
+                self._scene.removeItem(ghost)
+            scene_pt = self.mapToScene(event.position().toPoint())
+            dx_scene = scene_pt.x() - state["start_scene"].x()
+            dy_scene = scene_pt.y() - state["start_scene"].y()
+            # Ignore sub-pixel drags (stray click, not a real move).
+            if abs(dx_scene) < 2.0 and abs(dy_scene) < 2.0:
+                event.accept()
+                return
+            self._push_undo()
+            for si in sorted(self._selected):
+                a = self._annots[si]
+                if a.page_idx not in self._page_layout:
+                    continue
+                scale = self._page_layout[a.page_idx]["scale"]
+                dx_pt = dx_scene / scale
+                dy_pt = dy_scene / scale
+                a.pts = [(x + dx_pt, y + dy_pt) for x, y in a.pts]
             self._render_all()
             event.accept()
             return

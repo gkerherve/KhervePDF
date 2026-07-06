@@ -24,53 +24,8 @@ _FILL = "#c62828"
 _EDGE = "#a81f1f"
 _INK = "#ffffff"
 
-# The word is "Kpdf" (capital K, lowercase pdf), so glyphs share an
-# em-box with a common baseline: p has a descender, d and f ascenders.
-# Every glyph is drawn in a unit box (x, y in 0..1, y downward) using
-# these lines so they align.
-_CAP = 0.06     # cap / ascender top
-_BASE = 0.80    # baseline
-_DESC = 0.98    # descender bottom
-_XT = 0.33      # x-height top
-
-
-def _glyph_K():
-    w = 0.82
-    mid = (_CAP + _BASE) / 2 - 0.02
-    p = QPainterPath()
-    p.moveTo(0.0, _CAP); p.lineTo(0.0, _BASE)             # stem
-    p.moveTo(0.0, mid); p.lineTo(w, _CAP)                 # upper arm
-    p.moveTo(0.0, mid); p.lineTo(w, _BASE)                # lower arm
-    return p, w
-
-
-def _glyph_p():
-    w = 0.66
-    p = QPainterPath()
-    p.moveTo(0.0, _XT); p.lineTo(0.0, _DESC)              # stem + descender
-    p.moveTo(0.0, _XT)                                    # bowl
-    p.cubicTo(w * 1.30, _XT, w * 1.30, _BASE, 0.0, _BASE)
-    return p, w
-
-
-def _glyph_d():
-    w = 0.66
-    p = QPainterPath()
-    p.moveTo(w, _CAP); p.lineTo(w, _BASE)                 # ascender stem
-    p.moveTo(w, _XT)                                      # bowl
-    p.cubicTo(-w * 0.30, _XT, -w * 0.30, _BASE, w, _BASE)
-    return p, w
-
-
-def _glyph_f():
-    w = 0.52
-    sx = w * 0.46
-    p = QPainterPath()
-    p.moveTo(w * 0.92, _CAP)                              # top hook
-    p.cubicTo(w * 0.48, _CAP - 0.06, sx, _CAP - 0.02, sx, _CAP + 0.14)
-    p.lineTo(sx, _BASE)                                   # stem
-    p.moveTo(0.0, _XT); p.lineTo(w * 0.90, _XT)           # crossbar
-    return p, w
+# The page-with-magnifier schematic is a stroked vector path (font-
+# independent); the "Kpdf" wordmark itself uses a normal system font.
 
 
 def _stroke(p, path, color, box, weight):
@@ -101,17 +56,24 @@ def _tile(p, s):
     return rect
 
 
-def _wordmark(p, rect):
-    items = [_glyph_K(), _glyph_p(), _glyph_d(), _glyph_f()]
-    gap = 0.10
-    total = sum(w for _p, w in items) + gap * (len(items) - 1)
-    pad_x, pad_y = rect.width() * 0.10, rect.height() * 0.14
-    ch = min(rect.height() - 2 * pad_y, (rect.width() - 2 * pad_x) / total)
-    x = rect.x() + (rect.width() - total * ch) / 2.0
-    top = rect.y() + (rect.height() - ch) / 2.0
-    for path, gw in items:
-        _stroke(p, path, _INK, QRectF(x, top, gw * ch, ch), 0.15)
-        x += (gw + gap) * ch
+def _wordmark(p, rect, text):
+    """Draw *text* centred in *rect* with a normal bold system font,
+    scaled up to the largest size that still fits the tile width."""
+    from PySide6.QtGui import QFont, QFontMetricsF
+    avail = rect.width() * 0.82
+    font = QFont("Segoe UI")
+    font.setBold(True)
+    size = 1.0
+    while size < rect.height():
+        font.setPointSizeF(size + 0.5)
+        fm = QFontMetricsF(font)
+        if fm.horizontalAdvance(text) > avail or fm.height() > rect.height():
+            break
+        size += 0.5
+    font.setPointSizeF(size)
+    p.setFont(font)
+    p.setPen(QColor(_INK))
+    p.drawText(rect, Qt.AlignCenter, text)
 
 
 def _page_magnifier(p, box):
@@ -130,7 +92,7 @@ def _page_magnifier(p, box):
 
 
 def paint(size: int) -> QPixmap:
-    """Render the KPDF mark at *size* px."""
+    """Render the Kpdf mark at *size* px."""
     pm = QPixmap(size, size)
     pm.fill(Qt.transparent)
     p = QPainter(pm)
@@ -138,7 +100,7 @@ def paint(size: int) -> QPixmap:
     s = float(size)
     rect = _tile(p, s)
     x, y, w, h = rect.x(), rect.y(), rect.width(), rect.height()
-    _wordmark(p, QRectF(x, y + h * 0.05, w, h * 0.44))
+    _wordmark(p, QRectF(x, y + h * 0.05, w, h * 0.44), "Kpdf")
     bw, bh = w * 0.46, h * 0.38
     _page_magnifier(p, QRectF(x + (w - bw) / 2.0, y + h * 0.54, bw, bh))
     p.end()

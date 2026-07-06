@@ -255,35 +255,15 @@ def icon(name: str, color: QColor | str | None = None) -> QIcon:
 
 
 def app_icon() -> QIcon:
-    """White 'KP' monogram on a rounded red square.
+    """The KhervePDF mark: a white 'KPDF' wordmark above a page-with-
+    magnifier symbol on a rounded red tile.
 
-    Generated at several sizes so the taskbar, title bar and Alt-Tab
-    each get a sharp copy — matches the KherveTeX/KherveSheet
-    convention of not shipping any .ico/.png in the repo.
+    Drawn at several sizes as stroked vector paths in ``appmark`` (the
+    shared Kherve-family icon style) so the taskbar, title bar and
+    Alt-Tab each get a sharp, font-independent copy.
     """
+    from . import appmark
     ic = QIcon()
     for sz in (16, 24, 32, 48, 64, 128, 256):
-        pm = QPixmap(sz, sz)
-        pm.fill(Qt.transparent)
-        p = QPainter(pm)
-        p.setRenderHint(QPainter.Antialiasing, True)
-        p.setRenderHint(QPainter.TextAntialiasing, True)
-        radius = sz * 0.18
-        p.setPen(Qt.NoPen)
-        p.setBrush(QColor("#c62828"))  # red, matches the Eraser accent
-        p.drawRoundedRect(QRectF(0, 0, sz, sz), radius, radius)
-        # Match the KherveTeX "KT" recipe so the suite reads as a
-        # set: Georgia bold at pixelSize == sz * 0.52, white-on-tint.
-        # The earlier tofu-rectangles bug from offscreen Qt is
-        # solved at the build-script level — generate_icon.py no
-        # longer forces QT_QPA_PLATFORM=offscreen.
-        f = QFont("Georgia")
-        f.setStyleHint(QFont.Serif)
-        f.setPixelSize(int(sz * 0.52))
-        f.setBold(True)
-        p.setFont(f)
-        p.setPen(QColor("#ffffff"))
-        p.drawText(QRectF(0, 0, sz, sz), Qt.AlignCenter, "KP")
-        p.end()
-        ic.addPixmap(pm)
+        ic.addPixmap(appmark.paint(sz))
     return ic

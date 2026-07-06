@@ -6,7 +6,7 @@
 # (at your option) any later version.
 """The KhervePDF application mark (window / taskbar icon).
 
-Draws a "KPDF" wordmark above a page-with-magnifier symbol on a rounded
+Draws a "Kpdf" wordmark above a page-with-magnifier symbol on a rounded
 red tile, in the shared Kherve-family style (cf. KherveBook / KhervePaint
 / KherveSheet): the letters are stroked vector paths — not text — so the
 mark renders identically everywhere and stays crisp from 16 px to 256 px,
@@ -24,43 +24,52 @@ _FILL = "#c62828"
 _EDGE = "#a81f1f"
 _INK = "#ffffff"
 
-# Each glyph is built in a unit box (x, y in 0..1, y downward); caps fill
-# the box height. "KPDF" is all capitals (PDF is an initialism).
+# The word is "Kpdf" (capital K, lowercase pdf), so glyphs share an
+# em-box with a common baseline: p has a descender, d and f ascenders.
+# Every glyph is drawn in a unit box (x, y in 0..1, y downward) using
+# these lines so they align.
+_CAP = 0.06     # cap / ascender top
+_BASE = 0.80    # baseline
+_DESC = 0.98    # descender bottom
+_XT = 0.33      # x-height top
 
 
 def _glyph_K():
     w = 0.82
+    mid = (_CAP + _BASE) / 2 - 0.02
     p = QPainterPath()
-    p.moveTo(0.0, 0.0); p.lineTo(0.0, 1.0)
-    p.moveTo(0.0, 0.52); p.lineTo(w, 0.0)
-    p.moveTo(0.0, 0.52); p.lineTo(w, 1.0)
+    p.moveTo(0.0, _CAP); p.lineTo(0.0, _BASE)             # stem
+    p.moveTo(0.0, mid); p.lineTo(w, _CAP)                 # upper arm
+    p.moveTo(0.0, mid); p.lineTo(w, _BASE)                # lower arm
     return p, w
 
 
-def _glyph_P():
-    w = 0.70
+def _glyph_p():
+    w = 0.66
     p = QPainterPath()
-    p.moveTo(0.0, 0.0); p.lineTo(0.0, 1.0)
-    p.moveTo(0.0, 0.0)
-    p.cubicTo(w * 1.25, 0.02, w * 1.25, 0.52, 0.0, 0.54)
+    p.moveTo(0.0, _XT); p.lineTo(0.0, _DESC)              # stem + descender
+    p.moveTo(0.0, _XT)                                    # bowl
+    p.cubicTo(w * 1.30, _XT, w * 1.30, _BASE, 0.0, _BASE)
     return p, w
 
 
-def _glyph_D():
-    w = 0.72
+def _glyph_d():
+    w = 0.66
     p = QPainterPath()
-    p.moveTo(0.0, 0.0); p.lineTo(0.0, 1.0)
-    p.moveTo(0.0, 0.0)
-    p.cubicTo(w * 1.35, 0.05, w * 1.35, 0.95, 0.0, 1.0)
+    p.moveTo(w, _CAP); p.lineTo(w, _BASE)                 # ascender stem
+    p.moveTo(w, _XT)                                      # bowl
+    p.cubicTo(-w * 0.30, _XT, -w * 0.30, _BASE, w, _BASE)
     return p, w
 
 
-def _glyph_F():
-    w = 0.62
+def _glyph_f():
+    w = 0.52
+    sx = w * 0.46
     p = QPainterPath()
-    p.moveTo(0.0, 0.0); p.lineTo(0.0, 1.0)
-    p.moveTo(0.0, 0.0); p.lineTo(w, 0.0)
-    p.moveTo(0.0, 0.47); p.lineTo(w * 0.82, 0.47)
+    p.moveTo(w * 0.92, _CAP)                              # top hook
+    p.cubicTo(w * 0.48, _CAP - 0.06, sx, _CAP - 0.02, sx, _CAP + 0.14)
+    p.lineTo(sx, _BASE)                                   # stem
+    p.moveTo(0.0, _XT); p.lineTo(w * 0.90, _XT)           # crossbar
     return p, w
 
 
@@ -93,10 +102,10 @@ def _tile(p, s):
 
 
 def _wordmark(p, rect):
-    items = [_glyph_K(), _glyph_P(), _glyph_D(), _glyph_F()]
+    items = [_glyph_K(), _glyph_p(), _glyph_d(), _glyph_f()]
     gap = 0.10
     total = sum(w for _p, w in items) + gap * (len(items) - 1)
-    pad_x, pad_y = rect.width() * 0.11, rect.height() * 0.22
+    pad_x, pad_y = rect.width() * 0.10, rect.height() * 0.14
     ch = min(rect.height() - 2 * pad_y, (rect.width() - 2 * pad_x) / total)
     x = rect.x() + (rect.width() - total * ch) / 2.0
     top = rect.y() + (rect.height() - ch) / 2.0

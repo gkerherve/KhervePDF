@@ -894,6 +894,41 @@ class PdfTab(QGraphicsView):
             self._doc.close()
             self._doc = None
 
+    # ----- drag & drop -----
+    # QGraphicsView enables acceptDrops by default so it can forward
+    # drops to its scene. That means a PDF dropped onto the page canvas
+    # is consumed here and never bubbles up to MainWindow.dropEvent, so
+    # we intercept file-URL drops and hand them to the window's open_path
+    # (new tab per file); anything else falls through to the base view.
+
+    def _dropped_pdf_paths(self, event) -> list[Path]:
+        win = self.window()
+        if not hasattr(win, "_pdf_urls"):
+            return []
+        return win._pdf_urls(event.mimeData())
+
+    def dragEnterEvent(self, event):  # noqa: N802 — Qt override
+        if self._dropped_pdf_paths(event):
+            event.acceptProposedAction()
+        else:
+            super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event):  # noqa: N802 — Qt override
+        if self._dropped_pdf_paths(event):
+            event.acceptProposedAction()
+        else:
+            super().dragMoveEvent(event)
+
+    def dropEvent(self, event):  # noqa: N802 — Qt override
+        paths = self._dropped_pdf_paths(event)
+        if not paths:
+            super().dropEvent(event)
+            return
+        win = self.window()
+        for p in paths:
+            win.open_path(p)
+        event.acceptProposedAction()
+
     # ----- rendering -----
 
     def _render_all(self) -> None:

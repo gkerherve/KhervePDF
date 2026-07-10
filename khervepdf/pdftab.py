@@ -2763,9 +2763,13 @@ class PdfTab(QGraphicsView):
     #
     # Reason this is its own tool, not a generic "click and type": PDFs
     # don't store editable paragraphs — they store positioned glyphs.
-    # The MVP here finds the block at the click point, redacts it, and
-    # re-inserts the user's new text using a default font. Font matching
-    # and layout reflow are deliberately out of scope for v0.4.
+    # Two commit strategies, tried in order:
+    #   1. _rewrite_single_line — when the edit is plain text confined
+    #      to one original visual line, only that line is redacted and
+    #      re-set at its own baseline. The rest of the paragraph keeps
+    #      its exact glyphs, so small fixes don't reformat anything.
+    #   2. Full redact + insert_htmlbox reflow of the paragraph — for
+    #      multi-line or styled (bold/size/align/sup/sub) changes.
 
     def _edit_existing_text(self, page_idx: int,
                             x_pt: float, y_pt: float) -> None:
@@ -2810,6 +2814,15 @@ class PdfTab(QGraphicsView):
             return
         # Doc is about to be mutated — undo entry must include doc bytes.
         self._push_undo(include_doc=True)
+        # Fast path: a plain-text change confined to a single original
+        # line is rewritten in place — only that line is redacted and
+        # re-set at its own baseline, so the rest of the paragraph
+        # keeps its exact glyphs, breaks and spacing. Deleting one
+        # letter no longer reflows the whole block.
+        if not self._formatting_changed(dlg, info) \
+                and self._rewrite_single_line(page, info, new_plain):
+            self._render_all()
+            return
         rect = fitz.Rect(*info["rect"])
         # White out the original glyphs by rewriting the page content
         # stream so the new text doesn't sit on top of the old.
@@ -2845,6 +2858,163 @@ class PdfTab(QGraphicsView):
                 rect, new_plain, fontsize=info["size"], color=info["color"],
             )
         self._render_all()
+
+    @staticmethod
+    def _builtin_fontname(raw: str) -> str:
+        """Closest PDF Base-14 builtin for a span's raw font name —
+        used by the single-line rewrite so the replacement text at
+        least matches the original's serif/sans/mono class and
+        bold/italic style."""
+        f = (raw or "").lower()
+        bold = any(k in f for k in ("bold", "black", "heavy"))
+        italic = "italic" in f or "oblique" in f
+        if any(k in f for k in ("courier", "mono", "consol")):
+            grid = {(False, False): "cour", (True, False): "cobo",
+                    (False, True): "coit", (True, True): "cobi"}
+        elif "sans" not in f and any(k in f for k in (
+                "times", "georgia", "garamond", "book", "serif",
+                "cambria", "minion", "caslon", "palatino")):
+            grid = {(False, False): "tiro", (True, False): "tibo",
+                    (False, True): "tiit", (True, True): "tibi"}
+        else:
+            grid = {(False, False): "helv", (True, False): "hebo",
+                    (False, True): "heit", (True, True): "hebi"}
+        return grid[(bold, italic)]
+
+    @staticmethod
+    def _formatting_changed(dlg: "_EditTextDialog", info: dict) -> bool:
+        """True when the Edit-Text session touched formatting (bold /
+        italic / underline, super/sub, font size, alignment, rotation)
+        rather than just the text. The single-line fast path only
+        handles plain text; styled edits need the insert_htmlbox
+        full-paragraph path which understands them."""
+        if dlg.rotation() != 0:
+            return True
+        html = dlg.html()
+        # Only scan the body content — the <body> tag itself carries
+        # the application's default font-size, not the user's choice.
+        body = html.split("<body", 1)[-1].split(">", 1)[-1]
+        for marker in ("<sup", "<sub", "font-style:italic",
+                       "text-decoration: underline",
+                       "vertical-align:super", "vertical-align:sub"):
+            if marker in body:
+                return True
+        import re as _re
+        for m in _re.finditer(r"font-weight:\s*(\d+)", body):
+            if int(m.group(1)) >= 600:
+                return True
+        want = float(info.get("size", 11.0))
+        for m in _re.finditer(r"font-size:\s*(\d+(?:\.\d+)?)pt", body):
+            if abs(float(m.group(1)) - want) > 0.75:
+                return True
+        checked = dlg._align_group.checkedAction()
+        name_by_act = {a: n for n, a in dlg._align_acts.items()}
+        cur = name_by_act.get(checked, "align_left")
+        return cur != "align_" + info.get("align", "left")
+
+    def _rewrite_single_line(self, page: fitz.Page, info: dict,
+                             new_plain: str) -> bool:
+        """Minimal-edit fast path for Edit Text.
+
+        When the diff between the original paragraph and the edited
+        text is confined to a single original visual line, redact only
+        that line and re-set its new text at the same baseline with
+        the same size/colour and the closest builtin font. Every other
+        line keeps its exact original glyphs — deleting one letter
+        re-renders one line instead of reflowing the whole paragraph.
+
+        Returns False (without touching the document) whenever the
+        edit is not that simple — multi-line changes, sup/sub spans in
+        the affected line, or new text that no longer fits the column.
+        The caller then falls back to the full redact-and-reflow path.
+        """
+        lines = info.get("lines") or []
+        if not lines:
+            return False
+        old = " ".join(ln["plain"] for ln in lines)
+        new = new_plain.replace(" ", " ").replace("\n", " ")
+        if old == new:
+            return False
+        # Common prefix / suffix bound the changed region old[p:e]
+        # (empty when the edit is a pure insertion at point p).
+        limit = min(len(old), len(new))
+        p = 0
+        while p < limit and old[p] == new[p]:
+            p += 1
+        s = 0
+        s_max = limit - p
+        while s < s_max and old[len(old) - 1 - s] == new[len(new) - 1 - s]:
+            s += 1
+        e = len(old) - s
+        # Each line occupies [start, start+len(plain)) in `old`, with
+        # one joining space between consecutive lines.
+        starts: list[int] = []
+        off = 0
+        for ln in lines:
+            starts.append(off)
+            off += len(ln["plain"]) + 1
+        affected = [
+            i for i in range(len(lines))
+            if not (starts[i] + len(lines[i]["plain"]) < p or starts[i] > e)
+        ]
+        if len(affected) != 1:
+            return False
+        i = affected[0]
+        ln = lines[i]
+        if ln.get("rich"):
+            return False
+        a = starts[i]
+        b = a + len(ln["plain"])
+        lo, hi = a, len(new) - (len(old) - b)
+        if not (0 <= lo <= hi <= len(new)):
+            return False
+        new_line = new[lo:hi].strip()
+        if new_line == ln["plain"]:
+            return False  # whitespace-only wiggle — nothing visible
+        size = float(ln.get("size") or info.get("size", 11.0))
+        fname = self._builtin_fontname(ln.get("font_raw", ""))
+        rx0, _ry0, rx1, _ry1 = info["rect"]
+        lx0, ly0, lx1, ly1 = ln["bbox"]
+        x = lx0
+        if new_line:
+            try:
+                w = fitz.get_text_length(new_line, fontname=fname,
+                                         fontsize=size)
+            except Exception:
+                return False
+            align = info.get("align", "left")
+            if align == "center":
+                x = (rx0 + rx1) / 2.0 - w / 2.0
+            elif align == "right":
+                x = rx1 - w
+            # justify: the rewritten line loses its stretched word
+            # spacing, but that still beats reflowing the paragraph.
+            if x < rx0 - 1.0 or x + w > rx1 + 2.0:
+                return False  # no longer fits the column
+        # Redact a vertically inset band: glyph removal works by
+        # bbox intersection, so the middle ~60% of the line height
+        # still catches every glyph on this line while ascenders /
+        # descenders poking in from neighbouring lines stay outside.
+        inset = (ly1 - ly0) * 0.2
+        page.add_redact_annot(
+            fitz.Rect(lx0 - 0.5, ly0 + inset, lx1 + 0.5, ly1 - inset),
+            fill=(1, 1, 1),
+        )
+        try:
+            # Keep images and line art under the band (underlines,
+            # table borders) — only the text is being replaced.
+            page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE,
+                                  graphics=fitz.PDF_REDACT_LINE_ART_NONE)
+        except (AttributeError, TypeError):
+            page.apply_redactions()
+        if new_line:
+            c = int(ln.get("color", 0))
+            rgb = (((c >> 16) & 0xff) / 255.0,
+                   ((c >> 8) & 0xff) / 255.0,
+                   (c & 0xff) / 255.0)
+            page.insert_text((x, ln["baseline"]), new_line,
+                             fontsize=size, fontname=fname, color=rgb)
+        return True
 
     def _find_text_block_detailed(self, page: fitz.Page,
                                   x_pt: float, y_pt: float):
@@ -2908,6 +3078,7 @@ class PdfTab(QGraphicsView):
             p_y1 = max(ln["bbox"][3] for ln in target_para)
             line_htmls: list[str] = []
             line_plains: list[str] = []
+            line_details: list[dict] = []
             first_span = None
             for line in target_para:
                 spans = line.get("spans", [])
@@ -2947,8 +3118,23 @@ class PdfTab(QGraphicsView):
                         parts.append(esc)
                 if not parts:
                     continue
-                line_htmls.append("".join(parts).rstrip())
+                joined_html = "".join(parts).rstrip()
+                line_htmls.append(joined_html)
                 line_plains.append("".join(plain_parts).rstrip())
+                # Per-line geometry + style for the single-line rewrite
+                # fast path in _rewrite_single_line: it needs the exact
+                # bbox and baseline to redact one line and re-set its
+                # text in place without disturbing the neighbours.
+                ref = normal[0] if normal else spans[0]
+                line_details.append({
+                    "bbox": tuple(line["bbox"]),
+                    "baseline": float(baseline),
+                    "size": float(ref.get("size", max_size)),
+                    "color": int(ref.get("color", 0)),
+                    "font_raw": str(ref.get("font", "")),
+                    "plain": line_plains[-1],
+                    "rich": "<sup" in joined_html or "<sub" in joined_html,
+                })
             if first_span is None or not line_htmls:
                 continue
             # Always carry the original line breaks as <br> /\n in
@@ -2986,6 +3172,7 @@ class PdfTab(QGraphicsView):
                 "color": (r, g, b),
                 "align": align,
                 "font": font,
+                "lines": line_details,
             }
         return None
 

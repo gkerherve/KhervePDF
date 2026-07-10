@@ -457,6 +457,16 @@ class MainWindow(QMainWindow):
         self._side_tabs.setTabToolTip(
             0, "Drag a thumbnail up or down to reorder pages.",
         )
+        # A chevron button in the tab-bar corner collapses the panel —
+        # a discoverable in-place affordance next to the View-menu
+        # toggle (which re-shows it) and the toolbar Pages button.
+        hide_btn = QToolButton(self._side_tabs)
+        hide_btn.setIcon(icon("hide_panel"))
+        hide_btn.setAutoRaise(True)
+        hide_btn.setToolTip("Hide side panel (re-open from the toolbar "
+                            "or View → Show Page Thumbnails)")
+        hide_btn.clicked.connect(lambda: self._thumbs_dock.hide())
+        self._side_tabs.setCornerWidget(hide_btn, Qt.TopRightCorner)
         self._thumbs_dock = QDockWidget("Document", self)
         self._thumbs_dock.setObjectName("PagesDock")
         self._thumbs_dock.setWidget(self._side_tabs)
@@ -640,6 +650,13 @@ class MainWindow(QMainWindow):
             act = QAction(icon(name), tip, self, triggered=handler)
             act.setToolTip(tip)
             tb.addAction(act)
+        # Pages side-panel toggle — checkable, stays in sync with the
+        # dock's own close button and the in-panel hide chevron, and is
+        # how the user re-opens the panel after collapsing it.
+        pages_toggle = self._thumbs_dock.toggleViewAction()
+        pages_toggle.setIcon(icon("thumbs"))
+        pages_toggle.setToolTip("Show/hide the Pages side panel")
+        tb.addAction(pages_toggle)
         tb.addSeparator()
 
         # Shared options popup (used by every drawing tool with a

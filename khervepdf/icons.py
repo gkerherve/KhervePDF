@@ -48,6 +48,7 @@ _GLYPHS: dict[str, str] = {
     "rotate_l":  "fa5s.undo-alt",
     "rotate_r":  "fa5s.redo-alt",
     "thumbs":    "fa5s.th-list",
+    "hide_panel": "fa5s.angle-double-left",
 
     # Tools
     "select":    "fa5s.mouse-pointer",
@@ -125,6 +126,7 @@ _COLORS_LIGHT: dict[str, str] = {
     "rotate_l":  "#00838f",
     "rotate_r":  "#00838f",
     "thumbs":    "#455a64",
+    "hide_panel": "#455a64",
 
     # Tools — semantically coloured: pen=blue, highlight=yellow, etc.
     "select":    "#37474f",
@@ -190,6 +192,7 @@ _COLORS_DARK: dict[str, str] = {
     "fit_width": "#4dd0e1", "fit_page":  "#4dd0e1",
     "rotate_l":  "#4dd0e1", "rotate_r":  "#4dd0e1",
     "thumbs":    "#b0bec5",
+    "hide_panel": "#b0bec5",
 
     "select":    "#cfd8dc",
     "hand":      "#64b5f6",

@@ -481,6 +481,19 @@ class MainWindow(QMainWindow):
         # loading bar can show how much of a long PDF has been
         # rasterised into the side panel.
         self._thumbs.rendering_progress.connect(self._on_render_progress)
+        # AI assistant sidebar (right) — hideable like the Pages panel,
+        # mirroring KhervePaint's AI chat dock. Visibility persists
+        # across sessions.
+        from .ai_panel import AiDock
+        self._ai_dock = AiDock(self)
+        self.addDockWidget(Qt.RightDockWidgetArea, self._ai_dock)
+        from PySide6.QtCore import QSettings as _QS
+        _ai_visible = _QS("kherve", "KhervePDF").value(
+            "ai/visible", "true") == "true"
+        self._ai_dock.setVisible(_ai_visible)
+        self._ai_dock.visibilityChanged.connect(
+            lambda vis: _QS("kherve", "KhervePDF").setValue(
+                "ai/visible", "true" if vis else "false"))
         self._build_menus()
         self._build_toolbar()
         self._build_statusbar()
@@ -581,6 +594,10 @@ class MainWindow(QMainWindow):
         toggle_thumbs.setText("Show Page &Thumbnails")
         toggle_thumbs.setIcon(icon("thumbs"))
         m_view.addAction(toggle_thumbs)
+        toggle_ai = self._ai_dock.toggleViewAction()
+        toggle_ai.setText("Show &AI Assistant")
+        toggle_ai.setIcon(icon("ai"))
+        m_view.addAction(toggle_ai)
         m_view.addSeparator()
 
         m_theme = m_view.addMenu("&Theme")
@@ -668,6 +685,10 @@ class MainWindow(QMainWindow):
         pages_toggle.setIcon(icon("thumbs"))
         pages_toggle.setToolTip("Show/hide the Pages side panel")
         tb.addAction(pages_toggle)
+        ai_toggle = self._ai_dock.toggleViewAction()
+        ai_toggle.setIcon(icon("ai"))
+        ai_toggle.setToolTip("Show/hide the AI assistant panel")
+        tb.addAction(ai_toggle)
         tb.addSeparator()
 
         # Shared options popup (used by every drawing tool with a

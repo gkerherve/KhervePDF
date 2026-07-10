@@ -49,6 +49,17 @@ _GLYPHS: dict[str, str] = {
     "rotate_r":  "fa5s.redo-alt",
     "thumbs":    "fa5s.th-list",
     "hide_panel": "fa5s.angle-double-left",
+    "hide_panel_r": "fa5s.angle-double-right",
+
+    # AI assistant panel
+    "ai":         "fa5s.robot",
+    "refresh":    "fa5s.sync-alt",
+    "send":       "fa5s.paper-plane",
+    "stop":       "fa5s.stop",
+    "settings":   "fa5s.cog",
+    "clear_chat": "fa5s.trash-alt",
+    "help":       "fa5s.question-circle",
+    "close_x":    "fa5s.times",
 
     # Tools
     "select":    "fa5s.mouse-pointer",
@@ -128,6 +139,9 @@ _COLORS_LIGHT: dict[str, str] = {
     "rotate_r":  "#00838f",
     "thumbs":    "#455a64",
     "hide_panel": "#455a64",
+    "hide_panel_r": "#455a64",
+    "ai":         "#7b1fa2",
+    "refresh":    "#00838f",
 
     # Tools — semantically coloured: pen=blue, highlight=yellow, etc.
     "select":    "#37474f",
@@ -195,6 +209,9 @@ _COLORS_DARK: dict[str, str] = {
     "rotate_l":  "#4dd0e1", "rotate_r":  "#4dd0e1",
     "thumbs":    "#b0bec5",
     "hide_panel": "#b0bec5",
+    "hide_panel_r": "#b0bec5",
+    "ai":         "#ce93d8",
+    "refresh":    "#4dd0e1",
 
     "select":    "#cfd8dc",
     "select_text": "#cfd8dc",

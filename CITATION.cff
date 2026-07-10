@@ -1,0 +1,26 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+type: software
+title: "KhervePDF: A PDF viewer and annotation editor with built-in Git version history"
+authors:
+  - family-names: "Kerhervé"
+    given-names: "Gwilherm"
+    orcid: "https://orcid.org/0000-0002-6449-1828"
+    affiliation: "Department of Materials, Imperial College London"
+version: "0.67"
+date-released: "2026-07-10"
+license: GPL-3.0
+repository-code: "https://github.com/gkerherve/KhervePDF"
+keywords:
+  - PDF
+  - annotation
+  - document management
+  - digital signatures
+  - version control
+abstract: >-
+  KhervePDF is an open-source tabbed PDF viewer and annotation editor.
+  It provides annotation tools (pen, highlight, text, shapes, sticky
+  notes, signatures, redaction), page operations (insert, delete, rotate,
+  reorder, merge, split), AcroForm form filling, full-text search, and
+  per-document Git version history with auto-commit and remote push.
+  Built with Python, PySide6, PyMuPDF, pikepdf and pygit2.

@@ -1,0 +1,48 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[margin=2.5cm]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage[hidelinks]{hyperref}
+\usepackage{parskip}
+
+\title{KhervePDF: A PDF Viewer and Annotation Editor\\with Built-In Git Version History}
+\author{Gwilherm Kerhervé\thanks{ORCID: 0000-0002-6449-1828, \texttt{g.kerherve@imperial.ac.uk}}\\
+\small Department of Materials, Imperial College London, London SW7 2AZ, United Kingdom}
+\date{10 July 2026 --- Version 0.67}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+KhervePDF is an open-source, tabbed PDF viewer and annotation editor for the desktop. It provides a full set of annotation tools (pen, highlighter, text, lines, arrows, shapes, sticky notes, signatures, redaction), page operations (insert, delete, rotate, reorder, merge, split), AcroForm form filling, full-text search, and optional digital signing. Its distinguishing feature is per-document Git version history: every save is committed automatically, and the annotation history of a document can be browsed, diffed and restored. KhervePDF is written in Python with PySide6, PyMuPDF, pikepdf and pygit2, and is released under the GNU General Public License v3.0 at \url{https://github.com/gkerherve/KhervePDF}.
+\end{abstract}
+
+\section{Statement of need}
+
+Annotating and manipulating PDFs is a daily task in research --- marking up manuscripts, correcting proofs, filling forms, assembling reports and theses. The dominant tools are proprietary (Adobe Acrobat, PDF Expert) or, when open source, focused on a single function: viewers such as Okular and SumatraPDF annotate but do not restructure documents, while command-line tools such as \texttt{qpdf} restructure but do not annotate. Moreover, no mainstream PDF tool records the history of a document's annotations: reviewers routinely end up with \texttt{manuscript\_annotated\_v2\_final.pdf} chains.
+
+KhervePDF combines viewing, annotation, page-level editing, form filling and signing in one open-source desktop application, and adds automatic version control. Each document folder is a Git repository; saving auto-commits, so every stage of a review or mark-up session is preserved and can be inspected or restored later, and the history can be pushed to a GitHub or GitLab remote for collaboration.
+
+\section{Functionality}
+
+Documents open in tabs, one per PDF. The annotation toolset covers multi-colour pen and highlighter, text boxes, lines, arrows, rectangles, ellipses, sticky notes, signature placement and redaction. Page operations include insertion, deletion, rotation, drag-and-drop reordering, merging documents and splitting them apart. Interactive AcroForm forms can be filled and saved. Text search works across all pages. The interface ships with the thirteen themes shared across the Kherve tool family (Light, Dark, Nord, Dracula, Gruvbox, Monokai, One Dark, GitHub, Catppuccin and others), and the title bar is Git-aware, showing the current document's revision state. Optional digital signing is provided through pyHanko.
+
+\section{Implementation}
+
+KhervePDF is written in Python (3.12+) on PySide6 (Qt~6). Rendering and annotation use PyMuPDF~\cite{pymupdf}; lossless page-level restructuring (merge, split, reorder) uses pikepdf~\cite{pikepdf}, a libqpdf binding; version history uses pygit2~\cite{pygit2}; icons are provided by qtawesome; digital signatures by pyHanko~\cite{pyhanko}. The application shares its theme system, Git backend design and general workflow with its sibling tools KherveTeX and KherveBook, so users move between the three with no relearning.
+
+\section{Availability}
+
+Source code, a Windows installer and documentation are available at \url{https://github.com/gkerherve/KhervePDF} under the GPL-3.0 license. KhervePDF is part of the Kherve family of open-source scientific tools, which includes KherveFitting~\cite{khervefitting}, KherveTeX and KherveBook.
+
+\begin{thebibliography}{9}
+\bibitem{pymupdf} J.~X. McKie, \emph{PyMuPDF: Python bindings for MuPDF}, \url{https://github.com/pymupdf/PyMuPDF}.
+\bibitem{pikepdf} J.~Barlow, \emph{pikepdf: A Python library for reading and writing PDF, powered by qpdf}, \url{https://github.com/pikepdf/pikepdf}.
+\bibitem{pygit2} \emph{pygit2: Python bindings for libgit2}, \url{https://www.pygit2.org}.
+\bibitem{pyhanko} M.~Valvekens, \emph{pyHanko: Sign and stamp PDF files}, \url{https://github.com/MatthiasValvekens/pyHanko}.
+\bibitem{khervefitting} G.~Kerhervé, D.~J. Payne, \emph{KherveFitting: An Open Source Software for Fitting X-Ray Photoelectron Spectroscopy Data}, Surf. Interface Anal. (2026), doi:10.1002/sia.70032.
+\end{thebibliography}
+
+\end{document}

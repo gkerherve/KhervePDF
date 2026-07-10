@@ -540,6 +540,17 @@ class MainWindow(QMainWindow):
         m_edit.addAction(QAction(icon("redo"), "&Redo", self, shortcut="Ctrl+Y",
                                  triggered=self._redo))
         m_edit.addSeparator()
+        # Copy the current Select-Text selection. No Ctrl+C accelerator
+        # here on purpose: a window-level shortcut would preempt the
+        # native copy inside the edit-text item and sticky-note editor.
+        # PdfTab.keyPressEvent handles Ctrl+C conditionally instead —
+        # it only fires when a PDF text selection exists.
+        copy_act = QAction("&Copy Selected Text", self,
+                           triggered=self._copy_selection)
+        copy_act.setToolTip("Copy text selected with the Select Text tool "
+                            "(Ctrl+C)")
+        m_edit.addAction(copy_act)
+        m_edit.addSeparator()
         m_edit.addAction(QAction(icon("find"), "&Find…", self,
                                  shortcut="Ctrl+F",
                                  triggered=self._show_find_bar))
@@ -583,9 +594,9 @@ class MainWindow(QMainWindow):
             m_theme.addAction(act)
 
         m_tools = mb.addMenu("&Tools")
-        for label in ("&Select", "&Pen", "&Highlight", "&Text", "&Line",
-                      "&Arrow", "&Rectangle", "&Ellipse", "Sticky &Note",
-                      "&Signature", "Re&dact"):
+        for label in ("&Select", "Select Te&xt", "&Pen", "&Highlight",
+                      "&Text", "&Line", "&Arrow", "&Rectangle", "&Ellipse",
+                      "Sticky &Note", "&Signature", "Re&dact"):
             m_tools.addAction(QAction(label, self, triggered=self._noop))
 
         m_pages = mb.addMenu("&Pages")
@@ -677,6 +688,8 @@ class MainWindow(QMainWindow):
         tools = [
             ("hand",      "Hand — pan the document"),
             ("select",    "Select — click an annotation; Delete removes it"),
+            ("select_text", "Select Text — drag over text, then Ctrl+C "
+                            "(or right-click) to copy it"),
             ("pen",       "Pen"),
             ("highlight", "Highlight"),
             ("text",      "Text (add new)"),
@@ -1159,6 +1172,11 @@ class MainWindow(QMainWindow):
         if t is not None:
             t.redo()
             self._refresh_status()
+
+    def _copy_selection(self) -> None:
+        t = self._current_pdf_tab()
+        if t is not None and t.copy_selection():
+            self.statusBar().showMessage("Copied selected text", 1500)
 
     def _save(self) -> None:
         t = self._current_pdf_tab()

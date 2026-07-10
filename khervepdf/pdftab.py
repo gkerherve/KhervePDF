@@ -36,7 +36,7 @@ from PySide6.QtWidgets import (
     QGraphicsEllipseItem, QGraphicsItem, QGraphicsLineItem,
     QGraphicsPathItem, QGraphicsPixmapItem, QGraphicsRectItem,
     QGraphicsScene, QGraphicsTextItem, QGraphicsView, QHBoxLayout,
-    QInputDialog, QLabel, QMessageBox, QPushButton, QTextEdit,
+    QInputDialog, QLabel, QMenu, QMessageBox, QPushButton, QTextEdit,
     QToolBar, QToolButton, QVBoxLayout, QWidget,
 )
 
@@ -62,6 +62,7 @@ TOOL_DEFAULTS = {
     "text":      {"color": "#000000", "width": 11.0, "opacity": 100},
     "erase":     {"color": "#000000", "width": 1.0,  "opacity": 100},
     "select":    {"color": "#000000", "width": 1.0,  "opacity": 100},
+    "select_text": {"color": "#000000", "width": 1.0, "opacity": 100},
     "edit_text": {"color": "#000000", "width": 11.0, "opacity": 100},
     "move_text": {"color": "#000000", "width": 1.0,  "opacity": 100},
     # Tools that don't have option panels still need defaults so the
@@ -857,6 +858,18 @@ class PdfTab(QGraphicsView):
         self._max_undo = 20
         # page_idx -> dict(y_origin, scale, w_pt, h_pt, pixmap_h_px)
         self._page_layout: dict[int, dict] = {}
+        # Text-selection tool state. The overlay rects in
+        # _text_sel_items are transient UI (not annotations); they are
+        # torn down by _render_all's scene.clear(), so the list is reset
+        # there too. _text_sel_text is the copyable string; _text_sel_
+        # anchor is the reading-order word index where the drag began;
+        # _text_words_cache memoises get_text("words") per page so a
+        # drag doesn't re-extract on every mouse move.
+        self._text_sel_items: list[QGraphicsRectItem] = []
+        self._text_sel_text = ""
+        self._text_sel_anchor: Optional[int] = None
+        self._text_sel_page: Optional[int] = None
+        self._text_words_cache: dict[int, list] = {}
         # Preview state while dragging.
         self._drag_start: Optional[QPointF] = None
         self._drag_page: Optional[int] = None
@@ -934,6 +947,13 @@ class PdfTab(QGraphicsView):
     def _render_all(self) -> None:
         self._scene.clear()
         self._preview_item = None
+        # scene.clear() deleted any live text-selection overlay and the
+        # page geometry/text may have changed (edit, redact, zoom), so
+        # drop the selection and the cached word boxes.
+        self._text_sel_items = []
+        self._text_sel_text = ""
+        self._text_sel_anchor = None
+        self._text_words_cache.clear()
         self._page_layout.clear()
         if self._doc is None:
             return
@@ -1009,6 +1029,92 @@ class PdfTab(QGraphicsView):
         lay = self._page_layout[page_idx]
         return (max(0.0, min(x_pt, lay["w_pt"])),
                 max(0.0, min(y_pt, lay["h_pt"])))
+
+    # ----- text selection (the Select Text tool) -----
+
+    def _page_words(self, page_idx: int) -> list:
+        """Words on a page in reading order, memoised. Each entry is
+        PyMuPDF's (x0, y0, x1, y1, text, block, line, word) tuple; we
+        sort by (block, line, word) so slicing a range yields a natural
+        left-to-right, top-to-bottom selection."""
+        words = self._text_words_cache.get(page_idx)
+        if words is None:
+            if self._doc is None:
+                return []
+            words = self._doc[page_idx].get_text("words")
+            words.sort(key=lambda w: (w[5], w[6], w[7]))
+            self._text_words_cache[page_idx] = words
+        return words
+
+    @staticmethod
+    def _word_at_or_near(words: list, px: float, py: float) -> Optional[int]:
+        """Index of the word nearest a page point, or None if the page
+        has no text. Vertical distance dominates so the caret snaps to
+        the right line first, then to the nearest word within it."""
+        if not words:
+            return None
+        best_i = 0
+        best_score = None
+        for i, w in enumerate(words):
+            x0, y0, x1, y1 = w[0], w[1], w[2], w[3]
+            dv = 0.0 if y0 <= py <= y1 else min(abs(py - y0), abs(py - y1))
+            dh = 0.0 if x0 <= px <= x1 else min(abs(px - x0), abs(px - x1))
+            score = dv * 1000.0 + dh
+            if best_score is None or score < best_score:
+                best_score = score
+                best_i = i
+        return best_i
+
+    def _clear_text_selection(self) -> None:
+        for it in self._text_sel_items:
+            self._scene.removeItem(it)
+        self._text_sel_items = []
+        self._text_sel_text = ""
+        self._text_sel_anchor = None
+        self._text_sel_page = None
+
+    def _update_text_selection(self, page_idx: int,
+                               lo: int, hi: int) -> None:
+        """Redraw the blue selection overlay over words[lo:hi+1] and
+        rebuild the copyable text (a space between words, a newline
+        between lines)."""
+        for it in self._text_sel_items:
+            self._scene.removeItem(it)
+        self._text_sel_items = []
+        words = self._page_words(page_idx)
+        sel = words[lo:hi + 1]
+        parts: list[str] = []
+        prev_line = None
+        fill = QColor("#1976d2")
+        fill.setAlpha(70)
+        for w in sel:
+            x0, y0, x1, y1 = w[0], w[1], w[2], w[3]
+            top_left = self._page_to_scene(page_idx, x0, y0)
+            bot_right = self._page_to_scene(page_idx, x1, y1)
+            rect = QGraphicsRectItem(QRectF(top_left, bot_right).normalized())
+            rect.setPen(QPen(Qt.NoPen))
+            rect.setBrush(QBrush(fill))
+            rect.setZValue(150)
+            self._scene.addItem(rect)
+            self._text_sel_items.append(rect)
+            line_key = (w[5], w[6])
+            if prev_line is not None:
+                parts.append("\n" if line_key != prev_line else " ")
+            parts.append(w[4])
+            prev_line = line_key
+        self._text_sel_text = "".join(parts)
+
+    def has_text_selection(self) -> bool:
+        return bool(self._text_sel_text)
+
+    def copy_selection(self) -> bool:
+        """Copy the current text selection to the clipboard. Returns
+        True if anything was copied (so callers can give feedback)."""
+        if not self._text_sel_text:
+            return False
+        from PySide6.QtWidgets import QApplication
+        QApplication.clipboard().setText(self._text_sel_text)
+        return True
 
     # ----- hit-test (for the eraser) -----
 
@@ -1638,6 +1744,8 @@ class PdfTab(QGraphicsView):
         # page after the user picks Select / Hand / etc.
         if name != "text" and self._inline_text_item is not None:
             self._dismiss_inline_text()
+        if name != "select_text":
+            self._clear_text_selection()
         self._tool = name
         self._apply_drag_mode()
 
@@ -1689,7 +1797,8 @@ class PdfTab(QGraphicsView):
             self.viewport().setCursor(Qt.SizeAllCursor)
         else:
             self.setDragMode(QGraphicsView.NoDrag)
-            cursor = Qt.IBeamCursor if self._tool in ("text", "edit_text") \
+            cursor = Qt.IBeamCursor \
+                if self._tool in ("text", "edit_text", "select_text") \
                 else Qt.CrossCursor
             self.viewport().setCursor(cursor)
 
@@ -1927,8 +2036,21 @@ class PdfTab(QGraphicsView):
             if self._tool == "select" and self._selected:
                 self._selected.clear()
                 self._render_all()
+            elif self._tool == "select_text":
+                self._clear_text_selection()
             return super().mousePressEvent(event)
         page_idx, px, py = mapped
+        if self._tool == "select_text":
+            # Start a text selection: clear the old overlay and anchor
+            # the caret at the word under the press. The drag in
+            # mouseMoveEvent extends the range; release keeps it visible
+            # for Ctrl+C / right-click Copy.
+            self._clear_text_selection()
+            self._text_sel_page = page_idx
+            self._text_sel_anchor = self._word_at_or_near(
+                self._page_words(page_idx), px, py)
+            event.accept()
+            return
         if self._tool == "select":
             ctrl = bool(event.modifiers() & Qt.ControlModifier)
             idx = self._find_annot_at(page_idx, px, py)
@@ -2135,6 +2257,17 @@ class PdfTab(QGraphicsView):
         event.accept()
 
     def mouseMoveEvent(self, event):  # noqa: N802
+        if self._tool == "select_text" and self._text_sel_anchor is not None:
+            scene_pt = self.mapToScene(event.position().toPoint())
+            mapped = self._scene_to_page(scene_pt)
+            if mapped is not None and mapped[0] == self._text_sel_page:
+                words = self._page_words(self._text_sel_page)
+                cur = self._word_at_or_near(words, mapped[1], mapped[2])
+                if cur is not None:
+                    lo, hi = sorted((self._text_sel_anchor, cur))
+                    self._update_text_selection(self._text_sel_page, lo, hi)
+            event.accept()
+            return
         if self._tool == "move_text" and self._move_text_state is not None:
             state = self._move_text_state
             scene_pt = self.mapToScene(event.position().toPoint())
@@ -2194,6 +2327,13 @@ class PdfTab(QGraphicsView):
         event.accept()
 
     def mouseReleaseEvent(self, event):  # noqa: N802
+        if self._tool == "select_text":
+            # End the drag; the overlay + copyable text persist until the
+            # next press or a tool switch. A plain click (no drag) left
+            # the selection empty, which reads as a deselect.
+            self._text_sel_anchor = None
+            event.accept()
+            return
         if self._tool == "move_text" and self._move_text_state is not None:
             state = self._move_text_state
             self._move_text_state = None
@@ -2400,6 +2540,14 @@ class PdfTab(QGraphicsView):
     # ----- keyboard: Delete clears selected annotations -----
 
     def keyPressEvent(self, event):  # noqa: N802
+        if (event.modifiers() & Qt.ControlModifier) \
+                and event.key() == Qt.Key_C and self.copy_selection():
+            event.accept()
+            return
+        if event.key() == Qt.Key_Escape and self._text_sel_text:
+            self._clear_text_selection()
+            event.accept()
+            return
         if event.key() in (Qt.Key_Delete, Qt.Key_Backspace) and self._selected:
             self._push_undo()
             for i in sorted(self._selected, reverse=True):
@@ -2429,6 +2577,17 @@ class PdfTab(QGraphicsView):
                 event.accept()
                 return
         super().keyPressEvent(event)
+
+    def contextMenuEvent(self, event):  # noqa: N802
+        # Right-click over a live text selection offers Copy — the
+        # familiar viewer gesture alongside Ctrl+C.
+        if self._text_sel_text:
+            menu = QMenu(self)
+            menu.addAction("Copy", self.copy_selection)
+            menu.exec(event.globalPos())
+            event.accept()
+            return
+        super().contextMenuEvent(event)
 
     def wheelEvent(self, event):  # noqa: N802
         # Ctrl + wheel zooms; without Ctrl, the default scroll

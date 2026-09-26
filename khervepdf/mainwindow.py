@@ -15,27 +15,48 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import QSettings, Qt
+from PySide6.QtCore import QSettings, Qt, QTimer, QUrl
 from PySide6.QtGui import (
-    QAction, QActionGroup, QColor, QImage, QKeySequence, QPainter,
+    QAction, QActionGroup, QColor, QDesktopServices, QIcon, QImage,
+    QKeySequence,
+    QPainter,
 )
 from PySide6.QtPrintSupport import QPrintDialog, QPrinter, QPrintPreviewDialog
 from PySide6.QtWidgets import (
     QApplication, QButtonGroup, QCheckBox, QColorDialog, QComboBox,
     QDialog, QDockWidget, QDoubleSpinBox, QFileDialog, QGridLayout,
-    QHBoxLayout, QLabel, QMainWindow, QMenu, QMessageBox, QProgressBar,
-    QPushButton, QSlider, QStatusBar, QTabBar, QTabWidget, QToolBar,
+    QHBoxLayout, QInputDialog, QLabel, QMainWindow, QMenu, QMessageBox, QProgressBar,
+    QProgressDialog,
+    QPushButton, QSlider, QStackedWidget, QStatusBar, QTabBar, QTabWidget,
+    QToolBar,
     QToolButton, QVBoxLayout, QWidget, QWidgetAction,
 )
 
-from . import digital_sign, git_backend, page_ops, themes, version_string
+from . import (
+    digital_sign, git_backend, icons, page_ops, themes, updater,
+    version_string,
+)
 from .find_bar import FindBar
 from .history_dialog import HistoryDialog
-from .icons import app_icon, icon
+from .icons import app_icon
+from .icons import icon as _themed_icon
+
+# Every icon built through this module is remembered by cacheKey ->
+# (name, colour) so a live theme switch can find the actions / buttons
+# carrying it and rebuild them in the new palette (QAction.icon() and
+# QAbstractButton.icon() share the QIcon data, so the key survives).
+_ICON_SPECS: dict[int, tuple[str, object]] = {}
+
+
+def icon(name: str, color=None) -> QIcon:
+    ic = _themed_icon(name, color=color)
+    _ICON_SPECS[ic.cacheKey()] = (name, color)
+    return ic
 from .outline import OutlinePanel
 from .pdftab import PdfTab, TOOL_DEFAULTS
 from .remote_dialog import RemoteDialog
 from .thumbnails import ThumbnailPanel
+from .welcome import WelcomePage
 
 
 # Curated colour grid used by _OptionsPopup. Office-style: a greyscale
@@ -414,7 +435,7 @@ class MainWindow(QMainWindow):
     # toolbar icons re-tint to the active tool colour; other tools
     # (hand, select, note, signature, erase) keep their palette tint.
     OPTIONS_TOOLS = frozenset({
-        "pen", "highlight", "line", "arrow", "rect", "ellipse",
+        "pen", "highlight", "underline", "strikeout", "line", "arrow", "rect", "ellipse",
         "text", "edit_text",
     })
 
@@ -422,6 +443,9 @@ class MainWindow(QMainWindow):
         super().__init__()
         self._theme_name = theme_name
         self._theme = themes.THEMES.get(theme_name, themes.THEMES["Light"])
+        # Icons pick their light/dark palette at creation time, so the
+        # flag must be set before any toolbar/menu icon is built.
+        icons.set_dark(themes.is_dark(theme_name))
 
         self.setWindowIcon(app_icon())
         self.resize(1280, 860)
@@ -440,7 +464,24 @@ class MainWindow(QMainWindow):
         self._tabs.setStyleSheet(
             "QTabWidget::pane { background-color: #808080; border: none; }"
         )
-        self.setCentralWidget(self._tabs)
+        # Central area is a stack: the welcome/start page while no PDF
+        # is open, the tab widget otherwise. Swapping pages (rather
+        # than overlaying) keeps every existing `self._tabs` caller
+        # working — with no tabs, currentWidget() is simply None.
+        self._welcome = WelcomePage(self._theme, self)
+        self._welcome.open_requested.connect(self._open)
+        self._welcome.new_requested.connect(self._new)
+        self._welcome.recent_requested.connect(
+            lambda p: self.open_path(Path(p)))
+        self._welcome.update_requested.connect(self._download_update)
+        self._central = QStackedWidget(self)
+        self._central.addWidget(self._welcome)
+        self._central.addWidget(self._tabs)
+        self.setCentralWidget(self._central)
+        # Whether the user wants the Pages dock shown when a document
+        # is open; remembered across the welcome page, which hides it.
+        self._thumbs_wanted = True
+        self._pending_release: updater.ReleaseInfo | None = None
 
         self._current_tool = "hand"
         # Side panel — a QTabWidget holding the page thumbnails and the
@@ -499,6 +540,91 @@ class MainWindow(QMainWindow):
         self._build_statusbar()
         self._apply_theme_qss()
         self._update_title()
+        self._welcome.set_recent(self._recent_files())
+        self._show_welcome()
+
+        # Background update check, delayed so it never competes with
+        # startup (or with a PDF opened from the command line).
+        self._updater = updater.UpdateChecker(self)
+        self._updater.update_available.connect(self._on_update_available)
+        self._manual_update_check = False
+        self._updater.up_to_date.connect(self._on_up_to_date)
+        self._updater.failed.connect(self._on_update_failed)
+        QTimer.singleShot(4000, self._updater.maybe_check_automatically)
+
+    # ----- welcome page -----
+
+    def _show_welcome(self) -> None:
+        """Switch to the start page and hide the Pages dock (there is
+        nothing to show in it). The dock's visibility is remembered so
+        leaving the welcome page restores the user's choice."""
+        if self._central.currentWidget() is not self._welcome:
+            # isHidden() (not isVisible()) so this is also right
+            # before the window has been shown.
+            self._thumbs_wanted = not self._thumbs_dock.isHidden()
+        self._welcome.set_recent(self._recent_files())
+        self._central.setCurrentWidget(self._welcome)
+        self._thumbs_dock.hide()
+        # Nothing to page through: the Pages toggle (toolbar + View
+        # menu, one shared action) is disabled until a PDF is open.
+        self._thumbs_dock.toggleViewAction().setEnabled(False)
+
+    def _leave_welcome(self) -> None:
+        if self._central.currentWidget() is self._welcome:
+            self._central.setCurrentWidget(self._tabs)
+            self._thumbs_dock.toggleViewAction().setEnabled(True)
+            self._thumbs_dock.setVisible(self._thumbs_wanted)
+
+    def is_welcome_visible(self) -> bool:
+        return self._central.currentWidget() is self._welcome
+
+    # ----- updates -----
+
+    def _check_updates_now(self) -> None:
+        self._manual_update_check = True
+        self.statusBar().showMessage("Checking for updates…", 3000)
+        self._updater.check()
+
+    def _on_update_available(self, info: "updater.ReleaseInfo") -> None:
+        self._manual_update_check = False
+        self._pending_release = info
+        self._welcome.show_update(info.tag)
+        # Non-modal notice in the status bar for when a PDF is open.
+        btn = getattr(self, "_update_btn", None)
+        if btn is None:
+            btn = QPushButton(self)
+            btn.setFlat(True)
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.clicked.connect(self._download_update)
+            self.statusBar().addPermanentWidget(btn)
+            self._update_btn = btn
+        btn.setIcon(icon("update"))
+        btn.setText(f"Update {info.tag} available — Download")
+        btn.setToolTip(info.download_url)
+        btn.show()
+
+    def _on_up_to_date(self, tag: str) -> None:
+        if self._manual_update_check:
+            self._manual_update_check = False
+            QMessageBox.information(
+                self, "Check for Updates",
+                f"KhervePDF is up to date (latest release: {tag}).")
+
+    def _on_update_failed(self, err: str) -> None:
+        # Automatic checks stay silent (offline is normal); only a
+        # user-initiated check reports the failure.
+        if self._manual_update_check:
+            self._manual_update_check = False
+            QMessageBox.warning(
+                self, "Check for Updates",
+                f"Could not reach GitHub to check for updates:\n{err}")
+
+    def _download_update(self) -> None:
+        """Hand the installer (or release page) to the browser. We
+        never install anything ourselves — the user runs the download."""
+        info = self._pending_release
+        url = info.download_url if info else updater.RELEASES_PAGE
+        QDesktopServices.openUrl(QUrl(url))
 
     # ----- chrome -----
 
@@ -560,9 +686,22 @@ class MainWindow(QMainWindow):
         # it only fires when a PDF text selection exists.
         copy_act = QAction("&Copy Selected Text", self,
                            triggered=self._copy_selection)
-        copy_act.setToolTip("Copy text selected with the Select Text tool "
+        copy_act.setText("&Copy Selected Text\tCtrl+C")
+        copy_act.setToolTip("Copy the text selected by dragging over it "
+                            "with the Hand, Select or Select Text tool "
                             "(Ctrl+C)")
         m_edit.addAction(copy_act)
+        # As above, the accelerators are shown in the text only; the
+        # tab handles the keys itself so text editors keep them.
+        m_edit.addAction(QAction(
+            "Select &All Text on Page\tCtrl+A", self,
+            triggered=lambda: self._tab_call("select_all_text")))
+        m_edit.addAction(QAction(
+            "&Edit Selected Text…", self,
+            triggered=lambda: self._tab_call("edit_selected_text")))
+        m_edit.addAction(QAction(
+            icon("snapshot"), "Copy Selection as &Image", self,
+            triggered=lambda: self._tab_call("copy_selection_as_image")))
         m_edit.addSeparator()
         m_edit.addAction(QAction(icon("find"), "&Find…", self,
                                  shortcut="Ctrl+F",
@@ -615,6 +754,9 @@ class MainWindow(QMainWindow):
                       "&Text", "&Line", "&Arrow", "&Rectangle", "&Ellipse",
                       "Sticky &Note", "&Signature", "Re&dact"):
             m_tools.addAction(QAction(label, self, triggered=self._noop))
+        m_tools.addSeparator()
+        m_tools.addAction(QAction(icon("ocr"), "Recognize Text (&OCR)…",
+                                  self, triggered=self._ocr))
 
         m_pages = mb.addMenu("&Pages")
         m_pages.addAction(QAction(icon("page_insert"),
@@ -657,7 +799,15 @@ class MainWindow(QMainWindow):
                                 triggered=self._git_remote))
 
         m_help = mb.addMenu("&Help")
-        m_help.addAction(QAction("&About KhervePDF", self,
+        m_help.addAction(QAction(icon("update"), "Check for &Updates…", self,
+                                 triggered=self._check_updates_now))
+        auto = QAction("Check for Updates &Automatically", self,
+                       checkable=True)
+        auto.setChecked(updater.auto_check_enabled())
+        auto.toggled.connect(updater.set_auto_check_enabled)
+        m_help.addAction(auto)
+        m_help.addSeparator()
+        m_help.addAction(QAction(icon("about"), "&About KhervePDF", self,
                                  triggered=self._about))
 
     def _build_toolbar(self) -> None:
@@ -707,12 +857,22 @@ class MainWindow(QMainWindow):
         self._tool_group.setExclusive(True)
         self._tool_buttons: dict[str, QToolButton] = {}
         tools = [
-            ("hand",      "Hand — pan the document"),
-            ("select",    "Select — click an annotation; Delete removes it"),
+            ("hand",      "Hand — pan the document; drag over text to "
+                          "select it (Ctrl+C copies, right-click to "
+                          "edit / delete / highlight)"),
+            ("select",    "Select — click an annotation (Delete removes "
+                          "it), or drag over text to select it (Ctrl+C "
+                          "copies, right-click to edit / delete / "
+                          "highlight)"),
             ("select_text", "Select Text — drag over text, then Ctrl+C "
                             "(or right-click) to copy it"),
+            ("snapshot",  "Snapshot — drag a box to copy that page area "
+                          "to the clipboard as an image"),
             ("pen",       "Pen"),
-            ("highlight", "Highlight"),
+            ("highlight", "Highlight — swipe over text"),
+            ("underline", "Underline — swipe over text to underline it"),
+            ("strikeout", "Strikethrough — swipe over text to strike it "
+                          "through"),
             ("text",      "Text (add new)"),
             ("edit_text", "Edit existing text"),
             ("move_text", "Move a paragraph — drag to reposition"),
@@ -862,7 +1022,26 @@ class MainWindow(QMainWindow):
         self._theme_name = name
         self._theme = themes.apply_theme(QApplication.instance(), name)
         self._apply_theme_qss()
+        icons.set_dark(themes.is_dark(name))
+        self._retint_icons()
+        self._welcome.set_theme(self._theme)
         QSettings("kherve", "KhervePDF").setValue("theme_name", name)
+
+    def _retint_icons(self) -> None:
+        """Rebuild every menu / toolbar icon in the current palette.
+        Icons are found by the cacheKey recorded in `icon()`; drawing
+        tools tinted with the user's colour are then re-tinted."""
+        from PySide6.QtWidgets import QAbstractButton
+        targets = list(self.findChildren(QAction)) + \
+            list(self.findChildren(QAbstractButton))
+        targets += [self._thumbs_dock.toggleViewAction(),
+                    self._ai_dock.toggleViewAction()]
+        for obj in targets:
+            spec = _ICON_SPECS.get(obj.icon().cacheKey())
+            if spec is not None:
+                obj.setIcon(icon(spec[0], color=spec[1]))
+        for t in self.OPTIONS_TOOLS:
+            self._refresh_tool_icon(t)
 
     # ----- title / status -----
 
@@ -1012,6 +1191,8 @@ class MainWindow(QMainWindow):
             w.close_doc()
         if w is not None:
             w.deleteLater()
+        if self._tabs.count() == 0:
+            self._show_welcome()
         self._refresh_thumbs()
         self._refresh_status()
 
@@ -1039,6 +1220,7 @@ class MainWindow(QMainWindow):
         self._progress.setRange(0, 100)
         self._progress.setVisible(False)
         self._tabs.addTab(tab, path.name)
+        self._leave_welcome()
         self._tabs.setCurrentWidget(tab)
         tab.set_tool(self._current_tool)
         self._push_recent(path)
@@ -1127,6 +1309,7 @@ class MainWindow(QMainWindow):
         files = files[:10]
         self._settings().setValue("recent_files", files)
         self._refresh_recent_menu()
+        self._welcome.set_recent(files)
 
     def _refresh_recent_menu(self) -> None:
         m = self._m_recent
@@ -1151,9 +1334,26 @@ class MainWindow(QMainWindow):
     def _clear_recent(self) -> None:
         self._settings().setValue("recent_files", [])
         self._refresh_recent_menu()
+        self._welcome.set_recent([])
 
     def _new(self) -> None:
-        self._noop()
+        """Open a blank one-page A4 document. PdfTab works on a file,
+        so the blank page is written to a fresh temp file; the user
+        gives it a real name with Save As. It is not added to Recent."""
+        import tempfile
+        import fitz
+        fd, tmp = tempfile.mkstemp(prefix="Untitled-", suffix=".pdf")
+        import os
+        os.close(fd)
+        doc = fitz.open()
+        doc.new_page(width=595, height=842)
+        doc.save(tmp)
+        doc.close()
+        self.open_path(Path(tmp))
+        recent = [p for p in self._recent_files() if p != tmp]
+        self._settings().setValue("recent_files", recent)
+        self._refresh_recent_menu()
+        self._welcome.set_recent(recent)
 
     def _open(self) -> None:
         path_s, _ = QFileDialog.getOpenFileName(
@@ -1198,6 +1398,90 @@ class MainWindow(QMainWindow):
         t = self._current_pdf_tab()
         if t is not None and t.copy_selection():
             self.statusBar().showMessage("Copied selected text", 1500)
+
+    def _tab_call(self, method: str) -> None:
+        """Call a PdfTab method by name on the current tab, if any."""
+        t = self._current_pdf_tab()
+        if t is None:
+            self.statusBar().showMessage("Open a PDF first", 2000)
+            return
+        fn = getattr(t, method, None)
+        if fn is None:
+            self.statusBar().showMessage(
+                "Not available in this version", 2000)
+            return
+        fn()
+
+    def _ocr(self) -> None:
+        t = self._current_pdf_tab()
+        if t is None:
+            QMessageBox.information(self, "Recognize Text",
+                                    "Open a PDF first.")
+            return
+        try:
+            from .ocr import ocr_available
+            ok, msg = ocr_available()
+            run = t.ocr_pages
+        except (ImportError, AttributeError):
+            QMessageBox.information(
+                self, "Recognize Text",
+                "OCR support is not available in this build.")
+            return
+        if not ok:
+            QMessageBox.information(self, "Recognize Text", msg)
+            return
+        n = t._doc.page_count
+        cur = t.current_page_index()
+        choice, accepted = QInputDialog.getItem(
+            self, "Recognize Text (OCR)", "Pages to recognise:",
+            [f"Current page ({cur + 1})", f"All pages (1–{n})",
+             "Page range…"], 0, False)
+        if not accepted:
+            return
+        if choice.startswith("Current"):
+            indices = [cur]
+        elif choice.startswith("All"):
+            indices = list(range(n))
+        else:
+            text, accepted = QInputDialog.getText(
+                self, "Recognize Text (OCR)",
+                f"Pages (e.g. 1-3, 5; 1–{n}):")
+            if not accepted:
+                return
+            indices = self._parse_page_range(text, n)
+            if not indices:
+                QMessageBox.warning(self, "Recognize Text",
+                                    "No valid pages in that range.")
+                return
+        dlg = QProgressDialog("Recognising text…", "Cancel", 0,
+                              len(indices), self)
+        dlg.setWindowTitle("Recognize Text (OCR)")
+        dlg.setWindowModality(Qt.WindowModal)
+        dlg.setMinimumDuration(0)
+
+        def _progress(done: int, total: int) -> bool:
+            dlg.setMaximum(total)
+            dlg.setValue(done)
+            QApplication.processEvents()
+            return not dlg.wasCanceled()
+
+        try:
+            words = run(indices, progress=_progress)
+        except Exception as e:
+            dlg.close()
+            QMessageBox.critical(self, "Recognize Text",
+                                 f"OCR failed:<br>{e}")
+            return
+        cancelled = dlg.wasCanceled()
+        dlg.close()
+        msg = f"Recognised {words} word{'s' if words != 1 else ''}"
+        if cancelled:
+            msg += " (cancelled)"
+        self.statusBar().showMessage(msg, 5000)
+        QMessageBox.information(self, "Recognize Text",
+                                msg + ". The text is now selectable "
+                                      "and searchable.")
+        self._refresh_status()
 
     def _save(self) -> None:
         t = self._current_pdf_tab()

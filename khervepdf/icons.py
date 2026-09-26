@@ -1,7 +1,8 @@
 """Runtime icon factory.
 
 CLAUDE.md forbids shipping PNG/SVG files for UI chrome. All icons are
-drawn at runtime via qtawesome. Each icon is themed with a per-action
+drawn at runtime via qtawesome (Material Design Icons, with Font
+Awesome fallbacks). Each icon is themed with a per-action
 accent colour so the toolbar reads as polychrome — the same look as
 KherveTeX / KherveSheet, where Save is green, Pen is blue, Redact is
 red, etc.
@@ -20,8 +21,112 @@ import qtawesome as qta
 
 
 # Semantic name -> qtawesome glyph spec. Names mirror the action labels
-# used by mainwindow's toolbar so callers don't have to know FA codes.
+# used by mainwindow's toolbar so callers don't have to know glyph codes.
+#
+# Material Design Icons (mdi6) rather than Font Awesome: FA5's solid set
+# mixes filled and outline shapes of very different visual weight (a
+# solid floppy next to a hairline minus), which made the toolbar look
+# uneven. MDI's outline family shares one stroke weight and 24-px grid,
+# and has purpose-made glyphs (text cursor, marker, vector line, hand)
+# where FA only had approximations.
 _GLYPHS: dict[str, str] = {
+    # File
+    "new":        "mdi6.file-plus-outline",
+    "open":       "mdi6.folder-open-outline",
+    "save":       "mdi6.content-save-outline",
+    "save_as":    "mdi6.content-save-edit-outline",
+    "print":      "mdi6.printer-outline",
+    "export_png": "mdi6.file-image-outline",
+    "export_txt": "mdi6.file-document-outline",
+    "close":      "mdi6.close",
+
+    # Edit
+    "undo":   "mdi6.undo",
+    "redo":   "mdi6.redo",
+    "cut":    "mdi6.content-cut",
+    "copy":   "mdi6.content-copy",
+    "paste":  "mdi6.content-paste",
+    "find":   "mdi6.magnify",
+
+    # View / zoom
+    "zoom_in":   "mdi6.magnify-plus-outline",
+    "zoom_out":  "mdi6.magnify-minus-outline",
+    "fit_width": "mdi6.arrow-expand-horizontal",
+    "fit_page":  "mdi6.fit-to-page-outline",
+    "rotate_l":  "mdi6.rotate-left",
+    "rotate_r":  "mdi6.rotate-right",
+    "thumbs":    "mdi6.view-grid-outline",
+    "hide_panel": "mdi6.chevron-double-left",
+    "hide_panel_r": "mdi6.chevron-double-right",
+
+    # AI assistant panel
+    "ai":         "mdi6.robot-outline",
+    "refresh":    "mdi6.refresh",
+    "send":       "mdi6.send",
+    "stop":       "mdi6.stop-circle-outline",
+    "settings":   "mdi6.cog-outline",
+    "clear_chat": "mdi6.delete-sweep-outline",
+    "help":       "mdi6.help-circle-outline",
+    "close_x":    "mdi6.close",
+
+    # Tools — select (arrow) and select_text (I-beam) must stay visually
+    # distinct: they sit side by side in the toolbar.
+    "select":    "mdi6.cursor-default-outline",
+    "select_text": "mdi6.cursor-text",
+    "hand":      "mdi6.hand-back-right-outline",
+    "image":     "mdi6.image-outline",
+    "edit_text": "mdi6.text-box-edit-outline",
+    "move_text": "mdi6.cursor-move",
+    "pen":       "mdi6.draw-pen",
+    "highlight": "mdi6.marker",
+    "strikeout": "mdi6.format-strikethrough-variant",
+    "snapshot":  "mdi6.monitor-screenshot",
+    "ocr":       "mdi6.text-recognition",
+    "text":      "mdi6.format-text",
+    "line":      "mdi6.vector-line",
+    "arrow":     "mdi6.arrow-top-right",
+    "rect":      "mdi6.rectangle-outline",
+    "ellipse":   "mdi6.ellipse-outline",
+    "note":      "mdi6.note-outline",
+    "signature": "mdi6.signature-freehand",
+    "erase":     "mdi6.eraser",
+
+    # Pages
+    "page_insert": "mdi6.file-plus",
+    "page_delete": "mdi6.delete-outline",
+    "page_merge":  "mdi6.set-merge",
+    "page_split":  "mdi6.scissors-cutting",
+    "reorder":     "mdi6.sort",
+
+    # Git
+    "commit":  "mdi6.source-commit",
+    "history": "mdi6.history",
+    "remote":  "mdi6.cloud-upload-outline",
+    "branch":  "mdi6.source-branch",
+
+    # Rich-text dialog
+    "bold":          "mdi6.format-bold",
+    "italic":        "mdi6.format-italic",
+    "underline":     "mdi6.format-underline",
+    "superscript":   "mdi6.format-superscript",
+    "subscript":     "mdi6.format-subscript",
+    "align_left":    "mdi6.format-align-left",
+    "align_center":  "mdi6.format-align-center",
+    "align_right":   "mdi6.format-align-right",
+    "align_justify": "mdi6.format-align-justify",
+
+    # Help / updates
+    "about":  "mdi6.information-outline",
+    "update": "mdi6.update",
+    "download": "mdi6.download",
+    "recent_doc": "mdi6.file-pdf-box",
+}
+
+
+# Font Awesome 5 fallbacks — the pre-v0.72 glyph set. Only used if an
+# older qtawesome lacks one of the mdi6 names above, so a missing glyph
+# degrades to the previous look rather than a "?" icon.
+_FALLBACK_GLYPHS: dict[str, str] = {
     # File
     "new":        "fa5s.file",
     "open":       "fa5s.folder-open",
@@ -70,6 +175,9 @@ _GLYPHS: dict[str, str] = {
     "move_text": "fa5s.arrows-alt",
     "pen":       "fa5s.pen",
     "highlight": "fa5s.highlighter",
+    "strikeout": "fa5s.strikethrough",
+    "snapshot":  "fa5s.crop",
+    "ocr":       "fa5s.font",
     "text":      "fa5s.font",
     "line":      "fa5s.minus",
     "arrow":     "fa5s.long-arrow-alt-right",
@@ -105,6 +213,9 @@ _GLYPHS: dict[str, str] = {
 
     # Help
     "about": "fa5s.info-circle",
+    "update": "fa5s.sync-alt",
+    "download": "fa5s.download",
+    "recent_doc": "fa5s.file-pdf",
 }
 
 
@@ -152,6 +263,9 @@ _COLORS_LIGHT: dict[str, str] = {
     "move_text": "#1565c0",
     "pen":       "#1976d2",
     "highlight": "#fbc02d",
+    "strikeout": "#c62828",
+    "snapshot":  "#00838f",
+    "ocr":       "#6a1b9a",
     "text":      "#5d4037",
     "line":      "#212121",
     "arrow":     "#212121",
@@ -175,6 +289,9 @@ _COLORS_LIGHT: dict[str, str] = {
     "branch":  "#ef6c00",
 
     "about": "#1565c0",
+    "update": "#2e7d32",
+    "download": "#2e7d32",
+    "recent_doc": "#c62828",
 
     # Rich-text dialog — neutral charcoal
     "bold":          "#212121",
@@ -221,6 +338,9 @@ _COLORS_DARK: dict[str, str] = {
     "move_text": "#64b5f6",
     "pen":       "#64b5f6",
     "highlight": "#ffe082",
+    "strikeout": "#ef9a9a",
+    "snapshot":  "#4dd0e1",
+    "ocr":       "#ce93d8",
     "text":      "#bcaaa4",
     "line":      "#eeeeee", "arrow":     "#eeeeee",
     "rect":      "#81c784",
@@ -237,6 +357,7 @@ _COLORS_DARK: dict[str, str] = {
     "remote":  "#64b5f6", "branch":  "#ffb74d",
 
     "about": "#64b5f6",
+    "update": "#6abf69", "download": "#6abf69", "recent_doc": "#ef9a9a",
 
     "bold":          "#eeeeee",
     "italic":        "#eeeeee",
@@ -269,12 +390,19 @@ def icon(name: str, color: QColor | str | None = None) -> QIcon:
     the toolbar looks polychrome. Pass `color` to force a specific tint
     (e.g. a tool's user-picked stroke colour).
     """
-    spec = _GLYPHS.get(name, "fa5s.question")
     c = color if color is not None else _color_for(name)
-    try:
-        return qta.icon(spec, color=c)
-    except Exception:
-        return QIcon()
+    # Try the MDI glyph, then the FA5 fallback, then a generic "?" —
+    # an older qtawesome raising on an unknown name must never take a
+    # toolbar down with it.
+    for spec in (_GLYPHS.get(name), _FALLBACK_GLYPHS.get(name),
+                 "fa5s.question"):
+        if not spec:
+            continue
+        try:
+            return qta.icon(spec, color=c)
+        except Exception:
+            continue
+    return QIcon()
 
 
 def app_icon() -> QIcon:

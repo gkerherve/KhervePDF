@@ -20,7 +20,7 @@ from __future__ import annotations
 import copy
 import html as html_mod
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace as _dc_replace
 from pathlib import Path
 from typing import Optional
 
@@ -55,6 +55,9 @@ TOOL_DEFAULTS = {
     "hand":      {"color": "#000000", "width": 1.0,  "opacity": 100},
     "pen":       {"color": "#1976d2", "width": 2.0,  "opacity": 100},
     "highlight": {"color": "#fbc02d", "width": 14.0, "opacity": 35},
+    "underline": {"color": "#1976d2", "width": 1.0,  "opacity": 100},
+    "strikeout": {"color": "#c62828", "width": 1.0,  "opacity": 100},
+    "snapshot":  {"color": "#1976d2", "width": 1.0,  "opacity": 100},
     "rect":      {"color": "#388e3c", "width": 2.0,  "opacity": 100, "filled": False, "fill_color": None},
     "ellipse":   {"color": "#7b1fa2", "width": 2.0,  "opacity": 100, "filled": False, "fill_color": None},
     "line":      {"color": "#212121", "width": 2.0,  "opacity": 100},
@@ -79,7 +82,8 @@ class Annotation:
     `pts` semantics depend on `type`:
       * pen           — polyline (n points)
       * line / arrow  — [start, end]
-      * rect / ellipse / highlight / redact — [top_left, bottom_right]
+      * rect / ellipse / highlight / underline / strikeout / redact —
+        [top_left, bottom_right] (text marks: the word box)
       * text          — [anchor]
     """
     type: str
@@ -629,6 +633,65 @@ class _EditableTextItem(QGraphicsTextItem):
         self._tab._dismiss_inline_text()
 
 
+class _InlineReplaceItem(QGraphicsTextItem):
+    """On-page editor for "Edit Selected Text": sits exactly over the
+    selected words (white background hides the originals), in roughly
+    the same font and size. Enter commits, Shift+Enter adds a line,
+    Esc cancels, clicking elsewhere commits."""
+
+    def __init__(self, tab: "PdfTab", text: str) -> None:
+        super().__init__(text)
+        self._tab = tab
+        self._done = False
+        # The selection being replaced, frozen now — by the time the
+        # edit commits, a new click may have changed the live one.
+        self._range = tab._text_sel_range
+        self.setTextInteractionFlags(Qt.TextEditorInteraction)
+        self.setZValue(300)
+
+    def paint(self, painter, option, widget=None):  # noqa: D401
+        r = self.boundingRect()
+        painter.fillRect(r, QColor("white"))
+        pen = QPen(QColor("#1976d2"), 1.0)
+        pen.setCosmetic(True)
+        painter.setPen(pen)
+        painter.drawRect(r.adjusted(0, 0, -1, -1))
+        super().paint(painter, option, widget)
+
+    def keyPressEvent(self, ev):  # noqa: N802
+        if ev.key() in (Qt.Key_Return, Qt.Key_Enter) \
+                and not (ev.modifiers() & Qt.ShiftModifier):
+            self.finish(True)
+            ev.accept()
+            return
+        if ev.key() == Qt.Key_Escape:
+            self.finish(False)
+            ev.accept()
+            return
+        super().keyPressEvent(ev)
+
+    def focusOutEvent(self, ev):  # noqa: N802
+        super().focusOutEvent(ev)
+        # Deferred: the focus change may come from a click that is
+        # about to start a new selection.
+        QTimer.singleShot(0, lambda: self.finish(True))
+
+    def finish(self, commit: bool) -> None:
+        if self._done:
+            return
+        self._done = True
+        text = self.toPlainText()
+        if self.scene() is not None:
+            self.scene().removeItem(self)
+        self._tab._inline_replace = None
+        if commit and self._range is not None:
+            self._tab._text_sel_range = self._range
+            self._tab.replace_selected_text(text)
+        elif not commit:
+            for it in self._tab._text_sel_items:
+                it.setVisible(True)
+
+
 class _TextFormatBar(QFrame):
     """Floating toolbar that hovers next to an _EditableTextItem.
 
@@ -847,6 +910,8 @@ class PdfTab(QGraphicsView):
         # Add-Text inline editing state.
         self._inline_text_item: Optional[_EditableTextItem] = None
         self._inline_format_bar: Optional[_TextFormatBar] = None
+        # On-page editor for Edit Selected Text (_InlineReplaceItem).
+        self._inline_replace: Optional[_InlineReplaceItem] = None
         # Sticky-note popup (yellow Post-it style — see _StickyNotePopup).
         self._sticky_popup: Optional[_StickyNotePopup] = None
         # Undo/redo: each entry is a state snapshot. Annotation-only
@@ -869,7 +934,14 @@ class PdfTab(QGraphicsView):
         self._text_sel_text = ""
         self._text_sel_anchor: Optional[int] = None
         self._text_sel_page: Optional[int] = None
+        # (page_idx, lo, hi) of the live selection in _page_words order —
+        # what Edit / Delete / Highlight / Copy-as-image act on.
+        self._text_sel_range: Optional[tuple[int, int, int]] = None
+        self._text_sel_spans: list[tuple[int, int, int]] = []
         self._text_words_cache: dict[int, list] = {}
+        # Last left-click position in page points — where Ctrl+V pastes
+        # text and where the context menu's "Add text here" drops it.
+        self._last_click: Optional[tuple[int, float, float]] = None
         # Preview state while dragging.
         self._drag_start: Optional[QPointF] = None
         self._drag_page: Optional[int] = None
@@ -953,6 +1025,7 @@ class PdfTab(QGraphicsView):
         self._text_sel_items = []
         self._text_sel_text = ""
         self._text_sel_anchor = None
+        self._text_sel_range = None
         self._text_words_cache.clear()
         self._page_layout.clear()
         if self._doc is None:
@@ -1032,6 +1105,28 @@ class PdfTab(QGraphicsView):
 
     # ----- text selection (the Select Text tool) -----
 
+    # Rotated pages: PyMuPDF reports text and annotation geometry in
+    # the page's *unrotated* space, while we render (and the user
+    # clicks on) the rotated page. Everything in self._annots and the
+    # word cache lives in display space; these convert at the PDF
+    # boundary (load / bake / text-block lookup).
+    _RECT_TYPES = ("rect", "ellipse", "highlight", "underline", "strikeout", "redact", "image")
+
+    @staticmethod
+    def _map_pts(pts, m: "fitz.Matrix", rect_like: bool):
+        out = [tuple(fitz.Point(x, y) * m) for x, y in pts]
+        if rect_like and len(out) == 2:
+            (ax, ay), (bx, by) = out
+            out = [(min(ax, bx), min(ay, by)), (max(ax, bx), max(ay, by))]
+        return out
+
+    @staticmethod
+    def _to_unrotated(page: "fitz.Page", x: float, y: float) -> tuple[float, float]:
+        if not page.rotation:
+            return x, y
+        pt = fitz.Point(x, y) * page.derotation_matrix
+        return pt.x, pt.y
+
     def _page_words(self, page_idx: int) -> list:
         """Words on a page in reading order, memoised. Each entry is
         PyMuPDF's (x0, y0, x1, y1, text, block, line, word) tuple; we
@@ -1041,8 +1136,13 @@ class PdfTab(QGraphicsView):
         if words is None:
             if self._doc is None:
                 return []
-            words = self._doc[page_idx].get_text("words")
+            page = self._doc[page_idx]
+            words = page.get_text("words")
             words.sort(key=lambda w: (w[5], w[6], w[7]))
+            if page.rotation:
+                m = page.rotation_matrix
+                words = [tuple(fitz.Rect(w[:4]) * m) + tuple(w[4:])
+                         for w in words]
             self._text_words_cache[page_idx] = words
         return words
 
@@ -1072,37 +1172,123 @@ class PdfTab(QGraphicsView):
         self._text_sel_text = ""
         self._text_sel_anchor = None
         self._text_sel_page = None
+        self._text_sel_range = None
+        self._text_sel_spans = []
+
+    def _word_hit(self, page_idx: int, px: float, py: float) -> Optional[int]:
+        """Index of the word whose box contains the page point (with a
+        little slack), or None. Unlike _word_at_or_near this does not
+        snap from far away — it decides whether a press in the Hand /
+        Select tools lands *on text* and should start a selection."""
+        for i, w in enumerate(self._page_words(page_idx)):
+            pad = (w[3] - w[1]) * 0.15
+            if w[0] - pad <= px <= w[2] + pad and w[1] - pad <= py <= w[3] + pad:
+                return i
+        return None
+
+    def ocr_pages(self, page_indices: list[int], progress=None) -> int:
+        """Recognise text on scanned pages (see ocr.py) so they become
+        selectable, searchable and editable. Pages that already have a
+        text layer are skipped. `progress(done, total)` may return False
+        to cancel. One undo step; returns the number of words added."""
+        from . import ocr
+        if self._doc is None:
+            return 0
+        self._push_undo(include_doc=True)
+        added = 0
+        total = len(page_indices)
+        for n, i in enumerate(page_indices):
+            if progress is not None and progress(n, total) is False:
+                break
+            page = self._doc[i]
+            if not ocr.page_has_text(page):
+                added += ocr.ocr_page(page)
+        if progress is not None:
+            progress(total, total)
+        if added == 0 and self._undo_stack:
+            self._undo_stack.pop()
+        self._render_all()
+        return added
+
+    def select_all_text(self) -> bool:
+        """Select every word on the current page (Ctrl+A)."""
+        if self._doc is None:
+            return False
+        page_idx = self.current_page_index()
+        words = self._page_words(page_idx)
+        if not words:
+            return False
+        self._text_sel_page = page_idx
+        self._update_text_selection(page_idx, 0, len(words) - 1)
+        return True
 
     def _update_text_selection(self, page_idx: int,
                                lo: int, hi: int) -> None:
-        """Redraw the blue selection overlay over words[lo:hi+1] and
-        rebuild the copyable text (a space between words, a newline
-        between lines)."""
+        self._set_text_selection([(page_idx, lo, hi)])
+
+    def _set_text_selection(self, spans: list[tuple[int, int, int]]) -> None:
+        """Redraw the blue selection overlay over each (page, lo, hi)
+        word range and rebuild the copyable text (a space between
+        words, a newline between lines, a blank line between pages).
+        Several spans = a selection that runs across pages."""
         for it in self._text_sel_items:
             self._scene.removeItem(it)
         self._text_sel_items = []
-        words = self._page_words(page_idx)
-        sel = words[lo:hi + 1]
-        parts: list[str] = []
-        prev_line = None
         fill = QColor("#1976d2")
         fill.setAlpha(70)
-        for w in sel:
-            x0, y0, x1, y1 = w[0], w[1], w[2], w[3]
-            top_left = self._page_to_scene(page_idx, x0, y0)
-            bot_right = self._page_to_scene(page_idx, x1, y1)
-            rect = QGraphicsRectItem(QRectF(top_left, bot_right).normalized())
-            rect.setPen(QPen(Qt.NoPen))
-            rect.setBrush(QBrush(fill))
-            rect.setZValue(150)
-            self._scene.addItem(rect)
-            self._text_sel_items.append(rect)
-            line_key = (w[5], w[6])
-            if prev_line is not None:
-                parts.append("\n" if line_key != prev_line else " ")
-            parts.append(w[4])
-            prev_line = line_key
-        self._text_sel_text = "".join(parts)
+        page_texts: list[str] = []
+        spans = [sp for sp in spans if sp[1] <= sp[2]]
+        for page_idx, lo, hi in spans:
+            sel = self._page_words(page_idx)[lo:hi + 1]
+            parts: list[str] = []
+            prev_line = None
+            for w in sel:
+                x0, y0, x1, y1 = w[0], w[1], w[2], w[3]
+                top_left = self._page_to_scene(page_idx, x0, y0)
+                bot_right = self._page_to_scene(page_idx, x1, y1)
+                rect = QGraphicsRectItem(QRectF(top_left, bot_right).normalized())
+                rect.setPen(QPen(Qt.NoPen))
+                rect.setBrush(QBrush(fill))
+                rect.setZValue(150)
+                self._scene.addItem(rect)
+                self._text_sel_items.append(rect)
+                line_key = (w[5], w[6])
+                if prev_line is not None:
+                    parts.append("\n" if line_key != prev_line else " ")
+                parts.append(w[4])
+                prev_line = line_key
+            if parts:
+                page_texts.append("".join(parts))
+        self._text_sel_text = "\n\n".join(page_texts)
+        self._text_sel_spans = spans
+        # Edit / delete / copy-as-image act on a single-page range.
+        self._text_sel_range = spans[0] if len(spans) == 1 and self._text_sel_text \
+            else None
+
+    def _extend_text_selection(self, page_idx: int, px: float, py: float) -> None:
+        """Drag handler: select from the anchor word to the word nearest
+        (page_idx, px, py), spanning whole pages in between."""
+        a_page, a_idx = self._text_sel_page, self._text_sel_anchor
+        if a_page is None or a_idx is None:
+            return
+        cur = self._word_at_or_near(self._page_words(page_idx), px, py)
+        if cur is None:
+            # Blank page under the cursor — keep the anchor side only.
+            if page_idx == a_page:
+                return
+            cur = 0 if page_idx > a_page else -1
+        (p0, i0), (p1, i1) = sorted([(a_page, a_idx), (page_idx, cur)])
+        if p0 == p1:
+            self._set_text_selection([(p0, i0, i1)])
+            return
+        spans = [(p0, i0, len(self._page_words(p0)) - 1)]
+        for mid in range(p0 + 1, p1):
+            n = len(self._page_words(mid))
+            if n:
+                spans.append((mid, 0, n - 1))
+        last = i1 if i1 >= 0 else len(self._page_words(p1)) - 1
+        spans.append((p1, 0, last))
+        self._set_text_selection(spans)
 
     def has_text_selection(self) -> bool:
         return bool(self._text_sel_text)
@@ -1114,6 +1300,263 @@ class PdfTab(QGraphicsView):
             return False
         from PySide6.QtWidgets import QApplication
         QApplication.clipboard().setText(self._text_sel_text)
+        return True
+
+    def _selection_words(self) -> tuple[Optional[int], list]:
+        if self._text_sel_range is None:
+            return None, []
+        page_idx, lo, hi = self._text_sel_range
+        return page_idx, self._page_words(page_idx)[lo:hi + 1]
+
+    def copy_selection_as_image(self, dpi: int = 200) -> bool:
+        """Copy the selected passage as a picture — keeps equations,
+        symbols and exact typography that plain text would lose, and
+        pastes straight into slides, documents or back onto a PDF."""
+        page_idx, words = self._selection_words()
+        if not words or self._doc is None:
+            return False
+        r = fitz.Rect(words[0][:4])
+        for w in words[1:]:
+            r |= fitz.Rect(w[:4])
+        pad = 2.0
+        return self.copy_region_as_image(
+            page_idx, fitz.Rect(r.x0 - pad, r.y0 - pad, r.x1 + pad, r.y1 + pad),
+            dpi=dpi)
+
+    def copy_region_as_image(self, page_idx: int, rect: fitz.Rect,
+                             dpi: int = 200) -> bool:
+        """Snapshot tool / Copy as Image: render a page area (with the
+        user's annotations baked in, as seen on screen) to the
+        clipboard."""
+        if self._doc is None:
+            return False
+        rect = fitz.Rect(rect) & self._doc[page_idx].rect
+        if rect.is_empty or rect.width < 2 or rect.height < 2:
+            return False
+        # Bake this page's annotations into a throwaway one-page copy
+        # so the snapshot matches what's on screen.
+        tmp = fitz.open()
+        tmp.insert_pdf(self._doc, from_page=page_idx, to_page=page_idx)
+        keep = self._annots
+        self._annots = [_dc_replace(a, page_idx=0)
+                        for a in keep if a.page_idx == page_idx]
+        try:
+            self._bake_into(tmp)
+        except Exception:
+            pass  # annotations are a bonus — never fail the copy
+        finally:
+            self._annots = keep
+        pix = tmp[0].get_pixmap(clip=rect, dpi=dpi, annots=True)
+        tmp.close()
+        img = QImage(pix.samples, pix.width, pix.height, pix.stride,
+                     QImage.Format_RGB888).copy()
+        from PySide6.QtWidgets import QApplication
+        QApplication.clipboard().setImage(img)
+        win = self.window()
+        if hasattr(win, "statusBar"):
+            win.statusBar().showMessage(
+                "Copied area to the clipboard as an image — Ctrl+V to paste",
+                4000)
+        return True
+
+    def mark_selection(self, kind: str) -> bool:
+        """Underline / strike out the selected words."""
+        if not self._text_sel_spans:
+            return False
+        self._push_undo()
+        for page_idx, lo, hi in self._text_sel_spans:
+            for w in self._page_words(page_idx)[lo:hi + 1]:
+                self._annots.append(Annotation(
+                    type=kind, page_idx=page_idx, color=self.tool_color(kind),
+                    width=1.0, pts=[(w[0], w[1]), (w[2], w[3])],
+                    opacity=self.tool_opacity(kind),
+                ))
+        self._render_all()
+        return True
+
+    def highlight_selection(self) -> bool:
+        """Turn the current text selection into highlight annotations
+        (one per word, like the Highlight tool's swipe)."""
+        if not self._text_sel_spans:
+            return False
+        self._push_undo()
+        color = self.tool_color("highlight")
+        opacity = self.tool_opacity("highlight")
+        for page_idx, lo, hi in self._text_sel_spans:
+            for w in self._page_words(page_idx)[lo:hi + 1]:
+                pad = (w[3] - w[1]) * 0.08
+                self._annots.append(Annotation(
+                    type="highlight", page_idx=page_idx, color=color,
+                    width=0.0, pts=[(w[0], w[1] - pad), (w[2], w[3] + pad)],
+                    opacity=opacity,
+                ))
+        self._render_all()
+        return True
+
+    def _locate_selection_in_paragraph(self):
+        """Map the selected words onto the paragraph that contains
+        them. Returns (info, old_text, start, end) where old_text is the
+        paragraph as a single line (the form _rewrite_single_line works
+        on) and old_text[start:end] is the selected span — or None when
+        the selection crosses paragraphs."""
+        import re as _re
+        page_idx, words = self._selection_words()
+        if not words or self._doc is None:
+            return None
+        page = self._doc[page_idx]
+        cx = (words[0][0] + words[0][2]) / 2
+        cy = (words[0][1] + words[0][3]) / 2
+        info = self._find_text_block_detailed(page, cx, cy)
+        if info is None or not info.get("lines"):
+            return None
+        rx0, ry0, rx1, ry1 = info["rect"]
+
+        def inside(w) -> bool:
+            mx, my = self._to_unrotated(page, (w[0] + w[2]) / 2,
+                                        (w[1] + w[3]) / 2)
+            return rx0 - 1 <= mx <= rx1 + 1 and ry0 - 1 <= my <= ry1 + 1
+        if not inside(words[-1]):
+            return None
+        old = " ".join(ln["plain"] for ln in info["lines"])
+        tokens = list(_re.finditer(r"\S+", old))
+        para_words = [w for w in self._page_words(page_idx) if inside(w)]
+        sel_tokens = [w[4] for w in words]
+        n = len(sel_tokens)
+        # Prefer the word's ordinal inside the paragraph so a repeated
+        # word ("the") maps to the occurrence the user actually picked.
+        if len(para_words) == len(tokens) and words[0] in para_words:
+            k = para_words.index(words[0])
+            if k + n <= len(tokens) and \
+                    [t.group() for t in tokens[k:k + n]] == sel_tokens:
+                return info, old, tokens[k].start(), tokens[k + n - 1].end()
+        needle = " ".join(sel_tokens)
+        start = old.find(needle)
+        if start < 0:
+            return None
+        return info, old, start, start + len(needle)
+
+    def replace_selected_text(self, new_text: str) -> bool:
+        """Replace just the selected words inside their paragraph and
+        write the result back into the PDF. Small changes rewrite only
+        the affected line (the rest of the paragraph keeps its exact
+        glyphs); bigger ones reflow the paragraph in its original font,
+        size and alignment."""
+        loc = self._locate_selection_in_paragraph()
+        if loc is None:
+            return False
+        info, old, start, end = loc
+        page_idx = self._text_sel_range[0]
+        new_text = " ".join(new_text.split())
+        new_plain = (old[:start] + new_text + old[end:]).replace("  ", " ")
+        if new_plain.strip() == old.strip():
+            return True
+        page = self._doc[page_idx]
+        self._push_undo(include_doc=True)
+        if not self._rewrite_single_line(page, info, new_plain.strip()):
+            rect = fitz.Rect(*info["rect"])
+            page.add_redact_annot(rect, fill=(1, 1, 1))
+            page.apply_redactions()
+            if new_plain.strip():
+                self._insert_paragraph(page, rect,
+                                       html_mod.escape(new_plain.strip()),
+                                       info)
+        self._render_all()
+        return True
+
+    def _insert_paragraph(self, page: fitz.Page, rect: fitz.Rect,
+                          html_body: str, info: dict) -> None:
+        """Reflow `html_body` into `rect` using the paragraph's
+        detected font, size, colour and alignment. Grows the box
+        downward rather than letting insert_htmlbox shrink the text."""
+        sz = max(4.0, float(info.get("size", 11.0)))
+        align = info.get("align", "left")
+        font = info.get("font", "")
+        r, g, b = info.get("color", (0, 0, 0))
+        font_css = f"font-family:'{font}';" if font else ""
+        wrapped = (f'<div style="text-align:{align};font-size:{sz:.1f}pt;'
+                   f'color:rgb({int(r*255)},{int(g*255)},{int(b*255)});'
+                   f'{font_css}">{html_body}</div>')
+        try:
+            _spare, scale = page.insert_htmlbox(rect, wrapped, scale_low=1)
+            if scale < 0.999 or _spare < 0:
+                grown = fitz.Rect(rect.x0, rect.y0, rect.x1,
+                                  min(page.rect.height,
+                                      rect.y1 + rect.height * 4))
+                page.insert_htmlbox(grown, wrapped)
+        except (AttributeError, TypeError):
+            fitz_align = {"left": 0, "center": 1, "right": 2,
+                          "justify": 3}.get(align, 0)
+            page.insert_textbox(rect, self._strip_html(html_body),
+                                fontsize=sz, color=info.get("color", (0, 0, 0)),
+                                align=fitz_align)
+
+    def edit_selected_text(self) -> None:
+        """Right-click → Edit Selected Text: edit only the highlighted
+        words, then put them back into the PDF in place."""
+        if not self._text_sel_text:
+            return
+        if self._locate_selection_in_paragraph() is None:
+            QMessageBox.information(
+                self, "Edit selected text",
+                "The selection spans more than one paragraph.\n"
+                "Select text inside a single paragraph, or use the Edit "
+                "Text tool to rewrite whole paragraphs.")
+            return
+        info = self._locate_selection_in_paragraph()[0]
+        page_idx, words = self._selection_words()
+        r = fitz.Rect(words[0][:4])
+        for w in words[1:]:
+            r |= fitz.Rect(w[:4])
+        scale = self._page_layout[page_idx]["scale"]
+        item = _InlineReplaceItem(self, " ".join(self._text_sel_text.split()))
+        font = QFont(info.get("font") or "Times New Roman")
+        # Match the PDF size on screen: points → scene pixels.
+        font.setPixelSize(max(6, int(round(info.get("size", 11.0) * scale))))
+        item.setFont(font)
+        item.setDefaultTextColor(QColor.fromRgbF(*info.get("color", (0, 0, 0))))
+        item.document().setDocumentMargin(1)
+        multi_line = (r.y1 - r.y0) > float(info.get("size", 11.0)) * 1.6
+        if multi_line:
+            item.setTextWidth(r.width * scale)
+        pos = self._page_to_scene(page_idx, r.x0, r.y0)
+        item.setPos(pos.x() - 1, pos.y() - 1)
+        self._scene.addItem(item)
+        # Hide the blue overlay so it doesn't tint the editor.
+        for it in self._text_sel_items:
+            it.setVisible(False)
+        item.setFocus()
+        cur = item.textCursor()
+        cur.select(QTextCursor.Document)
+        item.setTextCursor(cur)
+        self._inline_replace = item
+
+    def delete_selected_text(self) -> None:
+        if self._text_sel_text and not self.replace_selected_text(""):
+            QMessageBox.information(
+                self, "Delete text",
+                "The selection spans more than one paragraph — select "
+                "text inside a single paragraph.")
+
+    def paste_text(self, text: str,
+                   at: Optional[tuple[int, float, float]] = None) -> bool:
+        """Drop clipboard text onto the page as a text box at the last
+        click (or the top of the current page). It stays editable with
+        the Select tool until saved."""
+        text = text.strip("\n")
+        if not text or self._doc is None:
+            return False
+        if at is None:
+            at = self._last_click
+        if at is None:
+            at = (self.current_page_index(), 72.0, 72.0)
+        page_idx, px, py = at
+        self._push_undo()
+        self._annots.append(Annotation(
+            type="text", page_idx=page_idx,
+            color=self.tool_color("text"), width=self.tool_width("text"),
+            opacity=100, pts=[(px, py)], text=text,
+        ))
+        self._render_all()
         return True
 
     # ----- hit-test (for the eraser) -----
@@ -1144,10 +1587,12 @@ class PdfTab(QGraphicsView):
             a = self._annots[i]
             if a.page_idx != page_idx or not a.pts:
                 continue
-            if a.type in ("rect", "ellipse", "highlight"):
+            if a.type in ("rect", "ellipse", "highlight",
+                          "underline", "strikeout"):
                 # Highlights are tight per-word — without a generous
                 # pad the eraser misses gaps between glyphs.
-                pad = max(tol_pt, 10.0) if a.type == "highlight" else tol_pt
+                pad = max(tol_pt, 10.0) if a.type in (
+                    "highlight", "underline", "strikeout") else tol_pt
                 x0, y0 = a.pts[0]
                 x1, y1 = a.pts[1]
                 xmin, xmax = min(x0, x1), max(x0, x1)
@@ -1358,6 +1803,9 @@ class PdfTab(QGraphicsView):
                 continue
             for annot in annots:
                 a = self._pdf_annot_to_annotation(page_idx, annot)
+                if a is not None and page.rotation:
+                    a.pts = self._map_pts(a.pts, page.rotation_matrix,
+                                          a.type in self._RECT_TYPES)
                 if a is not None:
                     self._annots.append(a)
 
@@ -1403,6 +1851,10 @@ class PdfTab(QGraphicsView):
         if a_type == "Highlight":
             return Annotation(type="highlight", page_idx=page_idx,
                               color=color_hex, width=0.0, opacity=opacity,
+                              pts=[(rect.x0, rect.y0), (rect.x1, rect.y1)])
+        if a_type in ("Underline", "StrikeOut"):
+            return Annotation(type=a_type.lower(), page_idx=page_idx,
+                              color=color_hex, width=1.0, opacity=opacity,
                               pts=[(rect.x0, rect.y0), (rect.x1, rect.y1)])
         if a_type == "Square":
             fill_hex = self._rgb01_to_hex(fill) if fill else None
@@ -1501,6 +1953,9 @@ class PdfTab(QGraphicsView):
             if a.page_idx >= doc.page_count:
                 continue
             page = doc[a.page_idx]
+            if page.rotation:
+                a = _dc_replace(a, pts=self._map_pts(
+                    a.pts, page.derotation_matrix, a.type in self._RECT_TYPES))
             rgb = self._hex_to_rgb01(a.color)
             op = max(0.0, min(1.0, a.opacity / 100.0))
             if a.type == "pen":
@@ -1519,6 +1974,15 @@ class PdfTab(QGraphicsView):
                 rect = fitz.Rect(a.pts[0][0], a.pts[0][1],
                                  a.pts[1][0], a.pts[1][1])
                 annot = page.add_highlight_annot(rect)
+                annot.set_colors(stroke=rgb)
+                annot.set_opacity(op)
+                annot.update()
+            elif a.type in ("underline", "strikeout"):
+                rect = fitz.Rect(a.pts[0][0], a.pts[0][1],
+                                 a.pts[1][0], a.pts[1][1])
+                annot = (page.add_underline_annot(rect)
+                         if a.type == "underline"
+                         else page.add_strikeout_annot(rect))
                 annot.set_colors(stroke=rgb)
                 annot.set_opacity(op)
                 annot.update()
@@ -1744,7 +2208,7 @@ class PdfTab(QGraphicsView):
         # page after the user picks Select / Hand / etc.
         if name != "text" and self._inline_text_item is not None:
             self._dismiss_inline_text()
-        if name != "select_text":
+        if name not in ("select_text", "select", "hand"):
             self._clear_text_selection()
         self._tool = name
         self._apply_drag_mode()
@@ -1798,7 +2262,8 @@ class PdfTab(QGraphicsView):
         else:
             self.setDragMode(QGraphicsView.NoDrag)
             cursor = Qt.IBeamCursor \
-                if self._tool in ("text", "edit_text", "select_text") \
+                if self._tool in ("text", "edit_text", "select_text",
+                                  "underline", "strikeout") \
                 else Qt.CrossCursor
             self.viewport().setCursor(cursor)
 
@@ -1860,6 +2325,16 @@ class PdfTab(QGraphicsView):
             item = QGraphicsRectItem(r)
             item.setPen(QPen(Qt.NoPen))
             item.setBrush(QBrush(color))
+            self._scene.addItem(item)
+        elif a.type in ("underline", "strikeout"):
+            # Same geometry the PDF viewer uses for these markup
+            # annotations: a rule near the bottom of the word box, or
+            # through its middle, ~7% of the box height thick.
+            r = self._rect_from_pts(a)
+            y = r.bottom() - r.height() * 0.1 if a.type == "underline" \
+                else r.center().y()
+            item = QGraphicsLineItem(r.left(), y, r.right(), y)
+            item.setPen(QPen(color, max(1.0, r.height() * 0.07)))
             self._scene.addItem(item)
         elif a.type == "image":
             if not a.image_bytes:
@@ -1928,7 +2403,8 @@ class PdfTab(QGraphicsView):
         selection marquee overlay."""
         if a.page_idx not in self._page_layout:
             return None
-        if a.type in ("rect", "ellipse", "highlight"):
+        if a.type in ("rect", "ellipse", "highlight",
+                      "underline", "strikeout"):
             return self._rect_from_pts(a)
         if a.type in ("line", "arrow"):
             p0 = self._page_to_scene(a.page_idx, *a.pts[0])
@@ -1965,6 +2441,9 @@ class PdfTab(QGraphicsView):
         if page_idx not in self._page_layout:
             return None
         x0, y0, x1, y1 = rect_pt
+        if self._doc is not None and self._doc[page_idx].rotation:
+            r = fitz.Rect(rect_pt) * self._doc[page_idx].rotation_matrix
+            x0, y0, x1, y1 = r.x0, r.y0, r.x1, r.y1
         p0 = self._page_to_scene(page_idx, x0, y0)
         p1 = self._page_to_scene(page_idx, x1, y1)
         item = QGraphicsRectItem(QRectF(p0, p1).normalized())
@@ -2014,6 +2493,16 @@ class PdfTab(QGraphicsView):
     # ----- mouse: drawing -----
 
     def mousePressEvent(self, event):  # noqa: N802
+        # A click outside the on-page Edit Selected Text editor commits
+        # it (and is consumed, so it doesn't also start a new gesture).
+        ed = self._inline_replace
+        if ed is not None:
+            scene_pt = self.mapToScene(event.position().toPoint())
+            if ed.sceneBoundingRect().contains(scene_pt):
+                return super().mousePressEvent(event)
+            ed.finish(True)
+            event.accept()
+            return
         # Always check first whether the click landed on a sticky-note
         # marker — even in Select mode, a click on a note should open
         # its edit dialog instead of starting a pan.
@@ -2027,6 +2516,27 @@ class PdfTab(QGraphicsView):
                     self._edit_note(note_idx)
                     event.accept()
                     return
+                self._last_click = mapped0
+                # Hand and Select behave like a normal reader: pressing
+                # on text starts a text selection (drag to extend, then
+                # Ctrl+C / right-click). Blank areas keep panning (Hand)
+                # or marquee/annotation picking (Select).
+                if self._tool in ("hand", "select"):
+                    pg, px0, py0 = mapped0
+                    on_annot = (self._tool == "select"
+                                and self._find_annot_at(pg, px0, py0) is not None)
+                    if not on_annot and self._word_hit(pg, px0, py0) is not None:
+                        if self._selected:
+                            self._selected.clear()
+                            self._render_all()
+                        self._clear_text_selection()
+                        self._text_sel_page = pg
+                        self._text_sel_anchor = self._word_at_or_near(
+                            self._page_words(pg), px0, py0)
+                        event.accept()
+                        return
+                if self._text_sel_text and self._tool in ("hand", "select"):
+                    self._clear_text_selection()
         if self._tool == "hand" or event.button() != Qt.LeftButton:
             return super().mousePressEvent(event)
         scene_pt = self.mapToScene(event.position().toPoint())
@@ -2150,6 +2660,16 @@ class PdfTab(QGraphicsView):
             item.setBrush(QBrush(self._qcolor(color_hex, alpha=90)))
             self._scene.addItem(item)
             self._preview_item = item
+        elif self._tool in ("underline", "strikeout", "snapshot"):
+            item = QGraphicsRectItem(QRectF(scene_pt, scene_pt))
+            pen = QPen(QColor(color_hex), 1.0, Qt.DashLine)
+            pen.setCosmetic(True)
+            item.setPen(pen)
+            fill = QColor(color_hex)
+            fill.setAlpha(30)
+            item.setBrush(QBrush(fill))
+            self._scene.addItem(item)
+            self._preview_item = item
         elif self._tool == "signature":
             # Drag a rectangle that determines where the signature
             # will be stamped. The dashed preview reuses the rect-
@@ -2256,16 +2776,48 @@ class PdfTab(QGraphicsView):
             return super().mousePressEvent(event)
         event.accept()
 
+    def mouseDoubleClickEvent(self, event):  # noqa: N802
+        # Double-click on a word selects it, in any tool that selects
+        # text — the quickest way to grab one word to copy or edit.
+        if event.button() == Qt.LeftButton \
+                and self._tool in ("hand", "select", "select_text"):
+            mapped = self._scene_to_page(
+                self.mapToScene(event.position().toPoint()))
+            if mapped is not None:
+                i = self._word_hit(*mapped)
+                if i is not None:
+                    self._clear_text_selection()
+                    self._text_sel_page = mapped[0]
+                    self._update_text_selection(mapped[0], i, i)
+                    event.accept()
+                    return
+        super().mouseDoubleClickEvent(event)
+
     def mouseMoveEvent(self, event):  # noqa: N802
-        if self._tool == "select_text" and self._text_sel_anchor is not None:
-            scene_pt = self.mapToScene(event.position().toPoint())
-            mapped = self._scene_to_page(scene_pt)
-            if mapped is not None and mapped[0] == self._text_sel_page:
-                words = self._page_words(self._text_sel_page)
-                cur = self._word_at_or_near(words, mapped[1], mapped[2])
-                if cur is not None:
-                    lo, hi = sorted((self._text_sel_anchor, cur))
-                    self._update_text_selection(self._text_sel_page, lo, hi)
+        if self._tool in ("hand", "select") and self._text_sel_anchor is None \
+                and not event.buttons():
+            # Hover feedback: I-beam over text so the user can tell a
+            # drag will select rather than pan.
+            mapped = self._scene_to_page(
+                self.mapToScene(event.position().toPoint()))
+            over_text = mapped is not None and self._word_hit(*mapped) is not None
+            default = Qt.OpenHandCursor if self._tool == "hand" else Qt.ArrowCursor
+            self.viewport().setCursor(Qt.IBeamCursor if over_text else default)
+        if self._text_sel_anchor is not None \
+                and self._tool in ("hand", "select", "select_text"):
+            pos = event.position().toPoint()
+            # Auto-scroll when dragging past the top / bottom edge so a
+            # selection can run onto the next page.
+            edge = 30
+            vh = self.viewport().height()
+            bar = self.verticalScrollBar()
+            if pos.y() > vh - edge:
+                bar.setValue(bar.value() + (pos.y() - (vh - edge)) // 2 + 4)
+            elif pos.y() < edge:
+                bar.setValue(bar.value() - (edge - pos.y()) // 2 - 4)
+            mapped = self._scene_to_page(self.mapToScene(pos))
+            if mapped is not None:
+                self._extend_text_selection(*mapped)
             event.accept()
             return
         if self._tool == "move_text" and self._move_text_state is not None:
@@ -2320,14 +2872,17 @@ class PdfTab(QGraphicsView):
             s = self._drag_start
             self._preview_item.setLine(s.x(), s.y(),
                                        scene_pt.x(), scene_pt.y())
-        elif self._tool in ("rect", "ellipse", "highlight", "redact"):
+        elif self._tool in ("rect", "ellipse", "highlight", "redact",
+                            "underline", "strikeout", "snapshot", "signature"):
             self._preview_item.setRect(
                 QRectF(self._drag_start, scene_pt).normalized()
             )
         event.accept()
 
     def mouseReleaseEvent(self, event):  # noqa: N802
-        if self._tool == "select_text":
+        if self._tool == "select_text" or (
+                self._text_sel_anchor is not None
+                and self._tool in ("hand", "select")):
             # End the drag; the overlay + copyable text persist until the
             # next press or a tool switch. A plain click (no drag) left
             # the selection empty, which reads as a deselect.
@@ -2342,6 +2897,11 @@ class PdfTab(QGraphicsView):
             scale = state["scale"]
             dx_pt = (scene_pt.x() - state["start_scene"].x()) / scale
             dy_pt = (scene_pt.y() - state["start_scene"].y()) / scale
+            if self._doc is not None and self._doc[state["page_idx"]].rotation:
+                # Drag delta is on screen; the block rect is unrotated.
+                m = self._doc[state["page_idx"]].derotation_matrix
+                v = fitz.Point(dx_pt, dy_pt) * m - fitz.Point(0, 0) * m
+                dx_pt, dy_pt = v.x, v.y
             # Anything under ~1pt in either axis is treated as a stray
             # click and dropped — no destructive redact.
             if abs(dx_pt) < 1.0 and abs(dy_pt) < 1.0:
@@ -2503,6 +3063,13 @@ class PdfTab(QGraphicsView):
                 ))
         elif self._tool == "highlight":
             self._commit_highlight(page, start_pt, end_pt, color, opacity)
+        elif self._tool in ("underline", "strikeout"):
+            self._commit_text_mark(self._tool, page, start_pt, end_pt,
+                                   color, opacity)
+        elif self._tool == "snapshot":
+            self.copy_region_as_image(page, fitz.Rect(
+                min(start_pt[0], end_pt[0]), min(start_pt[1], end_pt[1]),
+                max(start_pt[0], end_pt[0]), max(start_pt[1], end_pt[1])))
         elif self._tool == "signature":
             self._commit_signature(page, start_pt, end_pt)
         elif self._tool in ("line", "arrow", "rect", "ellipse"):
@@ -2540,12 +3107,35 @@ class PdfTab(QGraphicsView):
     # ----- keyboard: Delete clears selected annotations -----
 
     def keyPressEvent(self, event):  # noqa: N802
+        # While typing into an on-page editor, every key belongs to it —
+        # Del / Ctrl+A / Ctrl+V must not act on the PDF selection.
+        if isinstance(self._scene.focusItem(), QGraphicsTextItem):
+            super().keyPressEvent(event)
+            return
         if (event.modifiers() & Qt.ControlModifier) \
                 and event.key() == Qt.Key_C and self.copy_selection():
             event.accept()
             return
         if event.key() == Qt.Key_Escape and self._text_sel_text:
             self._clear_text_selection()
+            event.accept()
+            return
+        ctrl = bool(event.modifiers() & Qt.ControlModifier)
+        if ctrl and event.key() == Qt.Key_A and self.select_all_text():
+            event.accept()
+            return
+        if ctrl and event.key() == Qt.Key_V:
+            # Text on the clipboard lands as a text box at the last
+            # click; images fall through to MainWindow's image paste.
+            from PySide6.QtWidgets import QApplication
+            md = QApplication.clipboard().mimeData()
+            if md.hasText() and not md.hasImage() \
+                    and self.paste_text(md.text()):
+                event.accept()
+                return
+        if event.key() in (Qt.Key_Delete, Qt.Key_Backspace) \
+                and self._text_sel_text and not self._selected:
+            self.delete_selected_text()
             event.accept()
             return
         if event.key() in (Qt.Key_Delete, Qt.Key_Backspace) and self._selected:
@@ -2581,13 +3171,44 @@ class PdfTab(QGraphicsView):
     def contextMenuEvent(self, event):  # noqa: N802
         # Right-click over a live text selection offers Copy — the
         # familiar viewer gesture alongside Ctrl+C.
+        menu = QMenu(self)
         if self._text_sel_text:
-            menu = QMenu(self)
-            menu.addAction("Copy", self.copy_selection)
-            menu.exec(event.globalPos())
-            event.accept()
+            menu.addAction(icon("copy"), "Copy\tCtrl+C", self.copy_selection)
+            single = self._text_sel_range is not None
+            menu.addAction("Copy as Image",
+                           self.copy_selection_as_image).setEnabled(single)
+            menu.addSeparator()
+            menu.addAction(icon("edit_text"), "Edit Selected Text…",
+                           self.edit_selected_text).setEnabled(single)
+            menu.addAction("Delete Selected Text\tDel",
+                           self.delete_selected_text).setEnabled(single)
+            menu.addAction(icon("highlight"), "Highlight",
+                           self.highlight_selection)
+            menu.addAction(icon("underline"), "Underline",
+                           lambda: self.mark_selection("underline"))
+            menu.addAction("Strike Out",
+                           lambda: self.mark_selection("strikeout"))
+            menu.addSeparator()
+        mapped = self._scene_to_page(self.mapToScene(event.pos()))
+        if mapped is not None:
+            from PySide6.QtWidgets import QApplication
+            md = QApplication.clipboard().mimeData()
+            if md.hasText() and not md.hasImage():
+                menu.addAction(icon("paste"), "Paste Text Here",
+                               lambda: self.paste_text(md.text(), mapped))
+
+            def _add_text():
+                self._add_text_at(mapped[0], (mapped[1], mapped[2]),
+                                  self.tool_color("text"),
+                                  self.tool_width("text"), 100)
+            menu.addAction(icon("text"), "Add Text Here", _add_text)
+            menu.addAction("Select All Text on Page\tCtrl+A",
+                           self.select_all_text)
+        if menu.isEmpty():
+            super().contextMenuEvent(event)
             return
-        super().contextMenuEvent(event)
+        menu.exec(event.globalPos())
+        event.accept()
 
     def wheelEvent(self, event):  # noqa: N802
         # Ctrl + wheel zooms; without Ctrl, the default scroll
@@ -2654,6 +3275,28 @@ class PdfTab(QGraphicsView):
         ))
         self._render_all()
 
+    def _commit_text_mark(self, kind: str, page_idx: int,
+                          start_pt: tuple[float, float],
+                          end_pt: tuple[float, float],
+                          color: str, opacity: int) -> None:
+        """Underline / strikeout: one mark per word the swipe touched.
+        Unlike highlight there is no freeform fallback — a rule across
+        empty space means nothing."""
+        if self._doc is None:
+            return
+        drag = fitz.Rect(min(start_pt[0], end_pt[0]),
+                         min(start_pt[1], end_pt[1]),
+                         max(start_pt[0], end_pt[0]),
+                         max(start_pt[1], end_pt[1]))
+        if drag.width < 0.5 and drag.height < 0.5:
+            return
+        for w in self._page_words(page_idx):
+            if drag.intersects(fitz.Rect(w[:4])):
+                self._annots.append(Annotation(
+                    type=kind, page_idx=page_idx, color=color, width=1.0,
+                    pts=[(w[0], w[1]), (w[2], w[3])], opacity=opacity,
+                ))
+
     def _commit_highlight(self, page_idx: int,
                           start_pt: tuple[float, float],
                           end_pt: tuple[float, float],
@@ -2675,7 +3318,7 @@ class PdfTab(QGraphicsView):
         drag = fitz.Rect(x0, y0, x1, y1)
         page = self._doc[page_idx]
         added = 0
-        for w in page.get_text("words"):
+        for w in self._page_words(page_idx):
             wx0, wy0, wx1, wy1, *_ = w
             wrect = fitz.Rect(wx0, wy0, wx1, wy1)
             if drag.intersects(wrect):
@@ -3039,6 +3682,7 @@ class PdfTab(QGraphicsView):
             renders them back correctly on save. PyMuPDF flag bit 0
             (TEXT_FONT_SUPERSCRIPT) is also honoured when present.
         """
+        x_pt, y_pt = self._to_unrotated(page, x_pt, y_pt)
         d = page.get_text("dict")
         for block in d.get("blocks", []):
             if block.get("type") != 0:

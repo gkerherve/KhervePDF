@@ -38,6 +38,13 @@ def main() -> int:
     themes.apply_theme(app, theme_name)
 
     win = MainWindow(theme_name=theme_name)
+    # Open a file passed on the command line / by file association
+    # *before* showing the window, so the welcome page never flashes.
+    args = [a for a in sys.argv[1:] if not a.startswith("-")]
+    if args:
+        path = Path(args[0])
+        if path.exists():
+            win.open_path(path)
     win.show()
     # Centre on the primary screen now that frameGeometry is known.
     screen = app.primaryScreen()
@@ -46,11 +53,5 @@ def main() -> int:
         fg = win.frameGeometry()
         fg.moveCenter(avail.center())
         win.move(fg.topLeft())
-
-    args = [a for a in sys.argv[1:] if not a.startswith("-")]
-    if args:
-        path = Path(args[0])
-        if path.exists():
-            win.open_path(path)
 
     return app.exec()

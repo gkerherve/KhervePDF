@@ -1787,6 +1787,21 @@ class PdfTab(QGraphicsView):
         self._render_all()
         return target
 
+    def slideshow_document(self) -> Optional[fitz.Document]:
+        """In-memory copy of the document with every annotation baked
+        in, so a slideshow shows exactly what the page view shows —
+        including edits not yet saved. The caller owns the copy and must
+        close it; this tab's own document and annotations are untouched."""
+        if self._doc is None:
+            return None
+        doc_copy = fitz.open(stream=self._doc.tobytes(), filetype="pdf")
+        try:
+            self._bake_into(doc_copy)
+        except Exception:
+            doc_copy.close()
+            raise
+        return doc_copy
+
     # ----- load PDF annotations back into self._annots -----
 
     def _load_pdf_annots(self) -> None:

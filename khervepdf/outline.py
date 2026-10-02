@@ -39,8 +39,13 @@ class OutlinePanel(QTreeWidget):
             # Most papers / reports don't carry a saved TOC. Auto-
             # detect by scanning for lines whose font size is
             # noticeably larger than the body — gives a usable jump
-            # map without the user having to add bookmarks first.
-            toc = self._auto_detect_headings(doc)
+            # map without the user having to add bookmarks first. It is
+            # a convenience only, so a failure here must never stop the
+            # document from opening.
+            try:
+                toc = self._auto_detect_headings(doc)
+            except Exception:
+                toc = []
         if not toc:
             placeholder = QTreeWidgetItem(self,
                                           ["(no table of contents)"])
@@ -125,4 +130,7 @@ class OutlinePanel(QTreeWidget):
             return []
         unique_sizes = sorted({sz for _, sz, _ in headings}, reverse=True)
         level_map = {sz: i + 1 for i, sz in enumerate(unique_sizes[:6])}
-        return [[level_map[sz], t, p + 1] for p, sz, t in headings]
+        # A document can have more than six heading sizes; the smaller
+        # ones fold into the deepest level instead of being unmapped
+        # (a plain level_map[sz] raised KeyError and aborted opening).
+        return [[level_map.get(sz, 6), t, p + 1] for p, sz, t in headings]

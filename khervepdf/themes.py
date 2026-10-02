@@ -324,6 +324,16 @@ def is_dark(theme_name: str) -> bool:
     return THEMES.get(theme_name, THEMES["Light"])["dark"] == "1"
 
 
+def icon_color(t: dict[str, str]) -> str:
+    """The one colour every toolbar / menu icon is drawn in: the theme's
+    text colour eased 25% toward its background so glyphs sit a touch
+    lighter than the labels beside them (≈ KherveCAD's #444 on Light)."""
+    fg, bg = QColor(t["text"]), QColor(t["base"])
+    mix = lambda a, b: round(a * 0.75 + b * 0.25)  # noqa: E731
+    return QColor(mix(fg.red(), bg.red()), mix(fg.green(), bg.green()),
+                  mix(fg.blue(), bg.blue())).name()
+
+
 # ------------------------------------------------------------------ #
 # QPalette builder                                                     #
 # ------------------------------------------------------------------ #

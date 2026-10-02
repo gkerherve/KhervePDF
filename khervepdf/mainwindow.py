@@ -24,10 +24,11 @@ from PySide6.QtGui import (
 from PySide6.QtPrintSupport import QPrintDialog, QPrinter, QPrintPreviewDialog
 from PySide6.QtWidgets import (
     QApplication, QButtonGroup, QCheckBox, QColorDialog, QComboBox,
-    QDialog, QDockWidget, QDoubleSpinBox, QFileDialog, QGridLayout,
+    QDialog, QDockWidget, QDoubleSpinBox, QFileDialog, QFrame, QGridLayout,
     QHBoxLayout, QInputDialog, QLabel, QMainWindow, QMenu, QMessageBox, QProgressBar,
     QProgressDialog,
-    QPushButton, QSlider, QStackedWidget, QStatusBar, QTabBar, QTabWidget,
+    QPushButton, QSlider, QSpinBox, QStackedWidget, QStatusBar, QTabBar,
+    QTabWidget,
     QToolBar,
     QToolButton, QVBoxLayout, QWidget, QWidgetAction,
 )
@@ -36,25 +37,14 @@ from . import (
     digital_sign, git_backend, icons, page_ops, themes, updater,
     version_string,
 )
+from .about_author import AuthorDialog
 from .find_bar import FindBar
 from .history_dialog import HistoryDialog
-from .icons import app_icon
-from .icons import icon as _themed_icon
-
-# Every icon built through this module is remembered by cacheKey ->
-# (name, colour) so a live theme switch can find the actions / buttons
-# carrying it and rebuild them in the new palette (QAction.icon() and
-# QAbstractButton.icon() share the QIcon data, so the key survives).
-_ICON_SPECS: dict[int, tuple[str, object]] = {}
-
-
-def icon(name: str, color=None) -> QIcon:
-    ic = _themed_icon(name, color=color)
-    _ICON_SPECS[ic.cacheKey()] = (name, color)
-    return ic
+from .icons import app_icon, icon
 from .outline import OutlinePanel
 from .pdftab import PdfTab, TOOL_DEFAULTS
 from .remote_dialog import RemoteDialog
+from .slideshow import INTERVAL_MAX, INTERVAL_MIN, SlideshowView
 from .thumbnails import ThumbnailPanel
 from .welcome import WelcomePage
 
@@ -264,10 +254,6 @@ class _OptionsPopup(QWidget):
         tab = self._mw._current_pdf_tab()
         if tab is not None:
             tab.set_tool_color(color, tool)
-        # Update the toolbar tool button icon's tint so the user can
-        # see at a glance what colour their pen / line / rect will
-        # draw with.
-        self._mw._refresh_tool_icon(tool)
         self._mark_active_color(color)
         self._mw._close_options_menu()
 
@@ -280,7 +266,6 @@ class _OptionsPopup(QWidget):
         if chosen.isValid():
             if tab is not None:
                 tab.set_tool_color(chosen.name(), tool)
-            self._mw._refresh_tool_icon(tool)
             self._mark_active_color(chosen.name())
             self._mw._close_options_menu()
 
@@ -431,9 +416,8 @@ class _DetachableTabBar(QTabBar):
 
 
 class MainWindow(QMainWindow):
-    # Drawing tools that take a colour / width / opacity popup. Their
-    # toolbar icons re-tint to the active tool colour; other tools
-    # (hand, select, note, signature, erase) keep their palette tint.
+    # Drawing tools that take a colour / width / opacity popup (shown
+    # as a dropdown arrow beside the tool button).
     OPTIONS_TOOLS = frozenset({
         "pen", "highlight", "underline", "strikeout", "line", "arrow", "rect", "ellipse",
         "text", "edit_text",
@@ -443,9 +427,9 @@ class MainWindow(QMainWindow):
         super().__init__()
         self._theme_name = theme_name
         self._theme = themes.THEMES.get(theme_name, themes.THEMES["Light"])
-        # Icons pick their light/dark palette at creation time, so the
-        # flag must be set before any toolbar/menu icon is built.
-        icons.set_dark(themes.is_dark(theme_name))
+        # Icons are monochrome in the theme's colour, picked at creation
+        # time, so it must be set before any toolbar/menu icon is built.
+        icons.set_icon_color(themes.icon_color(self._theme))
 
         self.setWindowIcon(app_icon())
         self.resize(1280, 860)
@@ -484,6 +468,13 @@ class MainWindow(QMainWindow):
         self._pending_release: updater.ReleaseInfo | None = None
 
         self._current_tool = "hand"
+        # Live slideshow (None when in normal view), whether it is the
+        # full-screen kind, the tab it is showing, and — for a windowed
+        # show — the toolbars / docks hidden to make room, to restore.
+        self._slideshow: SlideshowView | None = None
+        self._slideshow_full = False
+        self._slideshow_tab: PdfTab | None = None
+        self._slideshow_chrome: list[tuple[QWidget, bool]] = []
         # Side panel — a QTabWidget holding the page thumbnails and the
         # document outline (TOC) — lives in a dock so the user can
         # hide/move it. Built before the menus so View → Show Side
@@ -528,13 +519,10 @@ class MainWindow(QMainWindow):
         from .ai_panel import AiDock
         self._ai_dock = AiDock(self)
         self.addDockWidget(Qt.RightDockWidgetArea, self._ai_dock)
-        from PySide6.QtCore import QSettings as _QS
-        _ai_visible = _QS("kherve", "KhervePDF").value(
+        _ai_visible = QSettings("kherve", "KhervePDF").value(
             "ai/visible", "true") == "true"
         self._ai_dock.setVisible(_ai_visible)
-        self._ai_dock.visibilityChanged.connect(
-            lambda vis: _QS("kherve", "KhervePDF").setValue(
-                "ai/visible", "true" if vis else "false"))
+        self._ai_dock.visibilityChanged.connect(self._on_ai_visibility)
         self._build_menus()
         self._build_toolbar()
         self._build_statusbar()
@@ -552,6 +540,14 @@ class MainWindow(QMainWindow):
         self._updater.failed.connect(self._on_update_failed)
         QTimer.singleShot(4000, self._updater.maybe_check_automatically)
 
+    def _on_ai_visibility(self, visible: bool) -> None:
+        # A windowed slideshow hides this dock only temporarily; that
+        # must not be remembered as the user's own choice.
+        if self._slideshow is not None:
+            return
+        QSettings("kherve", "KhervePDF").setValue(
+            "ai/visible", "true" if visible else "false")
+
     # ----- welcome page -----
 
     def _show_welcome(self) -> None:
@@ -568,12 +564,14 @@ class MainWindow(QMainWindow):
         # Nothing to page through: the Pages toggle (toolbar + View
         # menu, one shared action) is disabled until a PDF is open.
         self._thumbs_dock.toggleViewAction().setEnabled(False)
+        self._set_slideshow_enabled(False)
 
     def _leave_welcome(self) -> None:
         if self._central.currentWidget() is self._welcome:
             self._central.setCurrentWidget(self._tabs)
             self._thumbs_dock.toggleViewAction().setEnabled(True)
             self._thumbs_dock.setVisible(self._thumbs_wanted)
+            self._set_slideshow_enabled(True)
 
     def is_welcome_visible(self) -> bool:
         return self._central.currentWidget() is self._welcome
@@ -738,6 +736,8 @@ class MainWindow(QMainWindow):
         toggle_ai.setIcon(icon("ai"))
         m_view.addAction(toggle_ai)
         m_view.addSeparator()
+        self._build_slideshow_menu(m_view)
+        m_view.addSeparator()
 
         m_theme = m_view.addMenu("&Theme")
         theme_group = QActionGroup(self)
@@ -809,6 +809,12 @@ class MainWindow(QMainWindow):
         m_help.addSeparator()
         m_help.addAction(QAction(icon("about"), "&About KhervePDF", self,
                                  triggered=self._about))
+        author = QAction(icon("author"), "Meet the &Author…", self,
+                         triggered=self._about_author)
+        # Without this macOS would also try to file it under the app
+        # menu next to "About KhervePDF".
+        author.setMenuRole(QAction.NoRole)
+        m_help.addAction(author)
 
     def _build_toolbar(self) -> None:
         tb = QToolBar("Main", self)
@@ -889,14 +895,9 @@ class MainWindow(QMainWindow):
                 btn = _ToolButton(self, name, self)
                 btn.setMenu(self._options_menu)
                 btn.setPopupMode(QToolButton.MenuButtonPopup)
-                # Tint the icon to the tool's stored default colour so
-                # the toolbar reads as the user's palette at a glance.
-                default_color = TOOL_DEFAULTS.get(name, {}).get("color")
-                btn.setIcon(icon(name, color=default_color)
-                            if default_color else icon(name))
             else:
                 btn = QToolButton(self)
-                btn.setIcon(icon(name))
+            btn.setIcon(icon(name))
             btn.setToolTip(tip)
             btn.setCheckable(True)
             btn.setAutoExclusive(False)  # QButtonGroup owns exclusivity
@@ -961,26 +962,13 @@ class MainWindow(QMainWindow):
         if getattr(self, "_options_menu", None) is not None:
             self._options_menu.close()
 
-    def _refresh_tool_icon(self, tool: str) -> None:
-        """Re-tint a tool button's icon to the colour currently picked
-        for that tool on the active tab. Only applies to drawing tools
-        that take a colour (OPTIONS_TOOLS) — hand / select / note /
-        signature / erase keep their semantic palette colour."""
-        if tool not in self.OPTIONS_TOOLS:
-            return
-        btn = self._tool_buttons.get(tool)
-        if btn is None:
-            return
-        tab = self._current_pdf_tab()
-        color = (tab.tool_color(tool) if tab is not None
-                 else TOOL_DEFAULTS.get(tool, {}).get("color"))
-        if color:
-            btn.setIcon(icon(tool, color=color))
-
     def _build_statusbar(self) -> None:
         sb = QStatusBar(self)
         self.setStatusBar(sb)
         self._lbl_page = QLabel("—")
+        # Wide enough for "Page 100 of 100": the slideshow rewrites it on
+        # every page turn and a label sized for "Page 1" clips the rest.
+        self._lbl_page.setMinimumWidth(110)
         self._lbl_zoom = QLabel("100%")
         self._lbl_tool = QLabel("Select")
         self._lbl_branch = QLabel("")
@@ -997,6 +985,7 @@ class MainWindow(QMainWindow):
         sb.addPermanentWidget(self._lbl_tool)
         sb.addPermanentWidget(self._lbl_zoom)
         sb.addPermanentWidget(self._lbl_branch)
+        sb.addPermanentWidget(self._build_view_switcher())
 
     def _on_render_progress(self, current: int, total: int) -> None:
         """Slot for ThumbnailPanel.rendering_progress — drives the
@@ -1011,6 +1000,258 @@ class MainWindow(QMainWindow):
         self._progress.setValue(current)
         self._progress.setVisible(True)
 
+    # ----- slideshow -----
+
+    def _slide_pref(self, key: str, default):
+        return self._settings().value(key, default)
+
+    def _slide_pref_bool(self, key: str, default: bool) -> bool:
+        v = self._settings().value(key, "true" if default else "false")
+        return str(v).lower() == "true"
+
+    def _build_slideshow_menu(self, m_view: QMenu) -> None:
+        """View → Slideshow: the three views (Normal / in this window /
+        full screen) plus the continuous-advance and loop options. The
+        same actions drive the status-bar switcher."""
+        m_show = m_view.addMenu("&Slideshow")
+        m_show.menuAction().setIcon(icon("slideshow_full"))
+        views = QActionGroup(self)
+        views.setExclusive(True)
+        self._act_normal = QAction(icon("normal_view"), "&Normal View", self,
+                                   checkable=True)
+        self._act_normal.setChecked(True)
+        self._act_normal.setToolTip("Normal view")
+        self._act_show_window = QAction(
+            icon("slideshow_window"), "Slideshow in &Window", self,
+            checkable=True, shortcut="Shift+F5")
+        self._act_show_window.setToolTip(
+            "Slideshow in this window, one page at a time (Shift+F5)")
+        self._act_show_full = QAction(
+            icon("slideshow_full"), "Slideshow &Full Screen", self,
+            checkable=True, shortcut="F5")
+        self._act_show_full.setToolTip(
+            "Slideshow full screen, one page at a time (F5)")
+        for act in (self._act_normal, self._act_show_window,
+                    self._act_show_full):
+            views.addAction(act)
+            m_show.addAction(act)
+        m_show.addSeparator()
+        self._act_continuous = QAction(
+            icon("autoplay"), "&Continuous — advance automatically", self,
+            checkable=True)
+        self._act_continuous.setToolTip(
+            "Continuous: turn the page automatically (set the seconds "
+            "beside this button)")
+        self._act_continuous.setChecked(
+            self._slide_pref_bool("slideshow/continuous", False))
+        self._act_loop = QAction(icon("loop"), "&Loop back to the first page",
+                                 self, checkable=True)
+        self._act_loop.setChecked(self._slide_pref_bool("slideshow/loop", True))
+        m_show.addAction(self._act_continuous)
+        m_show.addAction(self._act_loop)
+
+        self._act_normal.triggered.connect(lambda: self._end_slideshow())
+        self._act_show_window.triggered.connect(
+            lambda: self._toggle_slideshow(False))
+        self._act_show_full.triggered.connect(
+            lambda: self._toggle_slideshow(True))
+        self._act_continuous.toggled.connect(self._on_continuous_toggled)
+        self._act_loop.toggled.connect(self._on_loop_toggled)
+
+    def _build_view_switcher(self) -> QWidget:
+        """PowerPoint-style cluster at the bottom right of the window:
+        Normal view | Slideshow in window | Slideshow full screen, then
+        the Continuous toggle with its seconds-per-page box."""
+        box = QWidget(self)
+        lay = QHBoxLayout(box)
+        lay.setContentsMargins(6, 0, 0, 0)
+        lay.setSpacing(2)
+
+        def button(act: QAction) -> QToolButton:
+            b = QToolButton(box)
+            b.setDefaultAction(act)
+            b.setAutoRaise(True)
+            return b
+
+        for act in (self._act_normal, self._act_show_window,
+                    self._act_show_full):
+            lay.addWidget(button(act))
+        sep = QFrame(box)
+        sep.setFrameShape(QFrame.VLine)
+        sep.setFrameShadow(QFrame.Sunken)
+        lay.addWidget(sep)
+        lay.addWidget(button(self._act_continuous))
+        self._slide_interval = QSpinBox(box)
+        self._slide_interval.setRange(INTERVAL_MIN, INTERVAL_MAX)
+        self._slide_interval.setSuffix(" s")
+        self._slide_interval.setKeyboardTracking(False)
+        self._slide_interval.setFixedWidth(68)
+        self._slide_interval.setToolTip(
+            "Seconds each page stays on screen in a continuous slideshow")
+        try:
+            secs = int(self._slide_pref("slideshow/interval", 5))
+        except (TypeError, ValueError):
+            secs = 5
+        self._slide_interval.setValue(max(INTERVAL_MIN, min(INTERVAL_MAX, secs)))
+        self._slide_interval.valueChanged.connect(self._on_interval_changed)
+        lay.addWidget(self._slide_interval)
+        return box
+
+    def _set_slideshow_enabled(self, enabled: bool) -> None:
+        for act in (self._act_normal, self._act_show_window,
+                    self._act_show_full):
+            act.setEnabled(enabled)
+
+    def _sync_slideshow_ui(self) -> None:
+        """Check the action matching the current state (a click on a
+        checkable action checks it even when we then decline to act)."""
+        if self._slideshow is None:
+            act = self._act_normal
+        elif self._slideshow_full:
+            act = self._act_show_full
+        else:
+            act = self._act_show_window
+        act.setChecked(True)
+
+    def _toggle_slideshow(self, fullscreen: bool) -> None:
+        if self._slideshow is not None and self._slideshow_full == fullscreen:
+            self._end_slideshow()       # clicking the active view leaves it
+        else:
+            self._start_slideshow(fullscreen)
+
+    def _start_slideshow(self, fullscreen: bool) -> None:
+        tab = self._current_pdf_tab()
+        if tab is None or tab.page_count() == 0:
+            self.statusBar().showMessage("Open a PDF to start a slideshow.",
+                                         3000)
+            self._sync_slideshow_ui()
+            return
+        start = tab.current_page_index()
+        if self._slideshow is not None:         # switching mode: keep place
+            start = self._slideshow.current_page()
+            self._teardown_slideshow()
+        try:
+            doc = tab.slideshow_document()
+        except Exception as e:
+            QMessageBox.warning(self, "Slideshow",
+                                f"Could not prepare the slideshow:\n{e}")
+            self._sync_slideshow_ui()
+            return
+        if doc is None:
+            self._sync_slideshow_ui()
+            return
+
+        view = SlideshowView(
+            doc, start,
+            continuous=self._act_continuous.isChecked(),
+            interval_s=self._slide_interval.value(),
+            loop=self._act_loop.isChecked(),
+            fullscreen=fullscreen,
+            parent=None if fullscreen else self._central,
+        )
+        view.exit_requested.connect(self._end_slideshow)
+        view.mode_switch_requested.connect(
+            lambda: self._start_slideshow(not self._slideshow_full))
+        view.page_changed.connect(self._on_slide_page)
+        view.settings_changed.connect(self._on_slide_settings)
+        self._slideshow, self._slideshow_full = view, fullscreen
+        self._slideshow_tab = tab
+        if fullscreen:
+            screen = self.screen()
+            if screen is not None:      # land on this window's monitor
+                view.setGeometry(screen.geometry())
+            view.showFullScreen()
+        else:
+            self._hide_chrome_for_slideshow()
+            self._central.addWidget(view)
+            self._central.setCurrentWidget(view)
+        view.activateWindow()
+        view.raise_()
+        view.setFocus()
+        self._on_slide_page(view.current_page())
+        self._sync_slideshow_ui()
+
+    def _hide_chrome_for_slideshow(self) -> None:
+        """A windowed show keeps the menu bar and status bar (the view
+        switcher lives there) but gives the page the rest of the window."""
+        bars = self.findChildren(QToolBar, options=Qt.FindDirectChildrenOnly)
+        self._slideshow_chrome = []
+        for w in (*bars, self._thumbs_dock, self._ai_dock):
+            self._slideshow_chrome.append((w, not w.isHidden()))
+            w.hide()
+
+    def _teardown_slideshow(self) -> int:
+        """Take the live slideshow down and return the page it was on.
+        Doesn't touch status text or the tab's scroll position."""
+        view, full = self._slideshow, self._slideshow_full
+        self._slideshow = None      # first, so dock restores persist normally
+        page = view.current_page()
+        view.dispose()
+        if full:
+            view.hide()
+        else:
+            self._central.removeWidget(view)
+            self._central.setCurrentWidget(self._tabs)
+            for w, was_visible in self._slideshow_chrome:
+                w.setVisible(was_visible)
+            self._slideshow_chrome = []
+        view.deleteLater()
+        return page
+
+    def _end_slideshow(self) -> None:
+        if self._slideshow is None:
+            self._sync_slideshow_ui()
+            return
+        tab = self._slideshow_tab
+        page = self._teardown_slideshow()
+        self._slideshow_tab = None
+        self._sync_slideshow_ui()
+        self._refresh_status()
+        # Put the normal view where the show stopped. Deferred a tick so
+        # the restored layout has settled; the tab may be closing by then.
+        QTimer.singleShot(0, lambda: tab is not None
+                          and self._tabs.indexOf(tab) >= 0
+                          and tab.scroll_to_page(page))
+        self.activateWindow()
+        self.raise_()
+
+    def _on_slide_page(self, idx: int) -> None:
+        if self._slideshow is not None:
+            self._lbl_page.setText(
+                f"Page {idx + 1} of {self._slideshow.page_count()}")
+
+    def _on_continuous_toggled(self, on: bool) -> None:
+        self._settings().setValue("slideshow/continuous",
+                                  "true" if on else "false")
+        if self._slideshow is not None:
+            self._slideshow.set_continuous(on, emit=False)
+
+    def _on_loop_toggled(self, on: bool) -> None:
+        self._settings().setValue("slideshow/loop", "true" if on else "false")
+        if self._slideshow is not None:
+            self._slideshow.set_loop(on, emit=False)
+
+    def _on_interval_changed(self, seconds: int) -> None:
+        self._settings().setValue("slideshow/interval", seconds)
+        if self._slideshow is not None:
+            self._slideshow.set_interval(seconds, emit=False)
+
+    def _on_slide_settings(self, continuous: bool, seconds: int,
+                           loop: bool) -> None:
+        """The on-stage control bar changed a setting: mirror it into the
+        menu / status bar and remember it (without echoing back)."""
+        for widget, value in ((self._act_continuous, continuous),
+                              (self._act_loop, loop),
+                              (self._slide_interval, seconds)):
+            widget.blockSignals(True)
+            (widget.setValue if widget is self._slide_interval
+             else widget.setChecked)(value)
+            widget.blockSignals(False)
+        s = self._settings()
+        s.setValue("slideshow/continuous", "true" if continuous else "false")
+        s.setValue("slideshow/loop", "true" if loop else "false")
+        s.setValue("slideshow/interval", seconds)
+
     # ----- theming -----
 
     def _apply_theme_qss(self) -> None:
@@ -1022,26 +1263,29 @@ class MainWindow(QMainWindow):
         self._theme_name = name
         self._theme = themes.apply_theme(QApplication.instance(), name)
         self._apply_theme_qss()
-        icons.set_dark(themes.is_dark(name))
+        icons.set_icon_color(themes.icon_color(self._theme))
         self._retint_icons()
         self._welcome.set_theme(self._theme)
         QSettings("kherve", "KhervePDF").setValue("theme_name", name)
 
     def _retint_icons(self) -> None:
-        """Rebuild every menu / toolbar icon in the current palette.
-        Icons are found by the cacheKey recorded in `icon()`; drawing
-        tools tinted with the user's colour are then re-tinted."""
+        """Rebuild every menu / toolbar / panel icon in the new theme
+        colour. Icons are found by the cacheKey the icon factory
+        recorded when it built them."""
         from PySide6.QtWidgets import QAbstractButton
         targets = list(self.findChildren(QAction)) + \
             list(self.findChildren(QAbstractButton))
         targets += [self._thumbs_dock.toggleViewAction(),
                     self._ai_dock.toggleViewAction()]
+        # Look every spec up first: rebuilding clears the old registry.
+        todo = []
         for obj in targets:
-            spec = _ICON_SPECS.get(obj.icon().cacheKey())
+            spec = icons.icon_spec(obj.icon())
             if spec is not None:
-                obj.setIcon(icon(spec[0], color=spec[1]))
-        for t in self.OPTIONS_TOOLS:
-            self._refresh_tool_icon(t)
+                todo.append((obj, spec))
+        icons.forget_icon_specs()
+        for obj, (name, color) in todo:
+            obj.setIcon(icon(name, color=color))
 
     # ----- title / status -----
 
@@ -1054,6 +1298,9 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f"KhervePDF {version_string()} — {name}")
 
     def _on_tab_changed(self, _idx: int) -> None:
+        # The show is bound to the tab it started on.
+        if self._slideshow is not None:
+            self._end_slideshow()
         self._refresh_status()
         self._refresh_thumbs()
 
@@ -1224,10 +1471,6 @@ class MainWindow(QMainWindow):
         self._tabs.setCurrentWidget(tab)
         tab.set_tool(self._current_tool)
         self._push_recent(path)
-        # Refresh all tinted tool icons to match this tab's tool
-        # settings (each PdfTab keeps its own colour state).
-        for t in self.OPTIONS_TOOLS:
-            self._refresh_tool_icon(t)
         self._refresh_thumbs()
         self._refresh_status()
 
@@ -2305,6 +2548,14 @@ class MainWindow(QMainWindow):
             return
         RemoteDialog(self, t.path).exec()
 
+    def closeEvent(self, event):  # noqa: N802 — Qt override
+        if self._slideshow is not None:
+            self._teardown_slideshow()
+        super().closeEvent(event)
+
+    def _about_author(self) -> None:
+        AuthorDialog(self).exec()
+
     def _about(self) -> None:
         """Rich About dialog: app + author bio + every library the
         running app actually loads, each with a one-line description
@@ -2374,44 +2625,13 @@ class MainWindow(QMainWindow):
             f"<p style='color:#666;margin-top:0'>WYSIWYG PDF viewer &amp; "
             f"annotation editor with Git history.</p>"
             f"<hr>"
-            f"<h3>About the author</h3>"
-            f"<p><b>Gwilherm Kerherv&eacute;</b> &nbsp;—&nbsp; "
-            f"Research Associate, Department of Materials, "
-            f"<a href='https://www.imperial.ac.uk/materials/'>"
-            f"Imperial College London</a>.</p>"
-            f"<p>Works on surface analysis and X-ray Photoelectron "
-            f"Spectroscopy (XPS), with a focus on materials for energy "
-            f"storage and catalysis. Maintains a small constellation "
-            f"of open-source tools, mostly for the XPS community:</p>"
-            f"<ul>"
-            f"<li><b>KherveFitting</b> — peak fitting for XPS spectra.</li>"
-            f"<li><b>spe-xps-reader</b> — open reader for PHI "
-            f"Instruments SPE binary files.</li>"
-            f"<li><b>KherveTeX</b> — WYSIWYG LaTeX editor.</li>"
-            f"<li><b>KherveSheet</b> — Origin-style scientific "
-            f"workbook.</li>"
-            f"<li><b>KhervePlot</b> — scientific plotting &amp; "
-            f"figure preparation.</li>"
-            f"<li><b>KherveNotebook</b> — interactive notebook tying "
-            f"the Kherve* tools together.</li>"
-            f"<li><b>KherveDB</b> — reference database for the "
-            f"Kherve* suite.</li>"
-            f"<li><b>KhervePDF</b> — this app: PDF viewing &amp; "
-            f"annotation with the same look &amp; feel as the rest "
-            f"of the suite.</li>"
-            f"</ul>"
-            f"<p>KhervePDF was built to round out the trio: write "
-            f"papers in KherveTeX, crunch and plot data in "
-            f"KherveSheet, and mark up PDFs (referee reports, "
-            f"reading lists, manuscripts) in KhervePDF — all "
-            f"sharing the same themes, the same icon style, and the "
-            f"same per-document Git history.</p>"
-            f"<p>"
-            f"<a href='mailto:g.kerherve@imperial.ac.uk'>"
-            f"g.kerherve@imperial.ac.uk</a> &nbsp;·&nbsp; "
-            f"<a href='mailto:gwilherm.kerherve@gmail.com'>"
-            f"gwilherm.kerherve@gmail.com</a>"
-            f"</p>"
+            f"<p>Created by <b>Gwilherm Kerherv&eacute;</b>, Department "
+            f"of Materials, Imperial College London — part of a small "
+            f"family of open-source tools (KherveFitting, KherveTeX, "
+            f"KherveSheet, KhervePlot, KherveCAD, …) that share the same "
+            f"themes, the same icon style and, here, the same "
+            f"per-document Git history.</p>"
+            f"<p>More about the author: <i>Help → Meet the Author…</i></p>"
             f"<hr>"
             f"<h3>Libraries</h3>"
             f"<p style='color:#666;margin-bottom:6pt'>Python "
@@ -2427,7 +2647,7 @@ class MainWindow(QMainWindow):
             f"</p>"
             f"<p style='color:#888;font-size:9pt;margin-top:6pt'>"
             f"© 2026 Gwilherm Kerherv&eacute;. Released under the "
-            f"BSD 3-Clause license — see the LICENSE file."
+            f"GNU General Public License v3 — see the LICENSE file."
             f"</p>"
         )
 
@@ -2438,6 +2658,9 @@ class MainWindow(QMainWindow):
         browser.setOpenExternalLinks(True)
         browser.setHtml(html)
         buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        who = buttons.addButton("Meet the Author…",
+                                QDialogButtonBox.ActionRole)
+        who.clicked.connect(lambda: AuthorDialog(dlg).exec())
         buttons.rejected.connect(dlg.reject)
         buttons.accepted.connect(dlg.accept)
         layout = QVBoxLayout(dlg)

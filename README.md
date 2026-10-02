@@ -15,6 +15,10 @@ KherveSheet — same look, same workflow, same theme set.
 - Text search across pages.
 - 13 KherveTeX themes (Light, Dark, Nord, Dracula, Gruvbox, Monokai,
   One Dark, GitHub, Catppuccin, …).
+- Slideshow: present the PDF one whole page at a time, in the app
+  window or full screen, by hand or continuously (a page every N
+  seconds). View → Slideshow, F5 / Shift+F5, or the view buttons at
+  the bottom right of the window.
 - Per-document Git repo: auto-commit, history browser, GitHub remote.
 
 ## Stack

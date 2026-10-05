@@ -6,12 +6,11 @@ import tempfile
 import traceback
 from pathlib import Path
 
-from PySide6.QtCore import QSettings
+from PySide6.QtCore import QEvent, QObject, QSettings
 from PySide6.QtWidgets import QApplication
 
-from . import themes
+from . import single_instance, themes
 from .icons import app_icon
-from .mainwindow import MainWindow
 
 
 def _install_crash_log() -> None:
@@ -26,6 +25,21 @@ def _install_crash_log() -> None:
     sys.excepthook = _hook
 
 
+class _FileOpenFilter(QObject):
+    """macOS delivers Finder's "Open" / "Open with" on the running app
+    as a FileOpen event rather than a new process."""
+
+    def __init__(self, win):
+        super().__init__(win)
+        self._win = win
+
+    def eventFilter(self, obj, event):  # noqa: N802 — Qt override
+        if event.type() == QEvent.FileOpen and event.file():
+            self._win.open_request({"cmd": "open", "paths": [event.file()]})
+            return True
+        return False
+
+
 def main() -> int:
     _install_crash_log()
     app = QApplication(sys.argv)
@@ -37,14 +51,21 @@ def main() -> int:
     theme_name = settings.value("theme_name", "Light") or "Light"
     themes.apply_theme(app, theme_name)
 
+    paths = [str(Path(a).resolve()) for a in sys.argv[1:]
+             if not a.startswith("-") and Path(a).exists()]
+    # Already running: the PDFs open as tabs there, and this launch ends.
+    if single_instance.send_to_running({"cmd": "open", "paths": paths}):
+        return 0
+
+    from .mainwindow import MainWindow
     win = MainWindow(theme_name=theme_name)
-    # Open a file passed on the command line / by file association
+    server = single_instance.Server(app)
+    server.request.connect(win.open_request)
+    app.installEventFilter(_FileOpenFilter(win))
+    # Open files passed on the command line / by file association
     # *before* showing the window, so the welcome page never flashes.
-    args = [a for a in sys.argv[1:] if not a.startswith("-")]
-    if args:
-        path = Path(args[0])
-        if path.exists():
-            win.open_path(path)
+    for p in paths:
+        win.open_path(Path(p))
     win.show()
     # Centre on the primary screen now that frameGeometry is known.
     screen = app.primaryScreen()

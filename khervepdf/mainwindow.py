@@ -1457,6 +1457,33 @@ class MainWindow(QMainWindow):
 
     # ----- file actions (stubs — concrete logic in pdftab v0.3) -----
 
+    def open_request(self, req: dict) -> None:
+        """A PDF opened while KhervePDF was already running (see
+        single_instance.py): each one becomes a tab here, or the tab it
+        is already open in comes to the front."""
+        for p in req.get("paths", []) if req.get("cmd") == "open" else []:
+            path = Path(p)
+            if not path.exists():
+                continue
+            tab = self._tab_for(path)
+            if tab is not None:
+                self._tabs.setCurrentWidget(tab)
+            else:
+                self.open_path(path)
+        if self.isMinimized():
+            self.showNormal()
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def _tab_for(self, path: Path):
+        target = Path(path).resolve()
+        for i in range(self._tabs.count()):
+            tab_path = getattr(self._tabs.widget(i), "path", None)
+            if tab_path is not None and Path(tab_path).resolve() == target:
+                return self._tabs.widget(i)
+        return None
+
     def open_path(self, path: Path) -> None:
         # Indeterminate progress while fitz.open + the first render
         # run — these are fast for small PDFs but can take a moment

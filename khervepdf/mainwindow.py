@@ -34,8 +34,8 @@ from PySide6.QtWidgets import (
 )
 
 from . import (
-    digital_sign, git_backend, icons, page_ops, themes, updater,
-    version_string,
+    digital_sign, git_backend, icons, kherveref_link, page_ops, themes,
+    updater, version_string,
 )
 from .about_author import AuthorDialog
 from .find_bar import FindBar
@@ -757,6 +757,18 @@ class MainWindow(QMainWindow):
         m_tools.addSeparator()
         m_tools.addAction(QAction(icon("ocr"), "Recognize Text (&OCR)…",
                                   self, triggered=self._ocr))
+        m_tools.addSeparator()
+        self._act_kref_add = QAction(icon("kherveref"), "Add to &KherveRef",
+                                     self, triggered=self._add_to_kherveref)
+        self._act_kref_show = QAction(icon("kherveref_show"),
+                                      "Show in KherveRe&f", self,
+                                      triggered=self._show_in_kherveref)
+        m_tools.addAction(self._act_kref_add)
+        m_tools.addAction(self._act_kref_show)
+        m_tools.addAction(QAction("Locate KherveRef…", self,
+                                  triggered=lambda: self._locate_kherveref()))
+        m_tools.aboutToShow.connect(self._sync_kherveref_actions)
+        self._sync_kherveref_actions()
 
         m_pages = mb.addMenu("&Pages")
         m_pages.addAction(QAction(icon("page_insert"),
@@ -1725,6 +1737,87 @@ class MainWindow(QMainWindow):
                                 msg + ". The text is now selectable "
                                       "and searchable.")
         self._refresh_status()
+
+    # ----- KherveRef -----
+
+    def _sync_kherveref_actions(self) -> None:
+        has_doc = self._current_pdf_tab() is not None
+        self._act_kref_add.setEnabled(has_doc)
+        self._act_kref_show.setEnabled(has_doc)
+
+    def _pdf_for_kherveref(self) -> Optional[Path]:
+        """The current tab's file, saved first if the user wants its
+        unsaved annotations to reach KherveRef. None means cancelled."""
+        t = self._current_pdf_tab()
+        if t is None:
+            return None
+        if t.is_dirty():
+            choice = QMessageBox.question(
+                self, "KherveRef",
+                "There are unsaved annotations. Save them into the PDF "
+                "first so KherveRef gets the annotated file?",
+                QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
+                QMessageBox.Yes,
+            )
+            if choice == QMessageBox.Cancel:
+                return None
+            if choice == QMessageBox.Yes:
+                self._save()
+                if t.is_dirty():
+                    return None
+        return t.path
+
+    def _kherveref_missing(self) -> bool:
+        """Explain how to get KherveRef; True if the user located it."""
+        box = QMessageBox(
+            QMessageBox.Information, "KherveRef not found",
+            "KhervePDF could not find KherveRef, the Kherve reference "
+            "manager.<br><br>Install it (into Applications on macOS, or "
+            "with its installer on Windows), or point KhervePDF at it "
+            "with <b>Locate KherveRef…</b> (also in the Tools menu).",
+            QMessageBox.Cancel, self)
+        locate = box.addButton("Locate KherveRef…", QMessageBox.AcceptRole)
+        box.exec()
+        return box.clickedButton() is locate and self._locate_kherveref()
+
+    def _send_to_kherveref(self, send, done: str) -> None:
+        if (kherveref_link.find_kherveref() is None
+                and not self._kherveref_missing()):
+            return
+        path = self._pdf_for_kherveref()
+        if path is None:
+            return
+        if send(path):
+            self.statusBar().showMessage(f"{done} {path.name}", 4000)
+        else:
+            QMessageBox.warning(self, "KherveRef",
+                                "KherveRef could not be started.")
+
+    def _add_to_kherveref(self) -> None:
+        self._send_to_kherveref(kherveref_link.add_to_kherveref,
+                                "Sent to KherveRef:")
+
+    def _show_in_kherveref(self) -> None:
+        self._send_to_kherveref(kherveref_link.reveal_in_kherveref,
+                                "Showing in KherveRef:")
+
+    def _locate_kherveref(self) -> bool:
+        # The native macOS open panel treats a .app bundle as one file.
+        filt = ("KherveRef (*.app)" if sys.platform == "darwin"
+                else "KherveRef (KherveRef.exe KherveRef.py *.exe *.py)")
+        path_s, _ = QFileDialog.getOpenFileName(
+            self, "Locate KherveRef", "", filt + ";;All files (*)")
+        if not path_s:
+            return False
+        if kherveref_link.set_custom_path(path_s):
+            self.statusBar().showMessage(f"Using KherveRef at {path_s}", 4000)
+            return True
+        QMessageBox.warning(
+            self, "Locate KherveRef",
+            f"<b>{Path(path_s).name}</b> doesn't look like KherveRef. "
+            "Choose KherveRef.app, KherveRef.exe, or KherveRef.py in a "
+            "checkout that has its own .venv.")
+        return False
 
     def _save(self) -> None:
         t = self._current_pdf_tab()

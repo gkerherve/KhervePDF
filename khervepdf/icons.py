@@ -120,6 +120,10 @@ _GLYPHS: dict[str, str] = {
     "download": "mdi6.download",
     "recent_doc": "mdi6.file-pdf-box",
 
+    # KherveRef (reference manager) hand-off
+    "kherveref":      "mdi6.bookshelf",
+    "kherveref_show": "mdi6.book-search-outline",
+
     # Slideshow — the view switcher in the status bar and the on-stage
     # control bar.
     "normal_view":     "mdi6.page-layout-sidebar-left",
@@ -238,6 +242,10 @@ _FALLBACK_GLYPHS: dict[str, str] = {
     "update": "fa5s.sync-alt",
     "download": "fa5s.download",
     "recent_doc": "fa5s.file-pdf",
+
+    # KherveRef
+    "kherveref":      "fa5s.book",
+    "kherveref_show": "fa5s.search",
 
     # Slideshow
     "normal_view":     "fa5s.columns",

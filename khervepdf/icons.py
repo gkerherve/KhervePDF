@@ -303,6 +303,13 @@ def icon(name: str, color: QColor | str | None = None) -> QIcon:
     icon colour. Pass `color` only to force a tint where the icon sits on
     a fixed background (e.g. white on the slideshow's black stage)."""
     c = color if color is not None else DEFAULT_COLOR
+    # The main toolbar's icons are hand-drawn duotones (toolbar_icons);
+    # everything else comes from the glyph tables below.
+    from . import toolbar_icons
+    drawn = toolbar_icons.paint_icon(name, c)
+    if drawn is not None:
+        _ICON_SPECS[drawn.cacheKey()] = (name, color)
+        return drawn
     # Try the MDI glyph, then the FA5 fallback, then a generic "?" —
     # an older qtawesome raising on an unknown name must never take a
     # toolbar down with it.

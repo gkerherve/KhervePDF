@@ -41,6 +41,7 @@ from .about_author import AuthorDialog
 from .features import FeatureMixin
 from .find_bar import FindBar
 from .history_dialog import HistoryDialog
+from . import tooltips
 from .icons import app_icon, icon
 from .outline import OutlinePanel
 from .pdftab import PdfTab, TOOL_DEFAULTS
@@ -848,6 +849,7 @@ class MainWindow(FeatureMixin, QMainWindow):
         ):
             act = QAction(icon(name), tip, self, triggered=handler)
             act.setToolTip(tip)
+            tooltips.apply(act, name)
             tb.addAction(act)
         # Pages side-panel toggle — checkable, stays in sync with the
         # dock's own close button and the in-panel hide chevron, and is
@@ -855,10 +857,12 @@ class MainWindow(FeatureMixin, QMainWindow):
         pages_toggle = self._thumbs_dock.toggleViewAction()
         pages_toggle.setIcon(icon("thumbs"))
         pages_toggle.setToolTip("Show/hide the Pages side panel")
+        tooltips.apply(pages_toggle, "thumbs")
         tb.addAction(pages_toggle)
         ai_toggle = self._ai_dock.toggleViewAction()
         ai_toggle.setIcon(icon("ai"))
         ai_toggle.setToolTip("Show/hide the AI assistant panel")
+        tooltips.apply(ai_toggle, "ai")
         tb.addAction(ai_toggle)
         tb.addSeparator()
 
@@ -914,6 +918,7 @@ class MainWindow(FeatureMixin, QMainWindow):
                 btn = QToolButton(self)
             btn.setIcon(icon(name))
             btn.setToolTip(tip)
+            tooltips.apply(btn, name)
             btn.setCheckable(True)
             btn.setAutoExclusive(False)  # QButtonGroup owns exclusivity
             btn.clicked.connect(
@@ -932,6 +937,7 @@ class MainWindow(FeatureMixin, QMainWindow):
         ):
             act = QAction(icon(name), tip, self, triggered=handler)
             act.setToolTip(tip)
+            tooltips.apply(act, name)
             tb.addAction(act)
         # Zoom-level selector — typeable combobox next to the zoom
         # icons. Picks between Fit Width and a set of common
@@ -942,6 +948,7 @@ class MainWindow(FeatureMixin, QMainWindow):
         self._zoom_combo.setToolTip(
             "Zoom level — pick a preset or type a percentage"
         )
+        tooltips.apply(self._zoom_combo, "zoom_combo")
         # Show the magnifier icon as the combo's leading visual cue.
         zoom_label = QToolButton(self)
         zoom_label.setIcon(icon("zoom_in"))

@@ -832,39 +832,77 @@ class MainWindow(FeatureMixin, QMainWindow):
 
         self._build_feature_menus()
 
+    # Toolbar layout: groups in the order you work — file, navigate /
+    # select, mark up text, draw, add content, view & reading, review &
+    # AI. The Pages toggle sits at the far left (its panel docks left)
+    # and the AI toggle at the far right (its panel docks right).
+    TOOLBAR_GROUPS = (
+        ("thumbs",),
+        ("open", "save"),
+        ("undo", "redo"),
+        ("hand", "select", "select_text", "snapshot"),
+        ("highlight", "underline", "strikeout"),
+        ("pen", "line", "arrow", "rect", "ellipse", "erase"),
+        ("text", "edit_text", "move_text", "note", "image", "signature",
+         "stamp"),
+        ("zoom_out", "zoom_in", "fit_width", "zoom_combo"),
+        ("night", "read_aloud"),
+        ("compare", "ask_area", "ai"),
+    )
+
+    TOOL_TIPS = {
+        "hand": "Hand — pan the document; drag over text to select it",
+        "select": "Select — click an annotation (Delete removes it)",
+        "select_text": "Select Text — drag over text, then Ctrl+C",
+        "snapshot": "Snapshot — copy a page area as an image",
+        "pen": "Pen", "highlight": "Highlight", "underline": "Underline",
+        "strikeout": "Strikethrough", "text": "Add text",
+        "edit_text": "Edit existing text", "move_text": "Move a paragraph",
+        "line": "Line", "arrow": "Arrow", "rect": "Rectangle",
+        "ellipse": "Ellipse", "note": "Sticky Note",
+        "signature": "Signature", "erase": "Eraser",
+    }
+
     def _build_toolbar(self) -> None:
         tb = QToolBar("Main", self)
+        tb.setObjectName("MainToolbar")
         tb.setMovable(False)
         self.addToolBar(Qt.TopToolBarArea, tb)
+        items: dict[str, object] = {}
 
-        # Plain file actions + undo/redo (mirrored from the Edit menu
-        # so the user has fast keyboard-or-mouse access).
-        for name, tip, handler in (
-            ("open", "Open PDF (Ctrl+O)", self._open),
-            ("save", "Save (Ctrl+S)",     self._save),
-            ("undo", "Undo (Ctrl+Z)",     self._undo),
-            ("redo", "Redo (Ctrl+Y)",     self._redo),
-            ("image", "Insert image from file (Ctrl+V to paste)",
-             self._insert_image_from_file),
-        ):
-            act = QAction(icon(name), tip, self, triggered=handler)
-            act.setToolTip(tip)
-            tooltips.apply(act, name)
-            tb.addAction(act)
-        # Pages side-panel toggle — checkable, stays in sync with the
-        # dock's own close button and the in-panel hide chevron, and is
-        # how the user re-opens the panel after collapsing it.
+        def action(name, text, handler, **kw):
+            act = QAction(icon(name), text, self, triggered=handler, **kw)
+            items[name] = act
+            return act
+
+        action("open", "Open PDF", self._open)
+        action("save", "Save", self._save)
+        action("undo", "Undo", self._undo)
+        action("redo", "Redo", self._redo)
+        action("image", "Insert image", self._insert_image_from_file)
+        action("zoom_out", "Zoom Out", self._zoom_out)
+        action("zoom_in", "Zoom In", self._zoom_in)
+        action("fit_width", "Fit Width", self._fit_width)
+        action("compare", "Compare", self._compare_with_file)
+        action("ask_area", "Ask AI about an area",
+               lambda: self._tab_call("start_ai_region"))
+        action("stamp", "Stamp", self._add_stamp)
+
+        # Panel toggles — checkable, in sync with each dock's own close
+        # button / hide chevron, and how the user re-opens a panel.
         pages_toggle = self._thumbs_dock.toggleViewAction()
         pages_toggle.setIcon(icon("thumbs"))
-        pages_toggle.setToolTip("Show/hide the Pages side panel")
-        tooltips.apply(pages_toggle, "thumbs")
-        tb.addAction(pages_toggle)
+        items["thumbs"] = pages_toggle
         ai_toggle = self._ai_dock.toggleViewAction()
         ai_toggle.setIcon(icon("ai"))
-        ai_toggle.setToolTip("Show/hide the AI assistant panel")
-        tooltips.apply(ai_toggle, "ai")
-        tb.addAction(ai_toggle)
-        tb.addSeparator()
+        items["ai"] = ai_toggle
+
+        self._act_night_tb = action("night", "Night reading",
+                                    self._toggle_night, checkable=True)
+        self._act_night_tb.setChecked(reading.night_mode() != "Off")
+        self._act_read_tb = action("read_aloud", "Read aloud",
+                                   self._toggle_read_aloud, checkable=True)
+        self._act_read_tb.setEnabled(reading.tts_available())
 
         # Shared options popup (used by every drawing tool with a
         # dropdown). Built once and attached to multiple tool buttons.
@@ -881,35 +919,7 @@ class MainWindow(FeatureMixin, QMainWindow):
         self._tool_group = QButtonGroup(self)
         self._tool_group.setExclusive(True)
         self._tool_buttons: dict[str, QToolButton] = {}
-        tools = [
-            ("hand",      "Hand — pan the document; drag over text to "
-                          "select it (Ctrl+C copies, right-click to "
-                          "edit / delete / highlight)"),
-            ("select",    "Select — click an annotation (Delete removes "
-                          "it), or drag over text to select it (Ctrl+C "
-                          "copies, right-click to edit / delete / "
-                          "highlight)"),
-            ("select_text", "Select Text — drag over text, then Ctrl+C "
-                            "(or right-click) to copy it"),
-            ("snapshot",  "Snapshot — drag a box to copy that page area "
-                          "to the clipboard as an image"),
-            ("pen",       "Pen"),
-            ("highlight", "Highlight — swipe over text"),
-            ("underline", "Underline — swipe over text to underline it"),
-            ("strikeout", "Strikethrough — swipe over text to strike it "
-                          "through"),
-            ("text",      "Text (add new)"),
-            ("edit_text", "Edit existing text"),
-            ("move_text", "Move a paragraph — drag to reposition"),
-            ("line",      "Line"),
-            ("arrow",     "Arrow"),
-            ("rect",      "Rectangle"),
-            ("ellipse",   "Ellipse"),
-            ("note",      "Sticky Note"),
-            ("signature", "Signature"),
-            ("erase",     "Eraser — click an annotation to delete it"),
-        ]
-        for name, tip in tools:
+        for name, tip in self.TOOL_TIPS.items():
             if name in self.OPTIONS_TOOLS:
                 btn = _ToolButton(self, name, self)
                 btn.setMenu(self._options_menu)
@@ -918,7 +928,6 @@ class MainWindow(FeatureMixin, QMainWindow):
                 btn = QToolButton(self)
             btn.setIcon(icon(name))
             btn.setToolTip(tip)
-            tooltips.apply(btn, name)
             btn.setCheckable(True)
             btn.setAutoExclusive(False)  # QButtonGroup owns exclusivity
             btn.clicked.connect(
@@ -926,37 +935,14 @@ class MainWindow(FeatureMixin, QMainWindow):
             )
             self._tool_group.addButton(btn)
             self._tool_buttons[name] = btn
-            tb.addWidget(btn)
+            items[name] = btn
         self._tool_buttons["hand"].setChecked(True)
 
-        tb.addSeparator()
-        for name, tip, handler in (
-            ("zoom_out",  "Zoom Out",  self._zoom_out),
-            ("zoom_in",   "Zoom In",   self._zoom_in),
-            ("fit_width", "Fit Width", self._fit_width),
-        ):
-            act = QAction(icon(name), tip, self, triggered=handler)
-            act.setToolTip(tip)
-            tooltips.apply(act, name)
-            tb.addAction(act)
-        # Zoom-level selector — typeable combobox next to the zoom
-        # icons. Picks between Fit Width and a set of common
-        # percentages, or accepts a custom "%" entry typed in.
+        # Zoom-level selector — typeable combobox: Fit Width, common
+        # percentages, or a custom "%" typed in.
         self._zoom_combo = QComboBox(self)
         self._zoom_combo.setEditable(True)
         self._zoom_combo.setMaximumWidth(110)
-        self._zoom_combo.setToolTip(
-            "Zoom level — pick a preset or type a percentage"
-        )
-        tooltips.apply(self._zoom_combo, "zoom_combo")
-        # Show the magnifier icon as the combo's leading visual cue.
-        zoom_label = QToolButton(self)
-        zoom_label.setIcon(icon("zoom_in"))
-        zoom_label.setEnabled(False)
-        zoom_label.setStyleSheet(
-            "QToolButton { background:transparent; border:none; }"
-        )
-        tb.addWidget(zoom_label)
         for label in ("Fit Width", "50%", "75%", "100%", "125%",
                       "150%", "200%", "300%", "400%"):
             self._zoom_combo.addItem(label)
@@ -968,31 +954,18 @@ class MainWindow(FeatureMixin, QMainWindow):
         self._zoom_combo.lineEdit().returnPressed.connect(
             self._apply_zoom_combo
         )
-        tb.addWidget(self._zoom_combo)
+        items["zoom_combo"] = self._zoom_combo
 
-        # Reading and reviewing tools (their menus live in features.py).
-        tb.addSeparator()
-        self._act_night_tb = QAction(icon("night"), "Night reading", self,
-                                     checkable=True)
-        self._act_night_tb.setChecked(reading.night_mode() != "Off")
-        self._act_night_tb.triggered.connect(self._toggle_night)
-        self._act_read_tb = QAction(icon("read_aloud"), "Read aloud", self,
-                                    checkable=True)
-        self._act_read_tb.setEnabled(reading.tts_available())
-        self._act_read_tb.triggered.connect(self._toggle_read_aloud)
-        for key, act in (
-            ("night", self._act_night_tb),
-            ("read_aloud", self._act_read_tb),
-            ("compare", QAction(icon("compare"), "Compare", self,
-                                triggered=self._compare_with_file)),
-            ("ask_area", QAction(icon("ask_area"), "Ask AI about an area",
-                                 self, triggered=lambda: self._tab_call(
-                                     "start_ai_region"))),
-            ("stamp", QAction(icon("stamp"), "Stamp", self,
-                              triggered=self._add_stamp)),
-        ):
-            tooltips.apply(act, key)
-            tb.addAction(act)
+        for gi, group in enumerate(self.TOOLBAR_GROUPS):
+            if gi:
+                tb.addSeparator()
+            for name in group:
+                item = items[name]
+                tooltips.apply(item, name)
+                if isinstance(item, QAction):
+                    tb.addAction(item)
+                else:
+                    tb.addWidget(item)
 
     def _activate_tool(self, name: str) -> None:
         self._current_tool = name

@@ -1,0 +1,86 @@
+name: macOS build
+
+# Builds only: arm64 (macos-14) and x86_64 (macos-15-intel) DMGs, ad hoc signed
+# (docs/MACOS_INSTALLER_SPEC.md in khervefitting-web). Uploads them as
+# workflow artifacts and never creates a release. Trigger:
+#
+#   git tag macos-v<__version__> && git push origin macos-v<__version__>
+
+on:
+  push:
+    tags:
+      - "macos-v*"
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install create-dmg
+        run: brew install create-dmg
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller pytest
+
+      - name: Run the test suite
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m pytest tests -q
+
+      - name: Build the .app and the DMG
+        run: python packaging/build_macos.py
+
+      - name: Check the bundle
+        run: |
+          set -euo pipefail
+          VERSION=$(python -c "import re;print(re.search(r'__version__\\s*=\\s*\"([^\"]+)\"',open('khervepdf/__init__.py').read()).group(1))")
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          case "$GITHUB_REF_NAME" in macos-v*) test "macos-v$VERSION" = "$GITHUB_REF_NAME" ;; esac
+          APP=dist/KhervePDF.app
+          test -x "$APP/Contents/MacOS/KhervePDF"
+          plutil -p "$APP/Contents/Info.plist" | grep -E 'CFBundleIdentifier|CFBundleShortVersionString'
+          codesign --verify --deep --strict "$APP"
+          file -b "$APP/Contents/MacOS/KhervePDF" | grep -q '${{ matrix.arch }}'
+
+      - name: Smoke-test the frozen app
+        run: python packaging/smoke_test.py dist/KhervePDF.app/Contents/MacOS/KhervePDF
+
+      - name: Upload the app log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-log-macOS-${{ matrix.arch }}
+          path: ${{ runner.temp }}/khervepdf-smoke.log
+          if-no-files-found: ignore
+
+      - name: Upload the DMG
+        uses: actions/upload-artifact@v4
+        with:
+          name: KhervePDF-${{ env.VERSION }}-macOS-${{ matrix.arch }}
+          path: |
+            dist/KhervePDF-*macOS-${{ matrix.arch }}.dmg
+            dist/KhervePDF-*macOS-${{ matrix.arch }}.dmg.sha256
+            dist/KhervePDF-macOS-${{ matrix.arch }}.json
+          if-no-files-found: error

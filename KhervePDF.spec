@@ -38,8 +38,10 @@ ROOT = Path(SPECPATH)
 # sizes (16..256) into a multi-resolution ICO under build/. The
 # resulting file is referenced by the EXE() block below and by
 # KhervePDF_setup.iss's SetupIconFile.
-ICON_PATH = ROOT / "build" / "KhervePDF.ico"
-if not ICON_PATH.exists():
+IS_MAC = sys.platform == "darwin"
+ICON_PATH = ROOT / "build" / ("KhervePDF.icns" if IS_MAC else "KhervePDF.ico")
+# On macOS packaging/build_macos.py writes the .icns before freezing.
+if not IS_MAC and not ICON_PATH.exists():
     import subprocess as _sp
     _sp.run(
         [sys.executable, str(ROOT / "tools" / "generate_icon.py"),
@@ -85,6 +87,12 @@ _packages = [
     ("uritools", False),
     ("requests", False),
 ]
+# On macOS collect_all("PySide6") drags in every Qt framework (WebEngine,
+# Quick, Designer .app bundles) — 430 MB, and nested .app bundles that
+# break codesign. PyInstaller's own PySide6 hooks collect exactly the
+# modules the app imports, so rely on them there.
+if IS_MAC:
+    _packages = [p for p in _packages if p[0] != "PySide6"]
 for pkg, sweep_submodules in _packages:
     d, b, h = _bundle(pkg)
     datas += d
@@ -265,7 +273,7 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=not IS_MAC,              # UPX corrupts Mach-O signatures
     console=False,                  # GUI app
     disable_windowed_traceback=False,
     argv_emulation=False,
@@ -287,7 +295,43 @@ coll = COLLECT(
     a.zipfiles,
     a.datas,
     strip=False,
-    upx=True,
+    upx=not IS_MAC,
     upx_exclude=[],
     name="KhervePDF",
 )
+
+
+# ---- BUNDLE (macOS) --------------------------------------------------
+
+if IS_MAC:
+    import re as _re
+    _ver = _re.search(r'__version__\s*=\s*"([^"]+)"',
+                      (ROOT / "khervepdf" / "__init__.py").read_text()).group(1)
+    try:
+        import subprocess as _sp
+        _build = _sp.run(["git", "rev-list", "--count", "HEAD"], cwd=ROOT,
+                         capture_output=True, text=True, check=True).stdout.strip()
+    except Exception:
+        _build = _ver
+    app = BUNDLE(
+        coll,
+        name="KhervePDF.app",
+        icon=str(ICON_PATH),
+        bundle_identifier="com.kerherve.khervepdf",
+        info_plist={
+            "CFBundleName": "KhervePDF",
+            "CFBundleDisplayName": "KhervePDF",
+            "CFBundleShortVersionString": _ver,
+            "CFBundleVersion": _build,
+            "LSMinimumSystemVersion": "11.0",
+            "NSHighResolutionCapable": True,
+            "LSApplicationCategoryType": "public.app-category.productivity",
+            "NSHumanReadableCopyright": "\u00a9 2026 Gwilherm Kerherve",
+            "CFBundleDocumentTypes": [{
+                "CFBundleTypeName": "PDF document",
+                "CFBundleTypeRole": "Editor",
+                "LSHandlerRank": "Alternate",
+                "LSItemContentTypes": ["com.adobe.pdf"],
+            }],
+        },
+    )

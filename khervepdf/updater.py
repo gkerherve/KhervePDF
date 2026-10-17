@@ -58,21 +58,47 @@ class ReleaseInfo:
     download_url: str  # platform asset if one matches, else page_url
 
 
-def _pick_asset(assets: list[dict], page_url: str) -> str:
-    """Choose the release asset for this platform: the Windows
-    installer ``.exe`` or the macOS ``.dmg``. Anything else (Linux, or
-    no matching asset) falls back to the release page."""
-    if sys.platform.startswith("win"):
-        wanted = (".exe", ".msi")
-    elif sys.platform == "darwin":
-        wanted = (".dmg", ".pkg")
+def mac_arch() -> str:
+    """``arm64`` or ``x86_64`` — the DMG this Mac should get. An x86_64
+    build running under Rosetta on Apple Silicon gets the arm64 one."""
+    import platform
+    import subprocess
+    machine = platform.machine()
+    if machine == "x86_64":
+        try:
+            out = subprocess.run(["sysctl", "-n", "sysctl.proc_translated"],
+                                 capture_output=True, text=True, timeout=2).stdout
+            if out.strip() == "1":
+                return "arm64"
+        except Exception:
+            pass
+    return "arm64" if machine == "arm64" else "x86_64"
+
+
+def _pick_asset(assets: list[dict], page_url: str,
+                platform: str | None = None, arch: str | None = None) -> str:
+    """Choose the release asset for this platform: the Windows installer
+    (``KhervePDF-Setup.exe`` first) or the macOS DMG for this Mac's
+    architecture (``KhervePDF-macOS-<arch>.dmg``). Anything else (Linux,
+    or no matching asset) falls back to the release page."""
+    platform = platform or sys.platform
+    by_name = {str(a.get("name", "")).lower(): a.get("browser_download_url")
+               for a in assets or [] if a.get("browser_download_url")}
+    if platform.startswith("win"):
+        preferred = ["khervepdf-setup.exe"]
+        suffixes = (".exe", ".msi")
+    elif platform == "darwin":
+        arch = arch or mac_arch()
+        preferred = [f"khervepdf-macos-{arch}.dmg"]
+        suffixes = (f"-macos-{arch}.dmg",)
     else:
         return page_url
-    for suffix in wanted:
-        for a in assets or []:
-            name = str(a.get("name", "")).lower()
-            url = a.get("browser_download_url")
-            if url and name.endswith(suffix):
+    for name in preferred:
+        if by_name.get(name):
+            return str(by_name[name])
+    for suffix in suffixes:
+        for name, url in by_name.items():
+            if name.endswith(suffix):
                 return str(url)
     return page_url
 

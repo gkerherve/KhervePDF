@@ -17,7 +17,10 @@
 #define MyAppName        "KhervePDF"
 #define MyAppPublisher   "Gwilherm Kerherve"
 #define MyAppExeName     "KhervePDF.exe"
-#define MyAppVersion     "0.66"
+; The build passes the real version: ISCC /DMyAppVersion=<__version__>
+#ifndef MyAppVersion
+  #define MyAppVersion   "0.0"
+#endif
 
 [Setup]
 ; Globally-unique app ID — keeps the uninstaller info tidy and lets

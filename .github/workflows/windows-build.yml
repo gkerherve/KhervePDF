@@ -1,0 +1,88 @@
+name: Windows build
+
+# Builds only: PyInstaller one-folder + portable zip + Inno installer.
+# Uploads a workflow artifact and never creates a release (that is done by
+# hand after the build is checked). Trigger: push a tag on dev,
+#
+#   git tag v<__version__> && git push origin v<__version__>
+#
+# (`v*` does not match `macos-v*`: tag patterns are anchored at the start.)
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller pytest
+
+      - name: Install Inno Setup
+        run: |
+          if (-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) {
+            choco install innosetup -y --no-progress
+          }
+
+      - name: Run the test suite
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m pytest tests -q
+
+      - name: Build the installer and portable zip
+        run: python packaging/build_installer.py
+
+      - name: Check the build
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION=$(python -c "import re;print(re.search(r'__version__\s*=\s*\"([^\"]+)\"',open('khervepdf/__init__.py').read()).group(1))")
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          case "$GITHUB_REF_NAME" in v*) test "v$VERSION" = "$GITHUB_REF_NAME" ;; esac
+          test -f dist/KhervePDF/KhervePDF.exe
+          ls -lh "dist/Setup_KhervePDF_$VERSION.exe" "dist/KhervePDF_$VERSION.zip" dist/KhervePDF-Setup.exe
+          python -c "import zipfile,sys; n=zipfile.ZipFile(sys.argv[1]).namelist(); assert n and all(x.startswith('KhervePDF/') for x in n); assert 'KhervePDF/KhervePDF.exe' in n" "dist/KhervePDF_$VERSION.zip"
+
+      - name: Smoke-test the frozen app
+        run: python packaging/smoke_test.py dist/KhervePDF/KhervePDF.exe
+
+      - name: Install silently, smoke-test the installed app, uninstall
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP "KhervePDF-installed"
+          $log = Join-Path $env:RUNNER_TEMP "install.log"
+          $p = Start-Process -FilePath "dist\Setup_KhervePDF_$env:VERSION.exe" `
+            -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART","/CURRENTUSER","/DIR=$dir","/LOG=$log" `
+            -Wait -PassThru
+          if ($p.ExitCode -ne 0) { Get-Content $log -Tail 40; throw "installer exited $($p.ExitCode)" }
+          python packaging/smoke_test.py "$dir\KhervePDF.exe"
+          if ($LASTEXITCODE -ne 0) { throw "smoke test of the installed app failed" }
+          Start-Process -FilePath "$dir\unins000.exe" -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART" -Wait
+          Write-Host "install / run / uninstall OK"
+
+      - name: Upload the installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: KhervePDF-${{ env.VERSION }}-windows
+          path: |
+            dist/Setup_KhervePDF_*.exe
+            dist/KhervePDF-Setup.exe
+            dist/KhervePDF_*.zip
+          if-no-files-found: error

@@ -38,6 +38,7 @@ from . import (
     updater, version_string,
 )
 from .about_author import AuthorDialog
+from .features import FeatureMixin
 from .find_bar import FindBar
 from .history_dialog import HistoryDialog
 from .icons import app_icon, icon
@@ -415,7 +416,7 @@ class _DetachableTabBar(QTabBar):
             mw._close_tab(idx)
 
 
-class MainWindow(QMainWindow):
+class MainWindow(FeatureMixin, QMainWindow):
     # Drawing tools that take a colour / width / opacity popup (shown
     # as a dropdown arrow beside the tool button).
     OPTIONS_TOOLS = frozenset({
@@ -799,7 +800,7 @@ class MainWindow(QMainWindow):
                                   "&Watermark every page…", self,
                                   triggered=self._add_watermark))
         m_pages.addAction(QAction(icon("text"),
-                                  "&Number every page…", self,
+                                  "&Number / Bates every page…", self,
                                   triggered=self._add_page_numbers))
 
         m_git = mb.addMenu("&Git")
@@ -827,6 +828,8 @@ class MainWindow(QMainWindow):
         # menu next to "About KhervePDF".
         author.setMenuRole(QAction.NoRole)
         m_help.addAction(author)
+
+        self._build_feature_menus()
 
     def _build_toolbar(self) -> None:
         tb = QToolBar("Main", self)
@@ -1445,6 +1448,8 @@ class MainWindow(QMainWindow):
         if idx < 0:
             return
         w = self._tabs.widget(idx)
+        self._save_position(w)
+        self._stop_reading_if(w)
         self._tabs.removeTab(idx)
         if isinstance(w, PdfTab):
             w.close_doc()
@@ -1509,6 +1514,7 @@ class MainWindow(QMainWindow):
         self._leave_welcome()
         self._tabs.setCurrentWidget(tab)
         tab.set_tool(self._current_tool)
+        self._restore_position(tab)
         self._push_recent(path)
         self._refresh_thumbs()
         self._refresh_status()
@@ -2037,33 +2043,6 @@ class MainWindow(QMainWindow):
         t._render_all()
         self.statusBar().showMessage(
             f"Watermarked {t._doc.page_count} page(s)", 4000,
-        )
-
-    def _add_page_numbers(self) -> None:
-        """Stamp "N / total" at the bottom-centre of every page."""
-        t = self._current_pdf_tab()
-        if t is None or t._doc is None:
-            return
-        import fitz as _fitz
-        t._push_undo(include_doc=True)
-        total = t._doc.page_count
-        for i in range(total):
-            page = t._doc[i]
-            r = page.rect
-            txt = f"{i + 1} / {total}"
-            try:
-                tw = _fitz.get_text_length(txt, fontsize=10,
-                                            fontname="helv")
-                page.insert_text(
-                    (r.x0 + (r.width - tw) / 2, r.y1 - 24),
-                    txt, fontsize=10, fontname="helv",
-                    color=(0.2, 0.2, 0.2),
-                )
-            except Exception:
-                continue
-        t._render_all()
-        self.statusBar().showMessage(
-            f"Numbered {total} page(s)", 4000,
         )
 
     def _digitally_sign(self) -> None:
@@ -2669,6 +2648,8 @@ class MainWindow(QMainWindow):
         RemoteDialog(self, t.path).exec()
 
     def closeEvent(self, event):  # noqa: N802 — Qt override
+        self._save_all_positions()
+        self._read_aloud_stop()
         if self._slideshow is not None:
             self._teardown_slideshow()
         super().closeEvent(event)

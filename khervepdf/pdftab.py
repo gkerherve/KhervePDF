@@ -40,6 +40,7 @@ from PySide6.QtWidgets import (
     QToolBar, QToolButton, QVBoxLayout, QWidget,
 )
 
+from . import doc_tools, reading
 from .icons import icon
 
 
@@ -948,6 +949,14 @@ class PdfTab(QGraphicsView):
         self._preview_item: Optional[QGraphicsItem] = None
         self._stroke_path: Optional[QPainterPath] = None
         self._stroke_pts_page: list[tuple[float, float]] = []
+        # Numbered reference list parsed from the bibliography (lazily,
+        # for citation hover popups); None = not parsed yet.
+        self._refs_cache: Optional[dict] = None
+        self._cite_tip_key = None
+        # "ai": the next Snapshot drag goes to the AI assistant instead
+        # of the clipboard, then the previous tool comes back.
+        self._snapshot_target: Optional[str] = None
+        self._tool_before_snapshot: Optional[str] = None
 
         self._scene = QGraphicsScene(self)
         self.setScene(self._scene)
@@ -1052,6 +1061,7 @@ class PdfTab(QGraphicsView):
                 QImage.Format_RGB888,
             ).copy()
             img.setDevicePixelRatio(dpr)
+            img = reading.apply_night(img)
             pm = QPixmap.fromImage(img)
             item = QGraphicsPixmapItem(pm)
             item.setTransformationMode(Qt.SmoothTransformation)
@@ -1073,7 +1083,85 @@ class PdfTab(QGraphicsView):
             y += h_logical + PAGE_GAP
             max_w = max(max_w, w_logical)
         self._scene.setSceneRect(QRectF(0, 0, max_w, max(0.0, y - PAGE_GAP)))
+        self._draw_form_fields()
         self._replay_annots()
+
+    # ----- form fields -----
+
+    def _widget_rect_scene(self, page_idx: int, rect) -> QRectF:
+        page = self._doc[page_idx]
+        r = fitz.Rect(rect)
+        if page.rotation:
+            r = r * page.rotation_matrix
+        return QRectF(self._page_to_scene(page_idx, r.x0, r.y0),
+                      self._page_to_scene(page_idx, r.x1, r.y1)).normalized()
+
+    def _draw_form_fields(self) -> None:
+        """Pages are rendered without annotations (we draw our own), which
+        also hides AcroForm widgets — draw each field's box and value."""
+        from PySide6.QtWidgets import QGraphicsSimpleTextItem
+        for page in self._doc:
+            if page.first_widget is None:
+                continue
+            for w in page.widgets():
+                r = self._widget_rect_scene(page.number, w.rect)
+                box = QGraphicsRectItem(r)
+                box.setPen(QPen(QColor(25, 118, 210, 150), 1))
+                box.setBrush(QBrush(QColor(25, 118, 210, 28)))
+                box.setZValue(5)
+                box.setToolTip(f"{w.field_name} — double-click to fill in")
+                self._scene.addItem(box)
+                val = w.field_value
+                if w.field_type in (fitz.PDF_WIDGET_TYPE_CHECKBOX,
+                                    fitz.PDF_WIDGET_TYPE_RADIOBUTTON):
+                    val = "✓" if val not in (None, "", "Off", False) else ""
+                if not val:
+                    continue
+                t = QGraphicsSimpleTextItem(str(val))
+                f = t.font()
+                f.setPixelSize(max(6, int(r.height() * 0.62)))
+                t.setFont(f)
+                t.setPos(r.x() + 2, r.y() + (r.height() - t.boundingRect().height()) / 2)
+                t.setZValue(6)
+                self._scene.addItem(t)
+
+    def field_at(self, page_idx: int, px: float, py: float):
+        if self._doc is None:
+            return None
+        page = self._doc[page_idx]
+        pt = fitz.Point(px, py)
+        if page.rotation:
+            pt = pt * page.derotation_matrix
+        for w in page.widgets() or []:
+            if fitz.Rect(w.rect).contains(pt):
+                return w
+        return None
+
+    def edit_field_at(self, page_idx: int, px: float, py: float) -> bool:
+        w = self.field_at(page_idx, px, py)
+        if w is None:
+            return False
+        name = w.field_name or "Field"
+        if w.field_type in (fitz.PDF_WIDGET_TYPE_CHECKBOX,
+                            fitz.PDF_WIDGET_TYPE_RADIOBUTTON):
+            value = w.field_value in (None, "", "Off", False)
+        elif w.choice_values:
+            opts = [str(o if not isinstance(o, (list, tuple)) else o[-1])
+                    for o in w.choice_values]
+            cur = opts.index(w.field_value) if w.field_value in opts else 0
+            value, ok = QInputDialog.getItem(self, "Fill in field", name,
+                                             opts, cur, False)
+            if not ok:
+                return True
+        else:
+            value, ok = QInputDialog.getText(self, "Fill in field", name,
+                                             text=str(w.field_value or ""))
+            if not ok:
+                return True
+        self._push_undo(include_doc=True)
+        doc_tools.set_field_value(self._doc, page_idx, w.xref, value)
+        self._render_all()
+        return True
 
     def _replay_annots(self) -> None:
         for i, a in enumerate(self._annots):
@@ -1328,11 +1416,26 @@ class PdfTab(QGraphicsView):
         """Snapshot tool / Copy as Image: render a page area (with the
         user's annotations baked in, as seen on screen) to the
         clipboard."""
-        if self._doc is None:
+        img = self.region_image(page_idx, rect, dpi)
+        if img is None:
             return False
+        from PySide6.QtWidgets import QApplication
+        QApplication.clipboard().setImage(img)
+        win = self.window()
+        if hasattr(win, "statusBar"):
+            win.statusBar().showMessage(
+                "Copied area to the clipboard as an image — Ctrl+V to paste",
+                4000)
+        return True
+
+    def region_image(self, page_idx: int, rect: fitz.Rect,
+                     dpi: int = 200) -> Optional[QImage]:
+        """A page area rendered as on screen (annotations baked in)."""
+        if self._doc is None:
+            return None
         rect = fitz.Rect(rect) & self._doc[page_idx].rect
         if rect.is_empty or rect.width < 2 or rect.height < 2:
-            return False
+            return None
         # Bake this page's annotations into a throwaway one-page copy
         # so the snapshot matches what's on screen.
         tmp = fitz.open()
@@ -1348,16 +1451,125 @@ class PdfTab(QGraphicsView):
             self._annots = keep
         pix = tmp[0].get_pixmap(clip=rect, dpi=dpi, annots=True)
         tmp.close()
-        img = QImage(pix.samples, pix.width, pix.height, pix.stride,
-                     QImage.Format_RGB888).copy()
-        from PySide6.QtWidgets import QApplication
-        QApplication.clipboard().setImage(img)
+        return QImage(pix.samples, pix.width, pix.height, pix.stride,
+                      QImage.Format_RGB888).copy()
+
+    # ----- AI region / citations / reading position -----
+
+    def start_ai_region(self) -> None:
+        """Arm a one-shot Snapshot drag whose picture goes to the AI
+        assistant."""
+        if self._tool != "snapshot":
+            self._tool_before_snapshot = self._tool
+        self._snapshot_target = "ai"
+        self.set_tool("snapshot")
+
+    def _send_region_to_ai(self, page_idx: int, rect: fitz.Rect) -> None:
+        self._snapshot_target = None
+        img = self.region_image(page_idx, rect, dpi=160)
+        try:
+            region_text = self._doc[page_idx].get_text(
+                "text", clip=rect).strip() if self._doc else ""
+        except Exception:
+            region_text = ""
+        prev = self._tool_before_snapshot
+        self._tool_before_snapshot = None
         win = self.window()
-        if hasattr(win, "statusBar"):
-            win.statusBar().showMessage(
-                "Copied area to the clipboard as an image — Ctrl+V to paste",
-                4000)
-        return True
+        if prev and hasattr(win, "_activate_tool"):
+            QTimer.singleShot(0, lambda: win._activate_tool(prev))
+        if img is not None and hasattr(win, "ask_ai_about_region"):
+            win.ask_ai_about_region(img, page_idx, region_text)
+
+    def references(self) -> dict:
+        if self._refs_cache is None:
+            try:
+                self._refs_cache = (doc_tools.reference_list(self._doc)
+                                    if self._doc else {})
+            except Exception:
+                self._refs_cache = {}
+        return self._refs_cache
+
+    def citation_text(self, page_idx: int, px: float,
+                      py: float) -> Optional[str]:
+        """The reference behind a citation at a page point: an internal
+        link's destination text, else a "[n]" marker looked up in the
+        parsed reference list."""
+        if self._doc is None:
+            return None
+        page = self._doc[page_idx]
+        pt = fitz.Point(px, py)
+        if page.rotation:
+            pt = pt * page.derotation_matrix
+        for link in page.get_links():
+            if fitz.Rect(link["from"]).contains(pt) and link.get("kind") in (
+                    fitz.LINK_GOTO, fitz.LINK_NAMED):
+                txt = doc_tools.link_target_text(self._doc, link)
+                if txt:
+                    return txt
+        idx = self._word_hit(page_idx, px, py)
+        if idx is None:
+            return None
+        words = self._page_words(page_idx)
+        # A citation can be split over several words: "[3," "5]".
+        lo, hi = idx, idx
+        while lo > 0 and "[" not in words[lo][4] and idx - lo < 4:
+            lo -= 1
+        while hi < len(words) - 1 and "]" not in words[hi][4] and hi - idx < 4:
+            hi += 1
+        nums = doc_tools.parse_citation(
+            " ".join(w[4] for w in words[lo:hi + 1]))
+        refs = self.references() if nums else {}
+        found = [f"[{n}] {refs[n]['text']}" for n in nums if n in refs]
+        return "\n\n".join(found[:6]) if found else None
+
+    def _maybe_show_citation(self, mapped, event) -> None:
+        from PySide6.QtWidgets import QToolTip
+        if mapped is None:
+            if self._cite_tip_key is not None:
+                QToolTip.hideText()
+                self._cite_tip_key = None
+            return
+        try:
+            txt = self.citation_text(*mapped)
+        except Exception:
+            txt = None
+        if not txt:
+            if self._cite_tip_key is not None:
+                QToolTip.hideText()
+                self._cite_tip_key = None
+            return
+        if txt == self._cite_tip_key:
+            return
+        self._cite_tip_key = txt
+        html = "<div style='max-width:420px'>" + html_mod.escape(
+            txt).replace("\n\n", "<br><br>") + "</div>"
+        QToolTip.showText(event.globalPosition().toPoint(), html,
+                          self.viewport())
+
+    def reading_position(self) -> tuple[int, float]:
+        """(page, fraction down that page) at the top of the view."""
+        page = self.current_page_index()
+        lay = self._page_layout.get(page)
+        if not lay:
+            return page, 0.0
+        top = self.mapToScene(self.viewport().rect().topLeft()).y()
+        frac = (top - lay["y_origin"]) / max(1.0, lay["h_px"])
+        return page, max(0.0, min(1.0, frac))
+
+    def restore_position(self, pos: dict) -> None:
+        if self._doc is None:
+            return
+        if not pos.get("fit", True):
+            self._auto_fit_width = False
+            self._set_zoom(pos.get("zoom", self._zoom))
+        page = max(0, min(int(pos.get("page", 0)), self.page_count() - 1))
+        lay = self._page_layout.get(page)
+        if not lay:
+            return
+        y = lay["y_origin"] + pos.get("frac", 0.0) * lay["h_px"]
+        self.verticalScrollBar().setValue(int(
+            self.mapFromScene(QPointF(0, y)).y()
+            + self.verticalScrollBar().value()))
 
     def mark_selection(self, kind: str) -> bool:
         """Underline / strike out the selected words."""
@@ -1738,6 +1950,7 @@ class PdfTab(QGraphicsView):
             if self._doc is not None:
                 self._doc.close()
             self._doc = fitz.open(stream=doc_bytes, filetype="pdf")
+            self._refs_cache = None
         self._render_all()
 
     # ----- save -----
@@ -2798,6 +3011,9 @@ class PdfTab(QGraphicsView):
                 and self._tool in ("hand", "select", "select_text"):
             mapped = self._scene_to_page(
                 self.mapToScene(event.position().toPoint()))
+            if mapped is not None and self.edit_field_at(*mapped):
+                event.accept()
+                return
             if mapped is not None:
                 i = self._word_hit(*mapped)
                 if i is not None:
@@ -2818,6 +3034,7 @@ class PdfTab(QGraphicsView):
             over_text = mapped is not None and self._word_hit(*mapped) is not None
             default = Qt.OpenHandCursor if self._tool == "hand" else Qt.ArrowCursor
             self.viewport().setCursor(Qt.IBeamCursor if over_text else default)
+            self._maybe_show_citation(mapped, event)
         if self._text_sel_anchor is not None \
                 and self._tool in ("hand", "select", "select_text"):
             pos = event.position().toPoint()
@@ -3082,9 +3299,13 @@ class PdfTab(QGraphicsView):
             self._commit_text_mark(self._tool, page, start_pt, end_pt,
                                    color, opacity)
         elif self._tool == "snapshot":
-            self.copy_region_as_image(page, fitz.Rect(
+            region = fitz.Rect(
                 min(start_pt[0], end_pt[0]), min(start_pt[1], end_pt[1]),
-                max(start_pt[0], end_pt[0]), max(start_pt[1], end_pt[1])))
+                max(start_pt[0], end_pt[0]), max(start_pt[1], end_pt[1]))
+            if self._snapshot_target == "ai":
+                self._send_region_to_ai(page, region)
+            else:
+                self.copy_region_as_image(page, region)
         elif self._tool == "signature":
             self._commit_signature(page, start_pt, end_pt)
         elif self._tool in ("line", "arrow", "rect", "ellipse"):

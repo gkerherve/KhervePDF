@@ -169,6 +169,22 @@ def restore_to_commit(pdf_path: Path, sha: str) -> bool:
         return False
 
 
+def file_bytes_at(pdf_path: Path, sha: str) -> Optional[bytes]:
+    """The PDF's bytes as committed at `sha` (None if unavailable)."""
+    if not _OK:
+        return None
+    repo = _repo_for(pdf_path)
+    if repo is None:
+        return None
+    rel = _rel_path(repo, pdf_path)
+    if rel is None:
+        return None
+    try:
+        return bytes(repo.revparse_single(sha).tree[rel].data)
+    except Exception:
+        return None
+
+
 def current_branch(pdf_path: Path) -> Optional[str]:
     if not _OK:
         return None

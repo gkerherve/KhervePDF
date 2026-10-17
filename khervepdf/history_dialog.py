@@ -44,6 +44,12 @@ class HistoryDialog(QDialog):
         self._restore_btn = QPushButton("Restore to selected", self)
         self._restore_btn.clicked.connect(self._restore_selected)
         actions.addWidget(self._restore_btn)
+        self._compare_btn = QPushButton("Compare with current…", self)
+        self._compare_btn.setToolTip("Show the selected commit next to the "
+                                     "open document with the text "
+                                     "differences highlighted")
+        self._compare_btn.clicked.connect(self._compare_selected)
+        actions.addWidget(self._compare_btn)
         actions.addStretch(1)
         layout.addLayout(actions)
 
@@ -69,6 +75,12 @@ class HistoryDialog(QDialog):
 
     def _on_double(self, item: QTreeWidgetItem, _col: int) -> None:
         self._restore_selected()
+
+    def _compare_selected(self) -> None:
+        item = self._tree.currentItem()
+        sha = item.data(0, Qt.UserRole) if item is not None else None
+        if sha and hasattr(self.parent(), "compare_with_commit"):
+            self.parent().compare_with_commit(self._path, sha)
 
     def _restore_selected(self) -> None:
         item = self._tree.currentItem()

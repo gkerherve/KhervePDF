@@ -28,6 +28,32 @@ _SETTINGS = ("kherve", "KhervePDF")
 #: How much page text goes into the system prompt. Full articles blow
 #: past small local models' context windows; one page rarely does.
 _MAX_PAGE_CHARS = 8000
+#: Whole-document presets ("summarise this paper") send every page,
+#: tagged with its number, up to this many characters.
+_MAX_DOC_CHARS = 60000
+
+#: (menu label, prompt, needs the whole document)
+PRESETS = (
+    ("Summarise this paper",
+     "Summarise this document in a short paragraph, then list its key "
+     "points as bullets. Cite the page for each point as (p. N).", True),
+    ("List the methods",
+     "List the methods, materials, instruments and techniques used in "
+     "this document, each with a one-line description and its page "
+     "(p. N).", True),
+    ("Key findings and numbers",
+     "List the main findings with the key numerical results (values, "
+     "units, uncertainties) and the page each comes from (p. N).", True),
+    ("Limitations and open questions",
+     "What limitations, assumptions and open questions does this "
+     "document state or imply? Cite pages (p. N).", True),
+    ("Explain this page simply",
+     "Explain the current page in plain language for a non-specialist.",
+     False),
+    ("Explain the selected passage",
+     "Explain the selected passage: what it says, the terms it uses, "
+     "and how it fits the rest of the document.", False),
+)
 
 SYSTEM_PROMPT = (
     "You are a research assistant inside KhervePDF, a PDF viewer and "
@@ -223,6 +249,7 @@ class AiDock(QDockWidget):
         self._hist_index = None
         self._draft = ""
         self._settings = QSettings(*_SETTINGS)
+        self._full_doc = False
         self._font_pt = int(self._settings.value("ai/fontpt", 10))
 
         body = QWidget()
@@ -240,6 +267,20 @@ class AiDock(QDockWidget):
                                       lambda: self._change_font(-1))
         self.larger_btn = self._tool("A+", "Larger text",
                                      lambda: self._change_font(1))
+        self.presets_btn = self._tool("Ask ▾", "Ready-made questions — "
+                                      "summary, methods, findings…",
+                                      lambda: None)
+        from PySide6.QtWidgets import QMenu
+        presets_menu = QMenu(self.presets_btn)
+        for label, prompt, full in PRESETS:
+            presets_menu.addAction(
+                label, lambda p=prompt, f=full: self.ask(p, full_doc=f))
+        presets_menu.addSeparator()
+        presets_menu.addAction(
+            "Ask about an area of the page…",
+            lambda: self._mw._tab_call("start_ai_region"))
+        self.presets_btn.setMenu(presets_menu)
+        self.presets_btn.setPopupMode(QToolButton.InstantPopup)
         self.help_btn = self._tool(None, "Help", self._show_help, "help")
         self.settings_btn = self._tool(None, "AI Chat settings",
                                        self._open_settings, "settings")
@@ -250,7 +291,8 @@ class AiDock(QDockWidget):
         self.hide_btn = self._tool(None, "Hide AI panel (re-open from the "
                                    "toolbar or View menu)",
                                    self.hide, "hide_panel_r")
-        for btn in (self.smaller_btn, self.larger_btn, self.help_btn,
+        for btn in (self.presets_btn, self.smaller_btn, self.larger_btn,
+                    self.help_btn,
                     self.settings_btn, self.clear_btn, self.hide_btn):
             header.addWidget(btn)
         layout.addLayout(header)
@@ -314,6 +356,23 @@ class AiDock(QDockWidget):
         return btn
 
     # ------------------------------------------------------- pdf context
+    def _full_document_text(self, doc) -> str:
+        parts, total = [], 0
+        for page in doc:
+            try:
+                t = page.get_text().strip()
+            except Exception:
+                t = ""
+            if not t:
+                continue
+            chunk = f"[Page {page.number + 1}]\n{t}"
+            if total + len(chunk) > _MAX_DOC_CHARS:
+                parts.append(f"…[truncated after page {page.number}]")
+                break
+            parts.append(chunk)
+            total += len(chunk)
+        return "\n\n".join(parts)
+
     def _document_context(self) -> str:
         """The grounding text for the system prompt: document name and
         size, the current page's text, and any live Select-Text
@@ -334,6 +393,11 @@ class AiDock(QDockWidget):
             page_text = doc[page_idx].get_text().strip()
         except Exception:
             page_text = ""
+        if self._full_doc:
+            parts.append("Full text of the document, each page tagged "
+                         "[Page N]:\n---\n" + self._full_document_text(doc)
+                         + "\n---")
+            return "\n\n".join(parts)
         if page_text:
             clipped = page_text[:_MAX_PAGE_CHARS]
             suffix = " …[truncated]" if len(page_text) > len(clipped) else ""
@@ -519,6 +583,20 @@ class AiDock(QDockWidget):
         self.input.setTextCursor(cursor)
 
     # ------------------------------------------------------- actions
+    def ask(self, prompt: str, image=None, full_doc: bool = False) -> None:
+        """Send a ready-made question (presets, Ask AI about an area),
+        showing the panel first. `full_doc` grounds it in every page."""
+        if self._is_busy:
+            return
+        self.show()
+        self.raise_()
+        if image is not None:
+            self._attach_image(image)
+        self._full_doc = full_doc
+        self._set_input(prompt)
+        self._send()
+        self._full_doc = False
+
     def _send(self):
         if self._is_busy:
             return
@@ -552,6 +630,7 @@ class AiDock(QDockWidget):
         self._save_history()
 
         system = SYSTEM_PROMPT.replace("{context}", self._document_context())
+        self._full_doc = False
         messages = [{"role": "system", "content": system}] + self._history
         self._busy(True)
         self._run(lambda: providers.chat(provider, model, messages, key,

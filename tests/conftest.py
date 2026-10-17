@@ -39,4 +39,5 @@ QtCore.QSettings = _IsolatedSettings
 
 # Guard the guard: if this ever stops redirecting, fail at collection
 # instead of silently touching the user's real settings.
-assert QtCore.QSettings("kherve", "KhervePDF").fileName().startswith(_ROOT)
+assert os.path.normpath(QtCore.QSettings("kherve", "KhervePDF").fileName()).startswith(
+    os.path.normpath(_ROOT))  # Qt reports forward slashes on Windows

@@ -32,7 +32,9 @@ jobs:
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          # newest pikepdf with a wheel: a fresh release can be sdist-only for
+          # a while, and building it needs qpdf
+          pip install --only-binary=pikepdf -r requirements.txt
           pip install pyinstaller pytest
 
       - name: Install Inno Setup

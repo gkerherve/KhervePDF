@@ -227,6 +227,54 @@ TIPS: dict[str, tuple] = {
         "when you resize the window.",
         ["Click, or press Ctrl+0."],
         "The zoom box beside it takes a typed percentage."),
+    "night": (
+        "Night reading",
+        "Recolours the pages for reading in the dark. Only the screen "
+        "changes — the PDF, printing and exports stay as they are.",
+        ["Click to turn night reading on or off (Ctrl+Shift+N).",
+         "View ▸ Night Reading picks the style: Invert, Dark (soft) or "
+         "Sepia."],
+        "Dark (soft) is easiest on the eyes; Invert gives the most "
+        "contrast."),
+    "read_aloud": (
+        "Read aloud",
+        "Reads the document out loud with your computer's voice, "
+        "highlighting each sentence in green and turning pages as it "
+        "goes.",
+        ["Click to start from the page you are viewing — or select a "
+         "sentence first to start there.",
+         "Click again to stop. Ctrl+Shift+Space pauses and resumes.",
+         "View ▸ Read Aloud has Previous / Next sentence and Speed."],
+        None),
+    "compare": (
+        "Compare",
+        "Shows this PDF next to another version with the text "
+        "differences marked: removed words in red on the left, added "
+        "words in green on the right.",
+        ["Click and choose the other PDF.",
+         "Use Next change ▶ to jump between differences; the two sides "
+         "scroll together."],
+        "To compare with an earlier saved version, use Git ▸ History… ▸ "
+        "Compare with current."),
+    "ask_area": (
+        "Ask AI about an area",
+        "Explains a figure, table, equation or passage: drag a box over "
+        "it and the picture (plus any text in it) goes to the AI "
+        "assistant.",
+        ["Click (or Ctrl+Shift+A) — the cursor becomes a crosshair.",
+         "Drag a box over the part of the page you want explained.",
+         "The answer appears in the AI panel; your previous tool comes "
+         "back."],
+        "Set up a provider and model first with the gear in the AI "
+        "panel."),
+    "stamp": (
+        "Stamp",
+        "Adds a rubber-stamp mark — Approved, Draft, Confidential, Final, "
+        "Reviewed — with today's date if you like.",
+        ["Click and pick the stamp (or type your own words).",
+         "Choose the corner, size and which pages get it.",
+         "Click Stamp. Undo removes it."],
+        None),
     "zoom_combo": (
         "Zoom level",
         "Shows the current zoom; pick a preset or type a percentage.",

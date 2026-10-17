@@ -364,7 +364,60 @@ def _fit_width(k):
                 "solid", w=0.9)
 
 
+def _night(k):
+    path = QPainterPath()
+    path.addEllipse(QPointF(11, 12.5), 8.5, 8.5)
+    bite = QPainterPath()
+    bite.addEllipse(QPointF(15.5, 8.5), 7, 7)
+    k.shape(path.subtracted(bite), "soft", w=1.6)
+    for (x, y, r) in ((18.5, 4, 1.3), (21, 9, 0.9), (15, 2.5, 0.8)):
+        k.dot(x, y, r)
+
+
+def _read_aloud(k):
+    k.shape(_poly((3, 9.5), (7, 9.5), (12, 5), (12, 19), (7, 14.5),
+                  (3, 14.5)), "soft", w=1.5)
+    for r in (3.5, 7):
+        path = QPainterPath()
+        path.arcMoveTo(QRectF(12 - r, 12 - r, 2 * r, 2 * r), -45)
+        path.arcTo(QRectF(12 - r, 12 - r, 2 * r, 2 * r), -45, 90)
+        k.shape(path, None, w=1.6)
+
+
+def _compare(k):
+    _page(k, 2.5, 3, 9, 15, 3, "soft")
+    _page(k, 12.5, 6, 9, 15, 3, "faint")
+    _text_lines(k, 4.3, 9.8, (9, 12), w=1.1)
+    _text_lines(k, 14.3, 19.8, (12, 15, 18), w=1.1)
+    k.line((10.5, 20.5), (14, 20.5), w=1.3, dash=True)
+
+
+def _ask_area(k):
+    for (x, y, dx, dy) in ((2.5, 6, 1, 1), (17, 6, -1, 1), (2.5, 20.5, 1, -1),
+                           (17, 20.5, -1, -1)):
+        k.line((x, y + dy * 3.5), (x, y), (x + dx * 3.5, y), w=1.7)
+    k.shape(_rrect(5.5, 9, 8.5, 8.5, 1), "soft", stroke=False)
+    star = QPainterPath()
+    for i in range(8):
+        r = 4.5 if i % 2 == 0 else 1.5
+        a = math.radians(-90 + i * 45)
+        pt = QPointF(18.5 + r * math.cos(a), 5.5 + r * math.sin(a))
+        star.moveTo(pt) if i == 0 else star.lineTo(pt)
+    star.closeSubpath()
+    k.shape(star, "solid", w=0.8)
+
+
+def _stamp(k):
+    k.shape(_rrect(9.5, 2.5, 5, 7, 2.2), "soft", w=1.5)
+    k.shape(_poly((7, 9.5), (17, 9.5), (19, 13.5), (5, 13.5)), "soft",
+            w=1.5)
+    k.shape(_rrect(4, 13.5, 16, 3, 0.8), "solid", w=1.2)
+    k.line((3, 20.5), (21, 20.5), w=1.5, dash=True)
+
+
 _PAINTERS: dict[str, Callable[[_Pen], None]] = {
+    "night": _night, "read_aloud": _read_aloud, "compare": _compare,
+    "ask_area": _ask_area, "stamp": _stamp,
     "open": _open, "save": _save, "undo": _undo, "redo": _redo,
     "image": _image, "thumbs": _thumbs, "ai": _ai,
     "hand": _hand, "select": _select, "select_text": _select_text,

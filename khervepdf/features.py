@@ -601,6 +601,8 @@ class FeatureMixin:
         act = self._night_actions.get(mode)
         if act is not None:
             act.setChecked(True)
+        if hasattr(self, "_act_night_tb"):
+            self._act_night_tb.setChecked(mode != "Off")
         for i in range(self._tabs.count()):
             tab = self._tabs.widget(i)
             if hasattr(tab, "_render_all"):
@@ -634,6 +636,19 @@ class FeatureMixin:
             page, from_word, _hi = tab._text_sel_range
         ra.start(tab, page, from_word)
 
+    def _toggle_read_aloud(self) -> None:
+        ra = self._read_aloud
+        if ra is not None and ra.is_active():
+            ra.stop()
+        else:
+            self._read_aloud_start()
+        self._sync_read_button()
+
+    def _sync_read_button(self) -> None:
+        if hasattr(self, "_act_read_tb"):
+            ra = self._read_aloud
+            self._act_read_tb.setChecked(bool(ra and ra.is_active()))
+
     def _read_aloud_pause(self) -> None:
         ra = self._read_aloud
         if ra is None or not ra.is_active():
@@ -659,6 +674,7 @@ class FeatureMixin:
     def _on_read_state(self, state: str) -> None:
         msg = {"speaking": "Reading aloud — Ctrl+Shift+Space pauses",
                "paused": "Reading paused", "stopped": "Stopped reading"}
+        self._sync_read_button()
         self.statusBar().showMessage(msg.get(state, ""), 4000)
 
     def _stop_reading_if(self, tab) -> None:

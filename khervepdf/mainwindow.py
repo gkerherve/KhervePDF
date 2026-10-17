@@ -41,7 +41,7 @@ from .about_author import AuthorDialog
 from .features import FeatureMixin
 from .find_bar import FindBar
 from .history_dialog import HistoryDialog
-from . import tooltips
+from . import reading, tooltips
 from .icons import app_icon, icon
 from .outline import OutlinePanel
 from .pdftab import PdfTab, TOOL_DEFAULTS
@@ -969,6 +969,30 @@ class MainWindow(FeatureMixin, QMainWindow):
             self._apply_zoom_combo
         )
         tb.addWidget(self._zoom_combo)
+
+        # Reading and reviewing tools (their menus live in features.py).
+        tb.addSeparator()
+        self._act_night_tb = QAction(icon("night"), "Night reading", self,
+                                     checkable=True)
+        self._act_night_tb.setChecked(reading.night_mode() != "Off")
+        self._act_night_tb.triggered.connect(self._toggle_night)
+        self._act_read_tb = QAction(icon("read_aloud"), "Read aloud", self,
+                                    checkable=True)
+        self._act_read_tb.setEnabled(reading.tts_available())
+        self._act_read_tb.triggered.connect(self._toggle_read_aloud)
+        for key, act in (
+            ("night", self._act_night_tb),
+            ("read_aloud", self._act_read_tb),
+            ("compare", QAction(icon("compare"), "Compare", self,
+                                triggered=self._compare_with_file)),
+            ("ask_area", QAction(icon("ask_area"), "Ask AI about an area",
+                                 self, triggered=lambda: self._tab_call(
+                                     "start_ai_region"))),
+            ("stamp", QAction(icon("stamp"), "Stamp", self,
+                              triggered=self._add_stamp)),
+        ):
+            tooltips.apply(act, key)
+            tb.addAction(act)
 
     def _activate_tool(self, name: str) -> None:
         self._current_tool = name

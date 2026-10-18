@@ -41,7 +41,7 @@ from PySide6.QtWidgets import (
     QToolBar, QToolButton, QVBoxLayout, QWidget,
 )
 
-from . import doc_tools, reading
+from . import doc_tools, font_guess, reading
 from .icons import icon
 
 
@@ -127,6 +127,8 @@ class _EditTextDialog(QDialog):
                  font_family: str = "",
                  rotation: int = 0,
                  color: tuple[float, float, float] | None = None,
+                 bold: bool = False, italic: bool = False,
+                 detected: str = "",
                  title: str = "Edit text") -> None:
         super().__init__(parent)
         self.setWindowTitle(title)
@@ -141,6 +143,8 @@ class _EditTextDialog(QDialog):
         # what you type looks like the page, and carried back to the
         # PDF so a reflowed paragraph no longer turns black.
         self._initial_color = QColor.fromRgbF(*(color or (0.0, 0.0, 0.0)))
+        self._initial_bold = bool(bold)
+        self._initial_italic = bool(italic)
         layout = QVBoxLayout(self)
 
         # ----- Toolbar -----
@@ -160,10 +164,12 @@ class _EditTextDialog(QDialog):
         tb.addWidget(QLabel(" Size: "))
         self._size_combo = QComboBox(self)
         self._size_combo.setEditable(True)
-        self._size_combo.setMaximumWidth(80)
+        self._size_combo.setMinimumWidth(72)
+        self._size_combo.setMaximumWidth(90)
         for sz in _FONT_SIZES:
             self._size_combo.addItem(str(sz))
-        self._size_combo.setCurrentText(str(int(round(max(4.0, fontsize)))))
+        self._size_combo.setCurrentText(
+            font_guess.size_text(max(4.0, fontsize)))
         self._size_combo.editTextChanged.connect(self._on_size)
         tb.addWidget(self._size_combo)
         tb.addSeparator()
@@ -245,6 +251,13 @@ class _EditTextDialog(QDialog):
         self._preserve_chk.toggled.connect(self._on_preserve_toggled)
         tb.addWidget(self._preserve_chk)
 
+        if detected:
+            hint = QLabel(detected, self)
+            hint.setObjectName("DetectedFont")
+            hint.setStyleSheet("color: palette(placeholder-text);")
+            hint.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            layout.addWidget(hint)
+
         # ----- Editor -----
         self._editor = QTextEdit(self)
         self._editor.setAcceptRichText(True)
@@ -306,10 +319,22 @@ class _EditTextDialog(QDialog):
         cur_col.select(QTextCursor.Document)
         col_fmt = QTextCharFormat()
         col_fmt.setForeground(self._initial_color)
+        if self._initial_font_family:
+            col_fmt.setFontFamilies([self._initial_font_family])
+        if self._initial_bold:
+            col_fmt.setFontWeight(QFont.Bold)
+        if self._initial_italic:
+            col_fmt.setFontItalic(True)
         cur_col.mergeCharFormat(col_fmt)
         cur_col.clearSelection()
         self._editor.setTextCursor(cur_col)
         self._editor.setTextColor(self._initial_color)
+        if self._initial_font_family:
+            self._editor.setFontFamily(self._initial_font_family)
+        if self._initial_bold:
+            self._editor.setFontWeight(QFont.Bold)
+        if self._initial_italic:
+            self._editor.setFontItalic(True)
         # Re-apply alignment to the freshly loaded content.
         cur_align = self._editor.textCursor()
         cur_align.select(QTextCursor.Document)
@@ -319,6 +344,8 @@ class _EditTextDialog(QDialog):
         cur_align.clearSelection()
         self._editor.setTextCursor(cur_align)
         self._editor.setAlignment(self._initial_qt_align)
+        if hasattr(self, "_bold"):
+            self._sync_toolbar()
 
     def _on_preserve_toggled(self, checked: bool) -> None:
         # Persist the choice for the next dialog open …
@@ -428,8 +455,16 @@ class _EditTextDialog(QDialog):
         sz = fmt.fontPointSize()
         if sz > 0:
             self._size_combo.blockSignals(True)
-            self._size_combo.setCurrentText(str(int(round(sz))))
+            self._size_combo.setCurrentText(font_guess.size_text(sz))
             self._size_combo.blockSignals(False)
+        family = fmt.fontFamilies() if hasattr(fmt, "fontFamilies") \
+            else None
+        family = (family[0] if isinstance(family, (list, tuple)) and family
+                  else fmt.fontFamily())
+        if family:
+            self._font_combo.blockSignals(True)
+            self._font_combo.setCurrentFont(QFont(family))
+            self._font_combo.blockSignals(False)
         align = self._editor.alignment()
         mapping = {
             Qt.AlignLeft:    "align_left",
@@ -3728,6 +3763,9 @@ class PdfTab(QGraphicsView):
                 preserve_line_breaks=self._preserve_line_breaks(),
                 font_family=info.get("font", ""),
                 color=info.get("color"),
+                bold=info.get("bold", False),
+                italic=info.get("italic", False),
+                detected=self._detected_font_label(info),
             )
             if dlg.exec() != QDialog.Accepted:
                 return
@@ -3784,9 +3822,12 @@ class PdfTab(QGraphicsView):
         # let it reflow the paragraph inside the original column.
         body = _re.sub(r"<br\s*/?>", " ", body, flags=_re.I)
         body = body.replace("\u2028", " ").replace("\u00a0", " ")
-        generic = {"t": "Times", "h": "Helvetica", "c": "Courier"}[
-            cls._builtin_fontname(info.get("font_raw")
-                                  or info.get("font", ""))[0]]
+        generic = {"serif": "Times", "sans": "Helvetica",
+                   "mono": "Courier"}.get(info.get("generic", ""))
+        if generic is None:
+            generic = {"t": "Times", "h": "Helvetica", "c": "Courier"}[
+                cls._builtin_fontname(info.get("font_raw")
+                                      or info.get("font", ""))[0]]
         orig = (info.get("font") or "").strip("'\" ")
         def _family(mm):
             fam = mm.group(1).strip("'\" ")
@@ -3853,6 +3894,17 @@ class PdfTab(QGraphicsView):
             )
 
     @staticmethod
+    def _detected_font_label(info: dict) -> str:
+        style = " ".join(w for w, on in (("bold", info.get("bold")),
+                                         ("italic", info.get("italic"))) if on)
+        fam = info.get("font", "")
+        src = info.get("font_source", "")
+        if src and not info.get("font_exact") and src.lower() != fam.lower():
+            fam = f"{fam} (closest to \u201c{src}\u201d in the PDF)"
+        size = font_guess.size_text(float(info.get("size", 11.0)))
+        return f"Detected: {fam}, {size} pt" + (f", {style}" if style else "")
+
+    @staticmethod
     def _builtin_fontname(raw: str) -> str:
         """Closest PDF Base-14 builtin for a span's raw font name —
         used by the single-line rewrite so the replacement text at
@@ -3887,15 +3939,20 @@ class PdfTab(QGraphicsView):
         # Only scan the body content — the <body> tag itself carries
         # the application's default font-size, not the user's choice.
         body = html.split("<body", 1)[-1].split(">", 1)[-1]
-        for marker in ("<sup", "<sub", "font-style:italic",
+        if not info.get("italic") and "font-style:italic" in body:
+            return True
+        for marker in ("<sup", "<sub",
                        "text-decoration: underline",
                        "vertical-align:super", "vertical-align:sub"):
             if marker in body:
                 return True
         import re as _re
         for m in _re.finditer(r"font-weight:\s*(\d+)", body):
-            if int(m.group(1)) >= 600:
+            if (int(m.group(1)) >= 600) != bool(info.get("bold")):
                 return True
+        if info.get("bold") and not _re.search(
+                r"font-weight:\s*[6-9]00", body):
+            return True
         r, g, b = info.get("color", (0.0, 0.0, 0.0))
         orig = QColor.fromRgbF(r, g, b)
         for m in _re.finditer(r"(?<![-\w])color:\s*(#[0-9a-fA-F]{6})", body):
@@ -3972,7 +4029,13 @@ class PdfTab(QGraphicsView):
         if new_line == ln["plain"]:
             return False  # whitespace-only wiggle — nothing visible
         size = float(ln.get("size") or info.get("size", 11.0))
-        fname = self._builtin_fontname(ln.get("font_raw", ""))
+        g = font_guess.guess_font(ln.get("font_raw", ""),
+                                  int(ln.get("flags", 0)), installed=set())
+        fname = {
+            "serif": ("tiro", "tibo", "tiit", "tibi"),
+            "sans": ("helv", "hebo", "heit", "hebi"),
+            "mono": ("cour", "cobo", "coit", "cobi"),
+        }[g.generic][int(g.bold) + 2 * int(g.italic)]
         rx0, _ry0, rx1, _ry1 = info["rect"]
         lx0, ly0, lx1, ly1 = ln["bbox"]
         x = lx0
@@ -4133,6 +4196,7 @@ class PdfTab(QGraphicsView):
                     "size": float(ref.get("size", max_size)),
                     "color": int(ref.get("color", 0)),
                     "font_raw": str(ref.get("font", "")),
+                    "flags": int(ref.get("flags", 0)),
                     "plain": line_plains[-1],
                     "rich": "<sup" in joined_html or "<sub" in joined_html,
                 })
@@ -4164,7 +4228,14 @@ class PdfTab(QGraphicsView):
                 {"bbox": (x0, p_y0, x1, p_y1), "lines": target_para},
                 dom_size,
             )
-            font = self._clean_font_name(dom_font_raw)
+            # Snap 10.9589 → 11, keep a real 10.5.
+            dom_size = font_guess.guess_size({dom_size: 1})
+            dom_flags = next(
+                (int(sp.get("flags", 0)) for ln in target_para
+                 for sp in ln.get("spans", [])
+                 if sp.get("font") == dom_font_raw and sp.get("text")),
+                0)
+            guess = font_guess.guess_font(dom_font_raw, dom_flags)
             return {
                 "rect": (x0, p_y0, x1, p_y1),
                 "html": paragraph_html.rstrip(),
@@ -4172,8 +4243,13 @@ class PdfTab(QGraphicsView):
                 "size": dom_size,
                 "color": (r, g, b),
                 "align": align,
-                "font": font,
+                "font": guess.family,
                 "font_raw": str(dom_font_raw or ""),
+                "font_source": guess.source,
+                "font_exact": guess.exact,
+                "bold": guess.bold,
+                "generic": guess.generic,
+                "italic": guess.italic,
                 "lines": line_details,
             }
         return None

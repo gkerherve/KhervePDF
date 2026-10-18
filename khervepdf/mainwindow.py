@@ -630,8 +630,11 @@ class MainWindow(FeatureMixin, QMainWindow):
 
     def _build_menus(self) -> None:
         mb = self.menuBar()
+        # Kept here for FeatureMixin._menu: QAction.menu() can hand back
+        # an already-deleted wrapper (PySide6 on Linux arm64).
+        self._top_menus: dict = {}
 
-        m_file = mb.addMenu("&File")
+        m_file = self._top_menus["&File".replace("&", "")] = mb.addMenu("&File")
         m_file.addAction(QAction(icon("new"), "&New", self, shortcut="Ctrl+N",
                                  triggered=self._new))
         m_file.addAction(QAction(icon("open"), "&Open…", self, shortcut="Ctrl+O",
@@ -673,7 +676,7 @@ class MainWindow(FeatureMixin, QMainWindow):
         m_file.addAction(QAction("E&xit", self, shortcut="Ctrl+Q",
                                  triggered=self.close))
 
-        m_edit = mb.addMenu("&Edit")
+        m_edit = self._top_menus["&Edit".replace("&", "")] = mb.addMenu("&Edit")
         m_edit.addAction(QAction(icon("undo"), "&Undo", self, shortcut="Ctrl+Z",
                                  triggered=self._undo))
         m_edit.addAction(QAction(icon("redo"), "&Redo", self, shortcut="Ctrl+Y",
@@ -707,7 +710,7 @@ class MainWindow(FeatureMixin, QMainWindow):
                                  shortcut="Ctrl+F",
                                  triggered=self._show_find_bar))
 
-        m_view = mb.addMenu("&View")
+        m_view = self._top_menus["&View".replace("&", "")] = mb.addMenu("&View")
         # Zoom shortcuts mirror the browser convention: Ctrl++ /
         # Ctrl+= for zoom in (= is the unshifted key on most US
         # keyboards), Ctrl+- for zoom out, Ctrl+0 for fit to width.
@@ -751,7 +754,7 @@ class MainWindow(FeatureMixin, QMainWindow):
             theme_group.addAction(act)
             m_theme.addAction(act)
 
-        m_tools = mb.addMenu("&Tools")
+        m_tools = self._top_menus["&Tools".replace("&", "")] = mb.addMenu("&Tools")
         for label in ("&Select", "Select Te&xt", "&Pen", "&Highlight",
                       "&Text", "&Line", "&Arrow", "&Rectangle", "&Ellipse",
                       "Sticky &Note", "&Signature", "Re&dact"):
@@ -772,7 +775,7 @@ class MainWindow(FeatureMixin, QMainWindow):
         m_tools.aboutToShow.connect(self._sync_kherveref_actions)
         self._sync_kherveref_actions()
 
-        m_pages = mb.addMenu("&Pages")
+        m_pages = self._top_menus["&Pages".replace("&", "")] = mb.addMenu("&Pages")
         m_pages.addAction(QAction(icon("page_insert"),
                                   "Insert &Blank Page", self,
                                   triggered=self._insert_blank))
@@ -804,7 +807,7 @@ class MainWindow(FeatureMixin, QMainWindow):
                                   "&Number / Bates every page…", self,
                                   triggered=self._add_page_numbers))
 
-        m_git = mb.addMenu("&Git")
+        m_git = self._top_menus["&Git".replace("&", "")] = mb.addMenu("&Git")
         m_git.addAction(QAction(icon("commit"), "Commit &Now", self,
                                 triggered=self._git_commit_now))
         m_git.addAction(QAction(icon("history"), "&History…", self,
@@ -812,7 +815,7 @@ class MainWindow(FeatureMixin, QMainWindow):
         m_git.addAction(QAction(icon("remote"), "&Remote / Push…", self,
                                 triggered=self._git_remote))
 
-        m_help = mb.addMenu("&Help")
+        m_help = self._top_menus["&Help".replace("&", "")] = mb.addMenu("&Help")
         m_help.addAction(QAction(icon("update"), "Check for &Updates…", self,
                                  triggered=self._check_updates_now))
         auto = QAction("Check for Updates &Automatically", self,

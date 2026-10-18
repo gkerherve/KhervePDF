@@ -444,6 +444,9 @@ class FeatureMixin:
     # ----- menus -----
 
     def _menu(self, title: str) -> Optional[QMenu]:
+        menu = getattr(self, "_top_menus", {}).get(title)
+        if menu is not None:
+            return menu
         for act in self.menuBar().actions():
             if act.text().replace("&", "") == title:
                 return act.menu()

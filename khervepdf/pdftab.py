@@ -41,7 +41,7 @@ from PySide6.QtWidgets import (
     QToolBar, QToolButton, QVBoxLayout, QWidget,
 )
 
-from . import doc_tools, font_guess, reading
+from . import doc_tools, font_guess, font_library, reading
 from .icons import icon
 
 
@@ -302,6 +302,10 @@ class _EditTextDialog(QDialog):
             style = f"font-size:{sz:.1f}pt;"
             if self._initial_font_family:
                 style += f" font-family:'{self._initial_font_family}';"
+            if self._initial_bold:
+                style += " font-weight:700;"
+            if self._initial_italic:
+                style += " font-style:italic;"
             self._editor.setHtml(
                 f'<span style="{style}">{display_html}</span>'
             )
@@ -319,12 +323,16 @@ class _EditTextDialog(QDialog):
         cur_col.select(QTextCursor.Document)
         col_fmt = QTextCharFormat()
         col_fmt.setForeground(self._initial_color)
-        if self._initial_font_family:
-            col_fmt.setFontFamilies([self._initial_font_family])
-        if self._initial_bold:
-            col_fmt.setFontWeight(QFont.Bold)
-        if self._initial_italic:
-            col_fmt.setFontItalic(True)
+        if not self._initial_is_html:
+            # Plain text has no inline styling to keep: the whole
+            # paragraph gets the detected face. (HTML carries it in
+            # the outer span, so inline code / emphasis survive.)
+            if self._initial_font_family:
+                col_fmt.setFontFamilies([self._initial_font_family])
+            if self._initial_bold:
+                col_fmt.setFontWeight(QFont.Bold)
+            if self._initial_italic:
+                col_fmt.setFontItalic(True)
         cur_col.mergeCharFormat(col_fmt)
         cur_col.clearSelection()
         self._editor.setTextCursor(cur_col)
@@ -346,6 +354,7 @@ class _EditTextDialog(QDialog):
         self._editor.setAlignment(self._initial_qt_align)
         if hasattr(self, "_bold"):
             self._sync_toolbar()
+        self._initial_signature = self.style_signature()
 
     def _on_preserve_toggled(self, checked: bool) -> None:
         # Persist the choice for the next dialog open …
@@ -476,6 +485,37 @@ class _EditTextDialog(QDialog):
             if align & flag:
                 self._align_acts[name].setChecked(True)
                 break
+
+    def style_signature(self) -> frozenset:
+        """Every distinct character style in the editor (font, size,
+        weight, italic, underline, colour, vertical alignment) —
+        text-independent, so typing never changes it."""
+        sig = set()
+        block = self._editor.document().begin()
+        while block.isValid():
+            it = block.begin()
+            while not it.atEnd():
+                frag = it.fragment()
+                if frag.isValid() and frag.text().strip():
+                    f = frag.charFormat()
+                    fams = f.fontFamilies() or []
+                    sig.add((
+                        tuple(fams) if isinstance(fams, (list, tuple))
+                        else (str(fams),),
+                        round(f.fontPointSize(), 1),
+                        f.fontWeight() >= QFont.DemiBold,
+                        f.fontItalic(), f.fontUnderline(),
+                        f.foreground().color().name(),
+                        int(f.verticalAlignment().value
+                            if hasattr(f.verticalAlignment(), "value")
+                            else f.verticalAlignment()),
+                    ))
+                it += 1
+            block = block.next()
+        return frozenset(sig)
+
+    def initial_style_signature(self) -> frozenset:
+        return getattr(self, "_initial_signature", frozenset())
 
     def html(self) -> str:
         """Body HTML as produced by QTextEdit — fed directly to
@@ -3807,14 +3847,71 @@ class PdfTab(QGraphicsView):
         except (AttributeError, TypeError):
             page.apply_redactions()
 
+    @staticmethod
+    def _embedded_font(page: fitz.Page, raw: str, text: str):
+        """The PDF's own font for span font *raw*, as (buffer, ext),
+        when it can typeset every character of *text* — the exact
+        original face, so a correction is indistinguishable from the
+        rest. Subset fonts often qualify: fixing a typo usually only
+        needs letters the paragraph already uses. None otherwise."""
+        if not raw:
+            return None
+        want = font_guess.strip_subset(raw)
+        doc = page.parent
+        for entry in page.get_fonts(full=True):
+            xref, ext, basefont = entry[0], entry[1], entry[3]
+            if font_guess.strip_subset(basefont) != want:
+                continue
+            if ext not in ("ttf", "otf", "cff", "pfa", "pfb"):
+                return None
+            try:
+                _name, ext, _type, buf = doc.extract_font(xref)
+                if not buf:
+                    return None
+                f = fitz.Font(fontbuffer=buf)
+            except Exception:
+                return None
+            if all(c.isspace() or f.has_glyph(ord(c)) for c in text):
+                return buf, ext
+            return None
+        return None
+
+    def _write_font(self, page: fitz.Page, raw: str, bold: bool,
+                    italic: bool, generic: str, family: str, text: str):
+        """Font to set *text* with on the page, best first:
+        the PDF's own embedded face → a bundled look-alike file →
+        a Base-14 builtin. Returns (insert_text kwargs, fitz.Font)."""
+        emb = self._embedded_font(page, raw, text)
+        if emb is not None:
+            buf, _ext = emb
+            name = "KPe" + font_guess.strip_subset(raw)[:20].replace(
+                " ", "")
+            return ({"fontname": name, "fontbuffer": buf},
+                    fitz.Font(fontbuffer=buf))
+        path = font_library.face_file(
+            font_library.pdf_family(family, generic), bold, italic)
+        if path is not None:
+            f = fitz.Font(fontfile=str(path))
+            if all(c.isspace() or f.has_glyph(ord(c)) for c in text):
+                name = "KP" + path.stem.replace("-", "")[:24]
+                return {"fontname": name, "fontfile": str(path)}, f
+        fname = {
+            "serif": ("tiro", "tibo", "tiit", "tibi"),
+            "sans": ("helv", "hebo", "heit", "hebi"),
+            "mono": ("cour", "cobo", "coit", "cobi"),
+        }[generic if generic in ("serif", "sans", "mono") else "sans"][
+            int(bold) + 2 * int(italic)]
+        return {"fontname": fname}, fitz.Font(fname)
+
     @classmethod
-    def _reflow_html(cls, html: str, info: dict) -> tuple[str, str]:
-        """Turn the dialog's QTextEdit HTML into (body_html, css) for
-        insert_htmlbox so the rewritten paragraph matches the page:
-        original colour, the original font class (MuPDF has no copy of
-        an arbitrary embedded font, so its Base-14 look-alike is used),
-        and the original line spacing instead of the engine's looser
-        default."""
+    def _reflow_html(cls, html: str, info: dict, page=None,
+                     new_plain: str = ""):
+        """Turn the dialog's QTextEdit HTML into (body_html, css,
+        archive) for insert_htmlbox so the rewritten paragraph matches
+        the page: original colour and line spacing, and real fonts —
+        the PDF's own embedded face when it has every letter typed,
+        else the bundled look-alike in all four styles (so bold /
+        italic picked in the dialog come out right)."""
         import re as _re
         m = _re.search(r"<body[^>]*>(.*)</body>", html, _re.S | _re.I)
         body = m.group(1) if m else html
@@ -3822,21 +3919,51 @@ class PdfTab(QGraphicsView):
         # let it reflow the paragraph inside the original column.
         body = _re.sub(r"<br\s*/?>", " ", body, flags=_re.I)
         body = body.replace("\u2028", " ").replace("\u00a0", " ")
-        generic = {"serif": "Times", "sans": "Helvetica",
-                   "mono": "Courier"}.get(info.get("generic", ""))
-        if generic is None:
-            generic = {"t": "Times", "h": "Helvetica", "c": "Courier"}[
-                cls._builtin_fontname(info.get("font_raw")
-                                      or info.get("font", ""))[0]]
+        generic = info.get("generic") or {
+            "t": "serif", "h": "sans", "c": "mono"}[
+            cls._builtin_fontname(info.get("font_raw")
+                                  or info.get("font", ""))[0]]
         orig = (info.get("font") or "").strip("'\" ")
+        archive = fitz.Archive(str(font_library.FONT_DIR))
+        faces: list[str] = []
+        css_names: dict[str, str] = {}
+
+        def _css_family(fam: str) -> str:
+            """@font-face set for an on-screen family → its CSS name."""
+            key = fam.lower()
+            if key in css_names:
+                return css_names[key]
+            name = f"kf{len(css_names)}"
+            css_names[key] = name
+            bundled = font_library.pdf_family(fam, generic)
+            for bold in (False, True):
+                for italic in (False, True):
+                    path = font_library.face_file(bundled, bold, italic)
+                    if path is None:
+                        continue
+                    rel = path.relative_to(font_library.FONT_DIR).as_posix()
+                    if (fam == orig and page is not None
+                            and bold == bool(info.get("bold"))
+                            and italic == bool(info.get("italic"))):
+                        emb = cls._embedded_font(
+                            page, info.get("font_raw", ""), new_plain)
+                        if emb is not None:
+                            rel = f"embedded.{emb[1]}"
+                            archive.add(emb[0], rel)
+                    faces.append(
+                        f"@font-face {{ font-family: {name}; src: url({rel});"
+                        f" font-weight: {'bold' if bold else 'normal'};"
+                        f" font-style: {'italic' if italic else 'normal'}; }}")
+            return name
+
+        main = _css_family(orig or "serif")
+
         def _family(mm):
             fam = mm.group(1).strip("'\" ")
-            # The original family (or Qt's placeholder) → look-alike;
-            # a font the user picked in the dialog is kept.
             if not fam or fam == orig or fam.lower() in (
                     "sans serif", "serif", "monospace"):
-                fam = generic
-            return f"font-family:'{fam}'"
+                return f"font-family:{main}"
+            return f"font-family:{_css_family(fam)}"
         body = _re.sub(r"font-family:\s*([^;\"]+)", _family, body)
         r, g, b = info.get("color", (0.0, 0.0, 0.0))
         lines = info.get("lines") or []
@@ -3856,12 +3983,13 @@ class PdfTab(QGraphicsView):
                        if mm.group(1) else
                        f'<p style="line-height:{leading:.3f};"',
                        body)
-        css = (f"* {{ font-family: '{generic}'; }} "
+        css = (" ".join(faces) + " "
+               f"* {{ font-family: {main}; }} "
                f"body {{ margin: 0; color: rgb({round(r * 255)},"
                f"{round(g * 255)},{round(b * 255)}); "
                f"font-size: {size:.2f}pt; }} "
                f"p {{ margin: 0; line-height: {leading:.3f}; }}")
-        return body, css
+        return body, css, archive
 
     def _reflow_paragraph(self, page: fitz.Page, info: dict, html: str,
                           new_plain: str, rotate: int = 0) -> None:
@@ -3870,22 +3998,43 @@ class PdfTab(QGraphicsView):
         the box grows downward (never shrinking the user's font); only
         when it cannot fit above the page bottom is it scaled down."""
         rect = fitz.Rect(*info["rect"])
+        # Read the embedded font before the redaction can drop it.
+        body, css, archive = self._reflow_html(html, info, page, new_plain)
         self._redact_text_only(page, rect)
-        body, css = self._reflow_html(html, info)
         rotate = int(rotate) % 360
+        kw = {"css": css, "rotate": rotate, "archive": archive}
         try:
-            bottom = page.rect.height - 18.0
+            # How far down the paragraph may grow before it would run
+            # into the next text in the same column.
+            page_bottom = page.rect.height - 18.0
+            limit = page_bottom
+            for bx0, by0, bx1, _by1, *_rest in page.get_text("blocks"):
+                if by0 >= rect.y1 - 1.0 and bx0 < rect.x1 and bx1 > rect.x0:
+                    limit = min(limit, by0 - 2.0)
+            limit = max(limit, rect.y1)
             box = fitz.Rect(rect)
             step = max(6.0, float(info.get("size", 11.0)))
             while True:
-                spare, _scale = page.insert_htmlbox(
-                    box, body, css=css, scale_low=1, rotate=rotate)
+                spare, _scale = page.insert_htmlbox(box, body, scale_low=1,
+                                                    **kw)
                 if spare >= 0:
+                    return
+                if box.y1 >= limit:
                     break
-                if box.y1 >= bottom:
-                    page.insert_htmlbox(box, body, css=css, rotate=rotate)
-                    break
-                box.y1 = min(bottom, box.y1 + step)
+                box.y1 = min(limit, box.y1 + step)
+            # Free space used up: allow a slight shrink before
+            # spilling over whatever follows.
+            spare, _scale = page.insert_htmlbox(box, body, scale_low=0.85,
+                                                **kw)
+            if spare >= 0:
+                return
+            while box.y1 < page_bottom:
+                box.y1 = min(page_bottom, box.y1 + step)
+                spare, _scale = page.insert_htmlbox(box, body, scale_low=1,
+                                                    **kw)
+                if spare >= 0:
+                    return
+            page.insert_htmlbox(box, body, **kw)
         except AttributeError:
             # PyMuPDF too old for insert_htmlbox — fall back to plain text.
             page.insert_textbox(
@@ -3935,35 +4084,11 @@ class PdfTab(QGraphicsView):
         full-paragraph path which understands them."""
         if dlg.rotation() != 0:
             return True
-        html = dlg.html()
-        # Only scan the body content — the <body> tag itself carries
-        # the application's default font-size, not the user's choice.
-        body = html.split("<body", 1)[-1].split(">", 1)[-1]
-        if not info.get("italic") and "font-style:italic" in body:
+        # The editor opened with the paragraph's own styling (font,
+        # size, colour, inline bold / italic / code, sup / sub); any
+        # style that was not there at the start is a formatting edit.
+        if dlg.style_signature() != dlg.initial_style_signature():
             return True
-        for marker in ("<sup", "<sub",
-                       "text-decoration: underline",
-                       "vertical-align:super", "vertical-align:sub"):
-            if marker in body:
-                return True
-        import re as _re
-        for m in _re.finditer(r"font-weight:\s*(\d+)", body):
-            if (int(m.group(1)) >= 600) != bool(info.get("bold")):
-                return True
-        if info.get("bold") and not _re.search(
-                r"font-weight:\s*[6-9]00", body):
-            return True
-        r, g, b = info.get("color", (0.0, 0.0, 0.0))
-        orig = QColor.fromRgbF(r, g, b)
-        for m in _re.finditer(r"(?<![-\w])color:\s*(#[0-9a-fA-F]{6})", body):
-            c = QColor(m.group(1))
-            if max(abs(c.red() - orig.red()), abs(c.green() - orig.green()),
-                   abs(c.blue() - orig.blue())) > 3:
-                return True
-        want = float(info.get("size", 11.0))
-        for m in _re.finditer(r"font-size:\s*(\d+(?:\.\d+)?)pt", body):
-            if abs(float(m.group(1)) - want) > 0.75:
-                return True
         checked = dlg._align_group.checkedAction()
         name_by_act = {a: n for n, a in dlg._align_acts.items()}
         cur = name_by_act.get(checked, "align_left")
@@ -4030,19 +4155,18 @@ class PdfTab(QGraphicsView):
             return False  # whitespace-only wiggle — nothing visible
         size = float(ln.get("size") or info.get("size", 11.0))
         g = font_guess.guess_font(ln.get("font_raw", ""),
-                                  int(ln.get("flags", 0)), installed=set())
-        fname = {
-            "serif": ("tiro", "tibo", "tiit", "tibi"),
-            "sans": ("helv", "hebo", "heit", "hebi"),
-            "mono": ("cour", "cobo", "coit", "cobi"),
-        }[g.generic][int(g.bold) + 2 * int(g.italic)]
+                                  int(ln.get("flags", 0)))
+        # Read the font before the redaction (it may drop an unused
+        # embedded font from the page).
+        font_kw, wfont = self._write_font(
+            page, ln.get("font_raw", ""), g.bold, g.italic, g.generic,
+            g.family, new_line)
         rx0, _ry0, rx1, _ry1 = info["rect"]
         lx0, ly0, lx1, ly1 = ln["bbox"]
         x = lx0
         if new_line:
             try:
-                w = fitz.get_text_length(new_line, fontname=fname,
-                                         fontsize=size)
+                w = wfont.text_length(new_line, fontsize=size)
             except Exception:
                 return False
             align = info.get("align", "left")
@@ -4075,8 +4199,13 @@ class PdfTab(QGraphicsView):
             rgb = (((c >> 16) & 0xff) / 255.0,
                    ((c >> 8) & 0xff) / 255.0,
                    (c & 0xff) / 255.0)
+            kw = dict(font_kw)
+            buf, ffile = kw.pop("fontbuffer", None), kw.pop("fontfile", None)
+            if buf is not None or ffile is not None:
+                page.insert_font(fontname=kw["fontname"], fontbuffer=buf,
+                                 fontfile=ffile)
             page.insert_text((x, ln["baseline"]), new_line,
-                             fontsize=size, fontname=fname, color=rgb)
+                             fontsize=size, color=rgb, **kw)
         return True
 
     def _find_text_block_detailed(self, page: fitz.Page,
@@ -4144,6 +4273,20 @@ class PdfTab(QGraphicsView):
             line_plains: list[str] = []
             line_details: list[dict] = []
             first_span = None
+            # Dominant font + size measured across the paragraph the
+            # user actually clicked (not the whole block — adjacent
+            # paragraphs may use a different font or weight). Known up
+            # front so spans in another face (inline code, an
+            # emphasised word) can be marked up as such.
+            dom_font_raw, dom_size = self._dominant_font_and_size_lines(
+                target_para, fallback_size=11.0)
+            dom_flags = next(
+                (int(sp.get("flags", 0)) for ln in target_para
+                 for sp in ln.get("spans", [])
+                 if sp.get("font") == dom_font_raw and sp.get("text")),
+                0)
+            guess = font_guess.guess_font(dom_font_raw, dom_flags)
+            span_guesses: dict[tuple[str, int], "font_guess.FontGuess"] = {}
             for line in target_para:
                 spans = line.get("spans", [])
                 if not spans:
@@ -4174,6 +4317,25 @@ class PdfTab(QGraphicsView):
                     is_super = (flags & 1) or (
                         smaller and origin_y < baseline - 1.0)
                     is_sub = smaller and origin_y > baseline + 1.0
+                    sfont = s.get("font") or ""
+                    if sfont != dom_font_raw and text.strip():
+                        key = (sfont, flags)
+                        sg = span_guesses.get(key)
+                        if sg is None:
+                            sg = span_guesses[key] = font_guess.guess_font(
+                                sfont, flags)
+                        css = []
+                        if sg.family != guess.family:
+                            css.append(f"font-family:'{sg.family}'")
+                        if sg.bold != guess.bold:
+                            css.append("font-weight:"
+                                       + ("700" if sg.bold else "400"))
+                        if sg.italic != guess.italic:
+                            css.append("font-style:"
+                                       + ("italic" if sg.italic
+                                          else "normal"))
+                        if css:
+                            esc = f'<span style="{"; ".join(css)}">{esc}</span>'
                     if is_super:
                         parts.append(f"<sup>{esc}</sup>")
                     elif is_sub:
@@ -4198,7 +4360,8 @@ class PdfTab(QGraphicsView):
                     "font_raw": str(ref.get("font", "")),
                     "flags": int(ref.get("flags", 0)),
                     "plain": line_plains[-1],
-                    "rich": "<sup" in joined_html or "<sub" in joined_html,
+                    "rich": ("<sup" in joined_html or "<sub" in joined_html
+                             or "<span" in joined_html),
                 })
             if first_span is None or not line_htmls:
                 continue
@@ -4218,10 +4381,6 @@ class PdfTab(QGraphicsView):
             # Dominant font + size measured across the paragraph the
             # user actually clicked (not the whole block — adjacent
             # paragraphs may use a different font or weight).
-            dom_font_raw, dom_size = self._dominant_font_and_size_lines(
-                target_para,
-                fallback_size=float(first_span.get("size", 11.0)),
-            )
             # Alignment detected on a synthetic block-like dict so the
             # heuristic only sees the chosen paragraph's lines.
             align = self._detect_alignment(
@@ -4230,12 +4389,6 @@ class PdfTab(QGraphicsView):
             )
             # Snap 10.9589 → 11, keep a real 10.5.
             dom_size = font_guess.guess_size({dom_size: 1})
-            dom_flags = next(
-                (int(sp.get("flags", 0)) for ln in target_para
-                 for sp in ln.get("spans", [])
-                 if sp.get("font") == dom_font_raw and sp.get("text")),
-                0)
-            guess = font_guess.guess_font(dom_font_raw, dom_flags)
             return {
                 "rect": (x0, p_y0, x1, p_y1),
                 "html": paragraph_html.rstrip(),

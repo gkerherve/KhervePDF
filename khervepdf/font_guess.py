@@ -82,14 +82,26 @@ _ALIASES: list[tuple[str, str, list[str]]] = [
     ("latinmodern", "serif", ["Latin Modern Roman", "CMU Serif",
                               "Times New Roman"]),
     # Palatino / Bookman / Century / Garamond / Office fonts
-    ("palatino", "serif", ["Palatino", "Palatino Linotype", "Book Antiqua"]),
-    ("urwpalladio", "serif", ["Palatino", "Palatino Linotype"]),
+    ("palatino", "serif", ["Palatino", "Palatino Linotype", "Book Antiqua",
+                           "TeX Gyre Pagella"]),
+    ("urwpalladio", "serif", ["Palatino", "TeX Gyre Pagella"]),
     ("texgyrepagella", "serif", ["TeX Gyre Pagella", "Palatino"]),
-    ("upl", "serif", ["Palatino", "Palatino Linotype"]),
-    ("bookantiqua", "serif", ["Book Antiqua", "Palatino"]),
-    ("bookman", "serif", ["Bookman Old Style", "Bookman", "Georgia"]),
+    ("upl", "serif", ["Palatino", "TeX Gyre Pagella"]),
+    ("texgyrebonum", "serif", ["TeX Gyre Bonum"]),
+    ("texgyreschola", "serif", ["TeX Gyre Schola"]),
+    ("urwbookman", "serif", ["Bookman Old Style", "TeX Gyre Bonum"]),
+    ("centuryschl", "serif", ["Century Schoolbook", "TeX Gyre Schola"]),
+    ("ncs", "serif", ["Century Schoolbook", "TeX Gyre Schola"]),
+    ("carlito", "sans", ["Carlito"]),
+    ("caladea", "serif", ["Caladea"]),
+    ("cmusansserif", "sans", ["CMU Sans Serif"]),
+    ("cmutypewriter", "mono", ["CMU Typewriter Text"]),
+    ("cmu", "serif", ["CMU Serif"]),
+    ("bookantiqua", "serif", ["Book Antiqua", "Palatino",
+                              "TeX Gyre Pagella"]),
+    ("bookman", "serif", ["Bookman Old Style", "Bookman", "TeX Gyre Bonum"]),
     ("centuryschoolbook", "serif", ["Century Schoolbook", "New Century "
-                                    "Schoolbook", "Georgia"]),
+                                    "Schoolbook", "TeX Gyre Schola"]),
     ("garamond", "serif", ["Garamond", "EB Garamond", "Adobe Garamond Pro",
                            "Georgia"]),
     ("minion", "serif", ["Minion Pro", "Times New Roman"]),
@@ -165,6 +177,8 @@ def guess_font(raw: str, flags: int = 0,
                installed: set[str] | None = None) -> FontGuess:
     if installed is None:
         try:
+            from . import font_library
+            font_library.register_with_qt()
             from PySide6.QtGui import QFontDatabase
             installed = set(QFontDatabase.families())
         except Exception:

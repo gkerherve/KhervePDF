@@ -16,6 +16,14 @@ from pathlib import Path
 
 def main() -> int:
     exe = Path(sys.argv[1]).resolve()
+    # Edit Text's bundled fonts must ship with the app.
+    bundle = exe.parents[1] if exe.parent.name == "MacOS" else exe.parent
+    missing = [n for n in ("cmunrm.otf", "LiberationSerif-Regular.ttf",
+                           "Carlito-Regular.ttf", "texgyrepagella-regular.otf")
+               if not any(bundle.rglob(n))]
+    if missing:
+        print(f"Bundled fonts missing from the build: {missing}")
+        return 1
     import pymupdf
     tmp = Path(tempfile.mkdtemp())
     pdf = tmp / "smoke.pdf"

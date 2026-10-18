@@ -60,6 +60,10 @@ def main() -> int:
     # Starting picture while the (heavy) main window is built.
     from . import splash as _splash, version_string
     splash = _splash.show(version_string())
+    # Bundled fonts (LaTeX's Computer Modern, Times/Arial/Calibri
+    # look-alikes …) for Edit Text's font list and preview.
+    from . import font_library
+    font_library.register_with_qt()
 
     from .mainwindow import MainWindow
     win = MainWindow(theme_name=theme_name)

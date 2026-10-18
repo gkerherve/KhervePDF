@@ -156,6 +156,9 @@ def _prune(pairs):
 
 
 datas = _prune(datas)
+# Edit Text's bundled fonts (CMU, Liberation, Carlito/Caladea, TeX Gyre)
+# — font_library resolves them next to its own module.
+datas += [(str(ROOT / "khervepdf" / "fonts"), "khervepdf/fonts")]
 binaries = _prune(binaries)
 
 

@@ -36,7 +36,8 @@ from PySide6.QtWidgets import (
     QGraphicsEllipseItem, QGraphicsItem, QGraphicsLineItem,
     QGraphicsPathItem, QGraphicsPixmapItem, QGraphicsRectItem,
     QGraphicsScene, QGraphicsTextItem, QGraphicsView, QHBoxLayout,
-    QInputDialog, QLabel, QMenu, QMessageBox, QPushButton, QTextEdit,
+    QColorDialog, QInputDialog, QLabel, QMenu, QMessageBox, QPushButton,
+    QTextEdit,
     QToolBar, QToolButton, QVBoxLayout, QWidget,
 )
 
@@ -125,6 +126,7 @@ class _EditTextDialog(QDialog):
                  preserve_line_breaks: bool = False,
                  font_family: str = "",
                  rotation: int = 0,
+                 color: tuple[float, float, float] | None = None,
                  title: str = "Edit text") -> None:
         super().__init__(parent)
         self.setWindowTitle(title)
@@ -135,6 +137,10 @@ class _EditTextDialog(QDialog):
         self._initial_content = html_or_text
         self._initial_fontsize = float(max(4.0, fontsize))
         self._initial_font_family = font_family
+        # Original text colour (PDF 0..1 RGB). Shown in the editor so
+        # what you type looks like the page, and carried back to the
+        # PDF so a reflowed paragraph no longer turns black.
+        self._initial_color = QColor.fromRgbF(*(color or (0.0, 0.0, 0.0)))
         layout = QVBoxLayout(self)
 
         # ----- Toolbar -----
@@ -168,6 +174,12 @@ class _EditTextDialog(QDialog):
         tb.addSeparator()
         self._super = self._toggle(tb, "superscript", "Superscript", self._on_super)
         self._sub   = self._toggle(tb, "subscript",   "Subscript",   self._on_sub)
+        tb.addSeparator()
+        self._color_act = QAction("Text colour", self)
+        self._color_act.setToolTip("Text colour of the selection")
+        self._color_act.setIcon(self._swatch_icon(self._initial_color))
+        self._color_act.triggered.connect(self._on_color)
+        tb.addAction(self._color_act)
         tb.addSeparator()
 
         self._align_group = QActionGroup(self)
@@ -290,6 +302,14 @@ class _EditTextDialog(QDialog):
             cur.clearSelection()
             self._editor.setTextCursor(cur)
         self._editor.setFontPointSize(sz)
+        cur_col = self._editor.textCursor()
+        cur_col.select(QTextCursor.Document)
+        col_fmt = QTextCharFormat()
+        col_fmt.setForeground(self._initial_color)
+        cur_col.mergeCharFormat(col_fmt)
+        cur_col.clearSelection()
+        self._editor.setTextCursor(cur_col)
+        self._editor.setTextColor(self._initial_color)
         # Re-apply alignment to the freshly loaded content.
         cur_align = self._editor.textCursor()
         cur_align.select(QTextCursor.Document)
@@ -336,6 +356,33 @@ class _EditTextDialog(QDialog):
             cur.mergeCharFormat(fmt)
         self._editor.setFontPointSize(sz)
 
+    @staticmethod
+    def _swatch_icon(color: QColor):
+        from PySide6.QtGui import QIcon
+        pm = QPixmap(20, 20)
+        pm.fill(Qt.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.Antialiasing)
+        f = QFont()
+        f.setBold(True)
+        f.setPixelSize(13)
+        p.setFont(f)
+        p.setPen(QColor("#444444"))
+        p.drawText(QRectF(0, 0, 20, 15), Qt.AlignCenter, "A")
+        p.fillRect(QRectF(2, 15, 16, 4), color)
+        p.end()
+        return QIcon(pm)
+
+    def _on_color(self) -> None:
+        cur = self._editor.textColor()
+        col = QColorDialog.getColor(cur if cur.isValid()
+                                    else self._initial_color,
+                                    self, "Text colour")
+        if not col.isValid():
+            return
+        self._editor.setTextColor(col)
+        self._color_act.setIcon(self._swatch_icon(col))
+
     def _on_bold(self, checked: bool) -> None:
         self._editor.setFontWeight(QFont.Bold if checked else QFont.Normal)
 
@@ -374,6 +421,10 @@ class _EditTextDialog(QDialog):
         va = fmt.verticalAlignment()
         self._super.setChecked(va == QTextCharFormat.AlignSuperScript)
         self._sub.setChecked(va == QTextCharFormat.AlignSubScript)
+        fg = fmt.foreground().color()
+        self._color_act.setIcon(self._swatch_icon(
+            fg if fmt.hasProperty(QTextCharFormat.ForegroundBrush)
+            else self._initial_color))
         sz = fmt.fontPointSize()
         if sz > 0:
             self._size_combo.blockSignals(True)
@@ -3676,13 +3727,13 @@ class PdfTab(QGraphicsView):
                 align=info.get("align", "left"),
                 preserve_line_breaks=self._preserve_line_breaks(),
                 font_family=info.get("font", ""),
+                color=info.get("color"),
             )
             if dlg.exec() != QDialog.Accepted:
                 return
         finally:
             if marker is not None and marker.scene() is self._scene:
                 self._scene.removeItem(marker)
-        html = dlg.html()
         new_plain = dlg.plain_text()
         # Normalise both sides — Qt represents <br> as   in
         # plain text while our reader uses \n — and skip if the body
@@ -3702,41 +3753,104 @@ class PdfTab(QGraphicsView):
                 and self._rewrite_single_line(page, info, new_plain):
             self._render_all()
             return
-        rect = fitz.Rect(*info["rect"])
-        # White out the original glyphs by rewriting the page content
-        # stream so the new text doesn't sit on top of the old.
-        page.add_redact_annot(rect, fill=(1, 1, 1))
-        page.apply_redactions()
-        # insert_htmlbox understands font sizes, super/sub
-        # (vertical-align:super), bold/italic, and CSS text-align — the
-        # dialog's QTextEdit emits all of these so we don't have to
-        # carry them as separate parameters. Returns (spare_height,
-        # scale); when scale < 1 the engine had to shrink to fit and
-        # we extend the rect downward and retry so the user's chosen
-        # font size is honoured instead of silently shrunk.
-        # Strip <br> before passing to insert_htmlbox: the engine's
-        # per-line spacing for explicit breaks is taller than the
-        # original PDF leading, which made the rewritten text overflow
-        # into the next paragraph. Letting insert_htmlbox reflow
-        # naturally produces tight lines that fit the original rect.
-        import re as _re
-        html = _re.sub(r"<br\s*/?>", " ", html, flags=_re.IGNORECASE)
-        html = html.replace(" ", " ")
+        self._reflow_paragraph(page, info, dlg.html(), new_plain,
+                               rotate=dlg.rotation())
+        self._render_all()
+
+    @staticmethod
+    def _redact_text_only(page: fitz.Page, rect) -> None:
+        """Remove the glyphs inside *rect* without painting over it:
+        no white fill (coloured backgrounds, highlights and table
+        shading survive) and images / line art are left alone."""
+        page.add_redact_annot(fitz.Rect(rect), fill=False)
         try:
-            spare, scale = page.insert_htmlbox(rect, html)
-            if scale < 0.999:
-                page_h = page.rect.height
-                grown = fitz.Rect(rect.x0, rect.y0,
-                                  rect.x1, min(page_h, rect.y1 + rect.height * 4))
-                page.add_redact_annot(rect, fill=(1, 1, 1))
-                page.apply_redactions()
-                page.insert_htmlbox(grown, html)
+            page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE,
+                                  graphics=fitz.PDF_REDACT_LINE_ART_NONE)
+        except (AttributeError, TypeError):
+            page.apply_redactions()
+
+    @classmethod
+    def _reflow_html(cls, html: str, info: dict) -> tuple[str, str]:
+        """Turn the dialog's QTextEdit HTML into (body_html, css) for
+        insert_htmlbox so the rewritten paragraph matches the page:
+        original colour, the original font class (MuPDF has no copy of
+        an arbitrary embedded font, so its Base-14 look-alike is used),
+        and the original line spacing instead of the engine's looser
+        default."""
+        import re as _re
+        m = _re.search(r"<body[^>]*>(.*)</body>", html, _re.S | _re.I)
+        body = m.group(1) if m else html
+        # Explicit breaks get taller-than-PDF leading in the engine;
+        # let it reflow the paragraph inside the original column.
+        body = _re.sub(r"<br\s*/?>", " ", body, flags=_re.I)
+        body = body.replace("\u2028", " ").replace("\u00a0", " ")
+        generic = {"t": "Times", "h": "Helvetica", "c": "Courier"}[
+            cls._builtin_fontname(info.get("font_raw")
+                                  or info.get("font", ""))[0]]
+        orig = (info.get("font") or "").strip("'\" ")
+        def _family(mm):
+            fam = mm.group(1).strip("'\" ")
+            # The original family (or Qt's placeholder) → look-alike;
+            # a font the user picked in the dialog is kept.
+            if not fam or fam == orig or fam.lower() in (
+                    "sans serif", "serif", "monospace"):
+                fam = generic
+            return f"font-family:'{fam}'"
+        body = _re.sub(r"font-family:\s*([^;\"]+)", _family, body)
+        r, g, b = info.get("color", (0.0, 0.0, 0.0))
+        lines = info.get("lines") or []
+        size = float(info.get("size", 11.0)) or 11.0
+        leading = 1.2
+        if len(lines) >= 2:
+            gaps = [lines[i + 1]["baseline"] - lines[i]["baseline"]
+                    for i in range(len(lines) - 1)]
+            gaps = [gp for gp in gaps if gp > 0]
+            if gaps:
+                leading = max(1.0, min(2.0, sorted(gaps)[len(gaps) // 2]
+                                       / size))
+        # Qt's per-paragraph inline style outranks a stylesheet rule,
+        # so the leading goes inline too.
+        body = _re.sub(r"<p(\s+style=\")?",
+                       lambda mm: f'<p style="line-height:{leading:.3f}; '
+                       if mm.group(1) else
+                       f'<p style="line-height:{leading:.3f};"',
+                       body)
+        css = (f"* {{ font-family: '{generic}'; }} "
+               f"body {{ margin: 0; color: rgb({round(r * 255)},"
+               f"{round(g * 255)},{round(b * 255)}); "
+               f"font-size: {size:.2f}pt; }} "
+               f"p {{ margin: 0; line-height: {leading:.3f}; }}")
+        return body, css
+
+    def _reflow_paragraph(self, page: fitz.Page, info: dict, html: str,
+                          new_plain: str, rotate: int = 0) -> None:
+        """Full-paragraph commit: remove the old glyphs and set the
+        edited HTML in the original column. If the new text is longer
+        the box grows downward (never shrinking the user's font); only
+        when it cannot fit above the page bottom is it scaled down."""
+        rect = fitz.Rect(*info["rect"])
+        self._redact_text_only(page, rect)
+        body, css = self._reflow_html(html, info)
+        rotate = int(rotate) % 360
+        try:
+            bottom = page.rect.height - 18.0
+            box = fitz.Rect(rect)
+            step = max(6.0, float(info.get("size", 11.0)))
+            while True:
+                spare, _scale = page.insert_htmlbox(
+                    box, body, css=css, scale_low=1, rotate=rotate)
+                if spare >= 0:
+                    break
+                if box.y1 >= bottom:
+                    page.insert_htmlbox(box, body, css=css, rotate=rotate)
+                    break
+                box.y1 = min(bottom, box.y1 + step)
         except AttributeError:
             # PyMuPDF too old for insert_htmlbox — fall back to plain text.
             page.insert_textbox(
                 rect, new_plain, fontsize=info["size"], color=info["color"],
+                rotate=rotate,
             )
-        self._render_all()
 
     @staticmethod
     def _builtin_fontname(raw: str) -> str:
@@ -3781,6 +3895,13 @@ class PdfTab(QGraphicsView):
         import re as _re
         for m in _re.finditer(r"font-weight:\s*(\d+)", body):
             if int(m.group(1)) >= 600:
+                return True
+        r, g, b = info.get("color", (0.0, 0.0, 0.0))
+        orig = QColor.fromRgbF(r, g, b)
+        for m in _re.finditer(r"(?<![-\w])color:\s*(#[0-9a-fA-F]{6})", body):
+            c = QColor(m.group(1))
+            if max(abs(c.red() - orig.red()), abs(c.green() - orig.green()),
+                   abs(c.blue() - orig.blue())) > 3:
                 return True
         want = float(info.get("size", 11.0))
         for m in _re.finditer(r"font-size:\s*(\d+(?:\.\d+)?)pt", body):
@@ -3877,7 +3998,7 @@ class PdfTab(QGraphicsView):
         inset = (ly1 - ly0) * 0.2
         page.add_redact_annot(
             fitz.Rect(lx0 - 0.5, ly0 + inset, lx1 + 0.5, ly1 - inset),
-            fill=(1, 1, 1),
+            fill=False,
         )
         try:
             # Keep images and line art under the band (underlines,
@@ -4052,6 +4173,7 @@ class PdfTab(QGraphicsView):
                 "color": (r, g, b),
                 "align": align,
                 "font": font,
+                "font_raw": str(dom_font_raw or ""),
                 "lines": line_details,
             }
         return None

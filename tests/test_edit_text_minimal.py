@@ -86,3 +86,41 @@ def test_too_long_line_falls_back(tab):
     new = old.replace("finally", "finally " + "very " * 40 + "slowly")
     assert not tab._rewrite_single_line(page, info, new)
     assert page.get_text() == before
+
+
+def test_reflow_keeps_colour_and_background(app, tmp_path):
+    """The full-paragraph path must not paint a white box over a
+    tinted background, and must keep the original text colour."""
+    path = tmp_path / "tinted.pdf"
+    doc = fitz.open()
+    page = doc.new_page()
+    page.draw_rect(fitz.Rect(60, 80, 400, 200), color=None,
+                   fill=(1, 0.95, 0.7))
+    page.insert_textbox(fitz.Rect(72, 90, 330, 190),
+                        "Blue serif words that will be rewritten across "
+                        "several lines of this tinted panel.",
+                        fontsize=11, fontname="tiro", color=(0.1, 0.2, 0.6))
+    doc.save(str(path))
+    doc.close()
+    t = PdfTab(path)
+    try:
+        page = t._doc[0]
+        w = next(r for r in page.get_text("words") if r[4] == "serif")
+        info = t._find_text_block_detailed(
+            page, (w[0] + w[2]) / 2, (w[1] + w[3]) / 2)
+        html = ("<html><body><p><span style=\"font-family:'"
+                + info["font"] + "'; font-size:11pt;\">Totally new "
+                "wording that is clearly longer than the original "
+                "paragraph so it has to grow downward a bit.</span>"
+                "</p></body></html>")
+        t._reflow_paragraph(page, info, html, "")
+        spans = [s for b in page.get_text("dict")["blocks"]
+                 for ln in b.get("lines", []) for s in ln["spans"]]
+        assert spans and all(s["color"] == 0x1a3399 for s in spans)
+        assert all(s["size"] == pytest.approx(11.0) for s in spans)
+        assert "Totally" in page.get_text()
+        pix = page.get_pixmap(clip=fitz.Rect(300, 95, 320, 105))
+        r, g, b = pix.pixel(5, 5)
+        assert (r, g, b) != (255, 255, 255), "white box painted"
+    finally:
+        t.close_doc()

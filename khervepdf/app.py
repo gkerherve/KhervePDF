@@ -57,6 +57,10 @@ def main() -> int:
     if single_instance.send_to_running({"cmd": "open", "paths": paths}):
         return 0
 
+    # Starting picture while the (heavy) main window is built.
+    from . import splash as _splash, version_string
+    splash = _splash.show(version_string())
+
     from .mainwindow import MainWindow
     win = MainWindow(theme_name=theme_name)
     server = single_instance.Server(app)
@@ -74,5 +78,6 @@ def main() -> int:
         fg = win.frameGeometry()
         fg.moveCenter(avail.center())
         win.move(fg.topLeft())
+    splash.finish(win)
 
     return app.exec()

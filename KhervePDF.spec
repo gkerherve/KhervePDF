@@ -39,9 +39,10 @@ ROOT = Path(SPECPATH)
 # resulting file is referenced by the EXE() block below and by
 # KhervePDF_setup.iss's SetupIconFile.
 IS_MAC = sys.platform == "darwin"
+IS_LINUX = sys.platform.startswith("linux")   # no exe icon on Linux
 ICON_PATH = ROOT / "build" / ("KhervePDF.icns" if IS_MAC else "KhervePDF.ico")
 # On macOS packaging/build_macos.py writes the .icns before freezing.
-if not IS_MAC and not ICON_PATH.exists():
+if not IS_MAC and not IS_LINUX and not ICON_PATH.exists():
     import subprocess as _sp
     _sp.run(
         [sys.executable, str(ROOT / "tools" / "generate_icon.py"),
@@ -286,7 +287,7 @@ exe = EXE(
     # The .ico is generated above from icons.app_icon() — same red
     # KP monogram the app draws at runtime, baked into the .exe's
     # Windows resource section so Explorer / the taskbar pick it up.
-    icon=str(ICON_PATH),
+    icon=None if IS_LINUX else str(ICON_PATH),
 )
 
 

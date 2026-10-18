@@ -1,6 +1,6 @@
 name: Linux build
 
-# Builds only: PyInstaller one-folder packed as a tar.gz (x86_64). Uploads a
+# Builds only: Debian packages for amd64 and arm64 (Raspberry Pi 4/5). Uploads a
 # workflow artifact and never creates a release. Trigger:
 #
 #   git tag linux-v<__version__> && git push origin linux-v<__version__>
@@ -13,7 +13,15 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            arch: amd64
+          - runner: ubuntu-22.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
 
     steps:
@@ -44,33 +52,37 @@ jobs:
           QT_QPA_PLATFORM: offscreen
         run: python -m pytest tests -q
 
-      - name: Freeze
-        env:
-          QT_QPA_PLATFORM: offscreen
-        run: python -m PyInstaller KhervePDF.spec --noconfirm --clean
+      - name: Build the .deb
+        run: python packaging/build_deb.py
 
-      - name: Pack the tarball
+      - name: Check the package
         run: |
           set -euo pipefail
           VERSION=$(python -c "import re;print(re.search(r'__version__\s*=\s*\"([^\"]+)\"',open('khervepdf/__init__.py').read()).group(1))")
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
           case "$GITHUB_REF_NAME" in linux-v*) test "linux-v$VERSION" = "$GITHUB_REF_NAME" ;; esac
-          test -x dist/KhervePDF/KhervePDF
-          cp packaging/icons/khervepdf_256.png dist/KhervePDF/khervepdf.png
-          printf '[Desktop Entry]\nType=Application\nName=KhervePDF\nComment=PDF editor\nExec=KhervePDF %%f\nIcon=khervepdf\nMimeType=application/pdf;\nCategories=Office;Viewer;\n' > dist/KhervePDF/KhervePDF.desktop
-          tar -C dist -czf "dist/KhervePDF-$VERSION-linux-x86_64.tar.gz" KhervePDF
-          cp "dist/KhervePDF-$VERSION-linux-x86_64.tar.gz" dist/KhervePDF-linux-x86_64.tar.gz
-          (cd dist && sha256sum KhervePDF-*linux-x86_64.tar.gz > KhervePDF-linux-x86_64.sha256)
-          ls -lh dist/*.tar.gz
+          dpkg-deb --info "dist/KhervePDF_${VERSION}_${{ matrix.arch }}.deb"
+          ls -lh dist/*.deb
 
       - name: Smoke-test the frozen app
         run: python packaging/smoke_test.py dist/KhervePDF/KhervePDF
 
-      - name: Upload the tarball
+      - name: Install the .deb, smoke-test the installed app, remove it
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y "./dist/KhervePDF_${VERSION}_${{ matrix.arch }}.deb"
+          test -x /usr/bin/khervepdf
+          test -f /usr/share/applications/khervepdf.desktop
+          python packaging/smoke_test.py /opt/khervepdf/KhervePDF
+          sudo apt-get remove -y khervepdf
+          test ! -e /opt/khervepdf/KhervePDF
+          echo "install / run / remove OK"
+
+      - name: Upload the .deb
         uses: actions/upload-artifact@v4
         with:
-          name: KhervePDF-${{ env.VERSION }}-linux-x86_64
+          name: KhervePDF-${{ env.VERSION }}-linux-${{ matrix.arch }}
           path: |
-            dist/KhervePDF-*linux-x86_64.tar.gz
-            dist/KhervePDF-linux-x86_64.sha256
+            dist/KhervePDF_*_${{ matrix.arch }}.deb
+            dist/KhervePDF-linux-${{ matrix.arch }}.deb
           if-no-files-found: error

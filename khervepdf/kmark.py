@@ -36,6 +36,7 @@ APPS = {
     "tex": ("TeX", "#4a8ef0", "#163b8c", GOLD),
     "note": ("Note", "#4f7cf0", "#22318f", GOLD),
     "stats": ("Stats", "#4fbe9f", "#155f4c", GOLD),
+    "house": ("House", "#5aa9f0", "#1d5a9e", GOLD),
 }
 
 
@@ -345,8 +346,93 @@ def _stats(p, b, s):
         p.drawEllipse(pt, s * 0.016, s * 0.016)
 
 
+def _house(p, b, s):
+    """A brick house with a slate roof, chimney, windows and a red door,
+    standing on a strip of lawn."""
+    # lawn
+    lawn = QRectF(b.left() - b.width() * 0.1, b.bottom() - b.height() * 0.08,
+                  b.width() * 1.2, b.height() * 0.2)
+    g = QLinearGradient(lawn.topLeft(), lawn.bottomLeft())
+    g.setColorAt(0, QColor("#6cc36a"))
+    g.setColorAt(1, QColor("#2f7d3a"))
+    p.setPen(Qt.NoPen)
+    p.setBrush(g)
+    p.drawRoundedRect(lawn, s * 0.02, s * 0.02)
+    wall = QRectF(b.left() + b.width() * 0.16, b.top() + b.height() * 0.40,
+                  b.width() * 0.68, b.height() * 0.54)
+    roof_top = b.top() + b.height() * 0.0
+    # chimney
+    ch = QRectF(wall.right() - wall.width() * 0.26, b.top() + b.height() * 0.06,
+                wall.width() * 0.12, b.height() * 0.3)
+    p.setBrush(QColor("#9c3f2a"))
+    p.drawRect(ch)
+    p.setBrush(QColor("#5d6470"))
+    p.drawRect(QRectF(ch.left() - s * 0.006, ch.top() - s * 0.012,
+                      ch.width() + s * 0.012, s * 0.02))
+    # wall with brick gradient and courses
+    path = QPainterPath()
+    path.addRect(wall)
+    _shadow(p, path, s)
+    wg = QLinearGradient(wall.topLeft(), wall.bottomRight())
+    wg.setColorAt(0, QColor("#c8603f"))
+    wg.setColorAt(1, QColor("#94391f"))
+    p.setBrush(wg)
+    p.drawRect(wall)
+    p.setPen(_pen("#7e2f19", s * 0.003, Qt.FlatCap))
+    rows = 9
+    for i in range(1, rows):
+        y = wall.top() + wall.height() * i / rows
+        p.drawLine(QPointF(wall.left(), y), QPointF(wall.right(), y))
+    # roof
+    roof = QPainterPath()
+    ov = wall.width() * 0.10
+    roof.moveTo(wall.left() - ov, wall.top() + s * 0.005)
+    roof.lineTo(wall.center().x(), roof_top)
+    roof.lineTo(wall.right() + ov, wall.top() + s * 0.005)
+    roof.closeSubpath()
+    _shadow(p, roof, s)
+    rg = QLinearGradient(QPointF(0, roof_top), QPointF(0, wall.top()))
+    rg.setColorAt(0, QColor("#5d6876"))
+    rg.setColorAt(1, QColor("#2f3743"))
+    p.setPen(_pen("#f4f4f4", s * 0.014))
+    p.setBrush(rg)
+    p.drawPath(roof)
+    # windows
+    def window(r):
+        p.setPen(_pen("#ffffff", s * 0.010, Qt.SquareCap))
+        wg2 = QLinearGradient(r.topLeft(), r.bottomRight())
+        wg2.setColorAt(0, QColor("#cfeaff"))
+        wg2.setColorAt(1, QColor("#6fa8d6"))
+        p.setBrush(wg2)
+        p.drawRect(r)
+        p.drawLine(QPointF(r.center().x(), r.top()),
+                   QPointF(r.center().x(), r.bottom()))
+        p.drawLine(QPointF(r.left(), r.center().y()),
+                   QPointF(r.right(), r.center().y()))
+    ww, wh = wall.width() * 0.22, wall.height() * 0.26
+    window(QRectF(wall.left() + wall.width() * 0.10, wall.top()
+                  + wall.height() * 0.14, ww, wh))
+    window(QRectF(wall.right() - wall.width() * 0.10 - ww, wall.top()
+                  + wall.height() * 0.14, ww, wh))
+    window(QRectF(wall.left() + wall.width() * 0.10, wall.top()
+                  + wall.height() * 0.56, ww, wh))
+    # door with canopy
+    dr = QRectF(wall.right() - wall.width() * 0.10 - ww * 0.9, wall.bottom()
+                - wall.height() * 0.40, ww * 0.9, wall.height() * 0.40)
+    p.setPen(_pen("#ffffff", s * 0.008, Qt.SquareCap))
+    p.setBrush(QColor("#c62828"))
+    p.drawRect(dr)
+    p.setPen(Qt.NoPen)
+    p.setBrush(QColor("#ffc94a"))
+    p.drawEllipse(QPointF(dr.right() - dr.width() * 0.22, dr.center().y()),
+                  s * 0.006, s * 0.006)
+    p.setBrush(QColor("#2f3743"))
+    p.drawRect(QRectF(dr.left() - s * 0.012, dr.top() - s * 0.02,
+                      dr.width() + s * 0.024, s * 0.016))
+
+
 _ART = {"pdf": _pdf, "sheet": _sheet, "slide": _slide, "tex": _tex,
-        "note": _note, "stats": _stats}
+        "note": _note, "stats": _stats, "house": _house}
 
 
 def paint(size: int, app: str) -> QPixmap:
@@ -375,7 +461,11 @@ def paint(size: int, app: str) -> QPixmap:
         box = QRectF(tile.left() + tile.width() * 0.10,
                      tile.top() + tile.height() * 0.46,
                      tile.width() * 0.80, tile.height() * 0.44)
+    clip = QPainterPath()
+    clip.addRoundedRect(tile, rad, rad)
+    p.setClipPath(clip)
     _ART[app](p, box, s)
+    p.setClipping(False)
     sheen = QRadialGradient(tile.center().x(), tile.top(), tile.width() * 0.8)
     sheen.setColorAt(0, QColor(255, 255, 255, 34))
     sheen.setColorAt(1, QColor(255, 255, 255, 0))
